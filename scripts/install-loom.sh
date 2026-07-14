@@ -1133,7 +1133,7 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
     # If Loom ever ships new .github/ files (e.g. workflows), add those
     # exact paths here AND in scripts/uninstall-loom.sh.
     case "$prev_file" in
-      CLAUDE.md|.gitignore|.claude/settings.json)
+      CLAUDE.md|AGENTS.md|.gitignore|.claude/settings.json)
         continue
         ;;
       .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
@@ -1754,7 +1754,8 @@ header "What's Included:"
 echo "  ✅ .loom/ directory with configuration and scripts"
 echo "  ✅ .claude/ directory with slash commands"
 echo "  ✅ .github/ directory with labels and issue templates"
-echo "  ✅ CLAUDE.md documentation"
+echo "  ✅ CLAUDE.md documentation (Claude Code)"
+echo "  ✅ AGENTS.md documentation (OpenAI Codex)"
 echo ""
 
 header "Next Steps:"
@@ -1820,8 +1821,8 @@ echo "        pull_request:"
 echo "          paths-ignore:"
 echo "            - '.loom/**'"
 echo "            - '.claude/**'"
-echo "            - '.codex/**'"
 echo "            - 'CLAUDE.md'"
+echo "            - 'AGENTS.md'"
 echo "            - '.github/labels.yml'"
 echo ""
 echo "  Full integration guide: ${TARGET_PATH}/.loom/docs/ci-integration.md"

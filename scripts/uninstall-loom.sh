@@ -264,10 +264,13 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
     file_path=$(echo "$file_path" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
     [[ -z "$file_path" ]] && continue
 
-    # CLAUDE.md gets smart removal (step 6), not direct removal
+    # CLAUDE.md and AGENTS.md get smart removal (step 6), not direct removal
     # .claude/settings.json gets smart removal (selective Loom hook/permission removal)
     # .gitignore gets smart removal (additive merge — never hard-delete; #3450)
     if [[ "$file_path" == "CLAUDE.md" ]]; then
+      continue
+    fi
+    if [[ "$file_path" == "AGENTS.md" ]]; then
       continue
     fi
     if [[ "$file_path" == ".claude/settings.json" ]]; then
@@ -449,8 +452,8 @@ else
       KNOWN_DEFAULTS+=("$target_file")
 
       # Check if the file exists in target and add to removal list
-      # CLAUDE.md gets smart removal (step 6), not direct removal
-      if [[ "$target_file" == "CLAUDE.md" ]]; then
+      # CLAUDE.md and AGENTS.md get smart removal (step 6), not direct removal
+      if [[ "$target_file" == "CLAUDE.md" ]] || [[ "$target_file" == "AGENTS.md" ]]; then
         continue
       fi
 
@@ -596,9 +599,14 @@ RUNTIME_DIRS=(
   ".loom/logs"
 )
 
-# 5. Mark CLAUDE.md, .gitignore, and settings.json for smart removal
+# 5. Mark CLAUDE.md, AGENTS.md, .gitignore, and settings.json for smart removal
 if [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
   SMART_REMOVE_FILES+=("CLAUDE.md")
+fi
+
+# AGENTS.md gets the same marker-based smart removal as CLAUDE.md (issue #4)
+if [[ -f "$TARGET_PATH/AGENTS.md" ]]; then
+  SMART_REMOVE_FILES+=("AGENTS.md")
 fi
 
 # .gitignore needs pattern removal (not full removal)
@@ -630,7 +638,7 @@ REMOVE_DIRS=(
 
 # Report what was found
 info "Files to remove: ${#REMOVE_FILES[@]}"
-info "Smart-remove files: ${#SMART_REMOVE_FILES[@]} (CLAUDE.md, .gitignore)"
+info "Smart-remove files: ${#SMART_REMOVE_FILES[@]} (CLAUDE.md, AGENTS.md, .gitignore)"
 info "Unknown files found: ${#UNKNOWN_FILES[@]}"
 echo ""
 
@@ -662,6 +670,9 @@ if [[ ${#SMART_REMOVE_FILES[@]} -gt 0 ]]; then
     case "$f" in
       CLAUDE.md)
         echo "  - CLAUDE.md (remove Loom section or entire file if Loom-generated)"
+        ;;
+      AGENTS.md)
+        echo "  - AGENTS.md (remove Loom section, marker-based)"
         ;;
       .gitignore)
         echo "  - .gitignore (remove Loom-specific patterns only)"
@@ -998,11 +1009,52 @@ if [[ -f "$WORKTREE_ABS/CLAUDE.md" ]]; then
   fi
 fi
 
+# Handle AGENTS.md (issue #4, dual-runtime Phase 1).
+#
+# Unlike CLAUDE.md, AGENTS.md has no historical "legacy full-guide-in-root"
+# layout to detect (it was only ever removed per #2026/#2034 and is being
+# reintroduced fresh) — so there is no marker-less structural-anchor removal
+# branch here. If the AGENTS section markers are present, remove just that
+# section (preserving surrounding user content). If markers are absent,
+# preserve the file untouched: we cannot distinguish a hand-authored
+# AGENTS.md from a Loom-managed one without markers, and preserving is the
+# safe default (same philosophy as CLAUDE.md's "when in doubt, preserve").
+if [[ -f "$WORKTREE_ABS/AGENTS.md" ]]; then
+  AGENTS_MD="$WORKTREE_ABS/AGENTS.md"
+
+  if grep -q '<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->' "$AGENTS_MD" 2>/dev/null && \
+     grep -q '<!-- END LOOM ORCHESTRATION (AGENTS) -->' "$AGENTS_MD" 2>/dev/null; then
+    info "Removing Loom section from AGENTS.md (marker-based)..."
+
+    sed '/<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->/,/<!-- END LOOM ORCHESTRATION (AGENTS) -->/d' "$AGENTS_MD" > "${AGENTS_MD}.tmp" && mv "${AGENTS_MD}.tmp" "$AGENTS_MD"
+
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$AGENTS_MD" > "${AGENTS_MD}.tmp" && mv "${AGENTS_MD}.tmp" "$AGENTS_MD"
+
+    if [[ ! -s "$AGENTS_MD" ]] || ! grep -q '[^[:space:]]' "$AGENTS_MD" 2>/dev/null; then
+      rm -f "$AGENTS_MD"
+      REMOVED_LIST+=("AGENTS.md")
+      success "AGENTS.md removed (was entirely Loom content)"
+    else
+      REMOVED_LIST+=("AGENTS.md (Loom section removed)")
+      success "AGENTS.md Loom section removed, user content preserved"
+    fi
+  else
+    info "AGENTS.md has no Loom markers — preserving (cannot distinguish from hand-authored content)"
+  fi
+fi
+
 # Handle .loom/CLAUDE.md - remove the full Loom guide written by install
 if [[ -f "$WORKTREE_ABS/.loom/CLAUDE.md" ]]; then
   rm -f "$WORKTREE_ABS/.loom/CLAUDE.md"
   REMOVED_LIST+=(".loom/CLAUDE.md")
   success ".loom/CLAUDE.md removed"
+fi
+
+# Handle .loom/AGENTS.md - remove the full Loom guide written by install
+if [[ -f "$WORKTREE_ABS/.loom/AGENTS.md" ]]; then
+  rm -f "$WORKTREE_ABS/.loom/AGENTS.md"
+  REMOVED_LIST+=(".loom/AGENTS.md")
+  success ".loom/AGENTS.md removed"
 fi
 
 # Handle .gitignore - remove Loom-specific patterns
@@ -1245,9 +1297,8 @@ else
 Removes Loom configuration, roles, scripts, and tooling:
 - .loom/ directory (configuration, roles, scripts)
 - .claude/ slash commands and agent definitions
-- .codex/ configuration
 - .github/ Loom-specific labels and issue templates
-- CLAUDE.md documentation
+- CLAUDE.md and AGENTS.md documentation
 - .gitignore Loom patterns
 - Runtime artifacts (state files, logs)"
 
