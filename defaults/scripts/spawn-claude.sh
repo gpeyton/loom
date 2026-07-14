@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # spawn-claude.sh - Token-rotating launcher for Claude Code.
 #
+# This is the Claude runner invoked by spawn-worker.sh (issue #2, Phase 1 of
+# epic #1) when the resolved worker type is "claude" (the default). Its
+# behavior is unchanged by that dispatcher -- spawn-worker.sh execs this
+# script with all passthrough args untouched.
+#
 # This script is a thin layer that:
 #   1. Selects a Claude Code OAuth token from .loom/tokens/ via
 #      `python3 -m loom_tools.tokens.select`.

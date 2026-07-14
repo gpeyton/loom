@@ -779,6 +779,186 @@ class TestGitWorktreePinning:
         assert len(git_env_calls) == 0
 
 
+class TestResolveWorkerTypeFromConfig:
+    """Tests for resolve_worker_type_from_config (issue #2, Phase 1 of epic #1).
+
+    Verifies the read path for the historically write-only
+    ``roleConfig.workerType`` config field.
+    """
+
+    def test_defaults_to_claude_when_config_missing(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.agent_spawn import resolve_worker_type_from_config
+
+        assert resolve_worker_type_from_config("builder", mock_repo) == "claude"
+
+    def test_defaults_to_claude_when_config_malformed(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.agent_spawn import resolve_worker_type_from_config
+
+        (mock_repo / ".loom" / "config.json").write_text("{not valid json")
+        assert resolve_worker_type_from_config("builder", mock_repo) == "claude"
+
+    def test_defaults_to_claude_when_no_matching_role_file(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.agent_spawn import resolve_worker_type_from_config
+
+        config = {
+            "terminals": [
+                {
+                    "id": "terminal-1",
+                    "name": "Judge",
+                    "roleConfig": {"workerType": "codex", "roleFile": "judge.md"},
+                }
+            ]
+        }
+        (mock_repo / ".loom" / "config.json").write_text(json.dumps(config))
+        assert resolve_worker_type_from_config("builder", mock_repo) == "claude"
+
+    def test_reads_configured_worker_type(self, mock_repo: pathlib.Path) -> None:
+        from loom_tools.agent_spawn import resolve_worker_type_from_config
+
+        config = {
+            "terminals": [
+                {
+                    "id": "terminal-1",
+                    "name": "Builder",
+                    "roleConfig": {"workerType": "codex", "roleFile": "builder.md"},
+                }
+            ]
+        }
+        (mock_repo / ".loom" / "config.json").write_text(json.dumps(config))
+        assert resolve_worker_type_from_config("builder", mock_repo) == "codex"
+
+    def test_defaults_to_claude_when_worker_type_empty(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.agent_spawn import resolve_worker_type_from_config
+
+        config = {
+            "terminals": [
+                {
+                    "id": "terminal-1",
+                    "name": "Builder",
+                    "roleConfig": {"workerType": "", "roleFile": "builder.md"},
+                }
+            ]
+        }
+        (mock_repo / ".loom" / "config.json").write_text(json.dumps(config))
+        assert resolve_worker_type_from_config("builder", mock_repo) == "claude"
+
+
+class TestSpawnAgentWorkerTypeEnv:
+    """Tests that spawn_agent surfaces worker_type as LOOM_WORKER (issue #2)."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_default_worker_type_sets_no_loom_worker_env(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """Zero-behavior-change criterion: worker_type="claude" (the default)
+        must NOT set LOOM_WORKER at all."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        worker_env_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4 and c[0] == "set-environment" and "LOOM_WORKER" in c
+        ]
+        assert len(worker_env_calls) == 0
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_non_default_worker_type_sets_loom_worker_env(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+            verify_timeout=0,
+            worker_type="codex",
+        )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        worker_env_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4 and c[0] == "set-environment" and "LOOM_WORKER" in c
+        ]
+        assert len(worker_env_calls) == 1
+        assert worker_env_calls[0][-1] == "codex"
+
+    @patch("loom_tools.agent_spawn._is_claude_running")
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value="123")
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_verify_loop_checks_worker_type_derived_process_name(
+        self,
+        mock_tmux: MagicMock,
+        _mock_pane_pid: MagicMock,
+        mock_is_claude_running: MagicMock,
+        mock_repo: pathlib.Path,
+    ) -> None:
+        """spawn_agent's verify loop passes worker_type through to the
+        process-liveness check as process_name (issue #2)."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        mock_is_claude_running.return_value = True
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+            verify_timeout=5,
+            worker_type="codex",
+        )
+
+        mock_is_claude_running.assert_called_with("123", process_name="codex")
+
+
 class TestAnsiStripping:
     """Tests for ANSI escape sequence stripping in log output."""
 

@@ -88,9 +88,11 @@ pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 pub struct SweepRegistryConfig {
     /// Absolute path to the workspace root (parent of `.loom/`).
     pub workspace_root: PathBuf,
-    /// Optional override for the spawn binary. Defaults to
-    /// `<workspace_root>/defaults/scripts/spawn-claude.sh` or, if absent,
-    /// `<workspace_root>/.loom/scripts/spawn-claude.sh`.
+    /// Optional override for the spawn binary. Defaults to resolving
+    /// `spawn-worker.sh` (preferred) or `spawn-claude.sh` (legacy fallback)
+    /// under `<workspace_root>/.loom/scripts/` or
+    /// `<workspace_root>/defaults/scripts/`. See
+    /// [`resolve_spawn_bin`](Self::resolve_spawn_bin) for the full order.
     pub spawn_bin: Option<PathBuf>,
     /// Override the `gh` binary (for tests). Defaults to `gh` from `PATH`.
     pub gh_bin: Option<PathBuf>,
@@ -114,14 +116,34 @@ impl SweepRegistryConfig {
     /// Resolve the spawn binary, preferring (in order):
     /// 1. `spawn_bin` explicit override.
     /// 2. `LOOM_SWEEP_SPAWN_BIN` env var.
-    /// 3. `<workspace>/.loom/scripts/spawn-claude.sh`.
-    /// 4. `<workspace>/defaults/scripts/spawn-claude.sh`.
+    /// 3. `<workspace>/.loom/scripts/spawn-worker.sh` (worker-runner
+    ///    dispatcher, issue #2 of epic #1).
+    /// 4. `<workspace>/defaults/scripts/spawn-worker.sh`.
+    /// 5. `<workspace>/.loom/scripts/spawn-claude.sh` (legacy fallback for
+    ///    installs that predate the `spawn-worker.sh` dispatcher).
+    /// 6. `<workspace>/defaults/scripts/spawn-claude.sh`.
     pub fn resolve_spawn_bin(&self) -> Result<PathBuf> {
         if let Some(ref p) = self.spawn_bin {
             return Ok(p.clone());
         }
         if let Ok(path) = std::env::var(SPAWN_BIN_ENV) {
             return Ok(PathBuf::from(path));
+        }
+        let installed_worker = self
+            .workspace_root
+            .join(".loom")
+            .join("scripts")
+            .join("spawn-worker.sh");
+        if installed_worker.exists() {
+            return Ok(installed_worker);
+        }
+        let defaults_worker = self
+            .workspace_root
+            .join("defaults")
+            .join("scripts")
+            .join("spawn-worker.sh");
+        if defaults_worker.exists() {
+            return Ok(defaults_worker);
         }
         let installed = self
             .workspace_root
@@ -140,8 +162,8 @@ impl SweepRegistryConfig {
             return Ok(defaults);
         }
         Err(anyhow!(
-            "spawn-claude.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
-             set {SPAWN_BIN_ENV} to override)",
+            "neither spawn-worker.sh nor spawn-claude.sh found under {} (looked in \
+             .loom/scripts and defaults/scripts; set {SPAWN_BIN_ENV} to override)",
             self.workspace_root.display()
         ))
     }
@@ -282,11 +304,18 @@ impl SweepRegistry {
     /// receives `--model <value>` appended to the `spawn-claude.sh` argv.
     /// When `None`, no `--model` flag is emitted at all — the session/CLI
     /// default is preserved end-to-end.
+    ///
+    /// `worker_type` (issue #2, Phase 1 of epic #1): when `Some` and
+    /// non-empty, the spawned child receives `LOOM_WORKER=<value>` in its
+    /// environment so `spawn-worker.sh` resolves to the matching runner.
+    /// When `None` or empty, no `LOOM_WORKER` env var is set at all — the
+    /// spawn layer's own default (`claude`) applies end-to-end.
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
         model: Option<&str>,
+        worker_type: Option<&str>,
     ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -330,7 +359,7 @@ impl SweepRegistry {
         // 5. Compute the log path and spawn the child.
         let log_path = self.compute_log_path(issue_number);
         let (pid, token_name) = self
-            .spawn_child(issue_number, &log_path, &sweep_id, model)
+            .spawn_child(issue_number, &log_path, &sweep_id, model, worker_type)
             .context("failed to spawn sweep child")?;
 
         // 6. Record the entry. The model is carried on the registry entry
@@ -506,6 +535,7 @@ impl SweepRegistry {
         log_path: &Path,
         sweep_id: &str,
         model: Option<&str>,
+        worker_type: Option<&str>,
     ) -> Result<(u32, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
@@ -549,6 +579,16 @@ impl SweepRegistry {
         if let Some(m) = model {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);
+            }
+        }
+        // Worker-type selection (issue #2, Phase 1 of epic #1): set
+        // LOOM_WORKER only when a non-empty value was supplied, exactly
+        // mirroring the --model rule above. spawn-worker.sh reads this env
+        // var to resolve the runner; when unset it defaults to "claude" —
+        // zero behavior change for dispatches that don't specify one.
+        if let Some(w) = worker_type {
+            if !w.is_empty() {
+                cmd.env("LOOM_WORKER", w);
             }
         }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
@@ -1202,6 +1242,7 @@ mod tests {
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
+  printf 'LOOM_WORKER=%s\n' "${{LOOM_WORKER:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -1246,7 +1287,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(42), None, None)
+            .dispatch(&SweepKind::Issue(42), None, None, None)
             .expect("dispatch should succeed");
 
         assert!(outcome.was_new);
@@ -1302,7 +1343,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"))
+            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1334,7 +1375,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(44), None, Some(""))
+            .dispatch(&SweepKind::Issue(44), None, Some(""), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1355,16 +1396,101 @@ exit 0
         );
     }
 
+    /// Issue #2 (Phase 1 of epic #1): a `worker_type` dispatch param threads
+    /// through to the spawn command's environment as `LOOM_WORKER=<value>`.
+    #[test]
+    #[serial]
+    fn dispatch_with_worker_type_sets_loom_worker_env() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(45), None, None, Some("codex"))
+            .expect("dispatch should succeed");
+
+        // The fixture script writes LOOM_WORKER last, so waiting for its
+        // exact expected value guarantees the whole record is flushed.
+        let needle = "LOOM_WORKER=codex";
+        assert!(
+            wait_for_contents(&record_log, needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("LOOM_WORKER=codex"),
+            "expected LOOM_WORKER=codex in recorded env; got: {recorded}"
+        );
+    }
+
+    /// Issue #2: `worker_type = None` must NOT set LOOM_WORKER at all — the
+    /// spawn layer's own default (`claude`) applies (zero-behavior-change
+    /// criterion, mirroring the `model = None` rule).
+    #[test]
+    #[serial]
+    fn dispatch_with_none_worker_type_emits_no_loom_worker_env() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(46), None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        // Give the fixture script time to flush its final LOOM_WORKER line
+        // (written after LOOM_TERMINAL_ID/LOOM_WORKSPACE).
+        assert!(
+            wait_for_contents(&record_log, "LOOM_WORKER=", 10000),
+            "fake spawn-claude.sh did not finish writing LOOM_WORKER line within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("LOOM_WORKER=unset"),
+            "worker_type=None must not set LOOM_WORKER; got: {recorded}"
+        );
+    }
+
+    /// Issue #2: an empty-string worker_type is treated as unset — no
+    /// `LOOM_WORKER` env var at all, matching the empty-model rule.
+    #[test]
+    #[serial]
+    fn dispatch_with_empty_worker_type_emits_no_loom_worker_env() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(47), None, None, Some(""))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        assert!(
+            wait_for_contents(&record_log, "LOOM_WORKER=", 10000),
+            "fake spawn-claude.sh did not finish writing LOOM_WORKER line within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("LOOM_WORKER=unset"),
+            "empty worker_type must not set LOOM_WORKER; got: {recorded}"
+        );
+    }
+
     #[test]
     #[serial]
     fn dispatch_lock_collision_rejected() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(&SweepKind::Issue(7), None, None);
+        let first = registry.dispatch(&SweepKind::Issue(7), None, None, None);
         assert!(first.is_ok());
 
-        let second = registry.dispatch(&SweepKind::Issue(7), None, None);
+        let second = registry.dispatch(&SweepKind::Issue(7), None, None, None);
         assert!(second.is_err(), "second dispatch for issue #7 should fail (lock collision)");
         let err = second.unwrap_err().to_string();
         assert!(err.contains("lock collision"), "expected lock collision error; got: {err}");
@@ -1377,7 +1503,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .unwrap();
         assert!(first.was_new);
 
@@ -1385,7 +1511,7 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .unwrap();
         assert!(!second.was_new);
         assert_eq!(first.sweep_id, second.sweep_id);
@@ -1396,7 +1522,7 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None);
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None);
         assert!(outcome.is_err());
         assert!(outcome
             .unwrap_err()
@@ -1411,7 +1537,7 @@ exit 0
 
         // Dispatch and then poke an entry into Exited state directly.
         let outcome = registry
-            .dispatch(&SweepKind::Issue(11), None, None)
+            .dispatch(&SweepKind::Issue(11), None, None, None)
             .unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
         entry.state = SweepState::Exited {
@@ -1784,7 +1910,7 @@ exit 0
         let mut registry = SweepRegistry::new(config);
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(123), None, None)
+            .dispatch(&SweepKind::Issue(123), None, None, None)
             .unwrap();
         assert!(outcome.was_new);
 

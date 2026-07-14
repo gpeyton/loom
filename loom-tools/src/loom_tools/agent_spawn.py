@@ -337,12 +337,19 @@ def _get_pane_pid(session_name: str) -> str | None:
     return None
 
 
-def _is_claude_running(shell_pid: str) -> bool:
-    """Check if a claude process is running as a child or grandchild of shell_pid."""
-    # Direct child: shell -> claude or shell -> claude-wrapper
+def _is_claude_running(shell_pid: str, process_name: str = "claude") -> bool:
+    """Check if a worker process is running as a child or grandchild of shell_pid.
+
+    ``process_name`` is the ``pgrep -f`` needle used to detect the live
+    worker process (issue #2, Phase 1 of epic #1: worker-runner abstraction).
+    Defaults to ``"claude"`` for zero behavior change on existing installs;
+    callers pass a worker-type-derived value (e.g. from ``spawn_agent``'s
+    ``worker_type`` parameter) to check for a different runner's process.
+    """
+    # Direct child: shell -> <process_name> or shell -> claude-wrapper
     try:
         result = subprocess.run(
-            ["pgrep", "-P", shell_pid, "-f", "claude"],
+            ["pgrep", "-P", shell_pid, "-f", process_name],
             capture_output=True, text=True, check=False, timeout=5,
         )
         if result.returncode == 0:
@@ -350,7 +357,7 @@ def _is_claude_running(shell_pid: str) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
-    # Grandchild: shell -> claude-wrapper -> claude
+    # Grandchild: shell -> claude-wrapper -> <process_name>
     try:
         result = subprocess.run(
             ["pgrep", "-P", shell_pid],
@@ -365,7 +372,7 @@ def _is_claude_running(shell_pid: str) -> bool:
                 continue
             try:
                 gc_result = subprocess.run(
-                    ["pgrep", "-P", child, "-f", "claude"],
+                    ["pgrep", "-P", child, "-f", process_name],
                     capture_output=True, text=True, check=False, timeout=5,
                 )
                 if gc_result.returncode == 0:
@@ -477,11 +484,17 @@ def check_tmux() -> bool:
     return True
 
 
-def check_claude_cli() -> bool:
-    """Validate that the Claude CLI is available."""
-    if not shutil.which("claude"):
-        log_error("Claude CLI not found in PATH")
-        log_info("Install with: npm install -g @anthropic-ai/claude-code")
+def check_claude_cli(binary: str = "claude") -> bool:
+    """Validate that the worker CLI binary is available.
+
+    ``binary`` defaults to ``"claude"`` for zero behavior change; callers
+    pass a worker-type-derived binary name (issue #2, Phase 1 of epic #1)
+    to validate a different runner's CLI is installed.
+    """
+    if not shutil.which(binary):
+        log_error(f"{binary!r} CLI not found in PATH")
+        if binary == "claude":
+            log_info("Install with: npm install -g @anthropic-ai/claude-code")
         return False
     return True
 
@@ -510,6 +523,50 @@ def validate_role(role: str, repo_root: pathlib.Path) -> bool:
             if name != "README" and (f.is_file() or f.is_symlink()):
                 log_info(f"  - {name}")
     return False
+
+
+def resolve_worker_type_from_config(role: str, repo_root: pathlib.Path) -> str:
+    """Read ``roleConfig.workerType`` for ``role`` from ``.loom/config.json``.
+
+    Issue #2 (Phase 1 of epic #1): ``workerType`` has historically been
+    write-only dead code — declared in the config schema and written by
+    ``configure_terminal``, but read by nothing in Rust, Python, or shell.
+    This is the read path for the CLI spawn entrypoint: it looks up the
+    terminal config entry whose ``roleConfig.roleFile`` matches
+    ``"{role}.md"`` and returns its ``workerType``.
+
+    Returns ``"claude"`` (the implicit default) when:
+      - ``.loom/config.json`` is absent or unreadable/malformed.
+      - No terminal entry's ``roleConfig.roleFile`` matches this role.
+      - The matching entry has no ``workerType`` set, or it is empty.
+    """
+    config_path = repo_root / ".loom" / "config.json"
+    if not config_path.is_file():
+        return "claude"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "claude"
+
+    terminals = config.get("terminals")
+    if not isinstance(terminals, list):
+        return "claude"
+
+    target_role_file = f"{role}.md"
+    for terminal in terminals:
+        if not isinstance(terminal, dict):
+            continue
+        role_config = terminal.get("roleConfig")
+        if not isinstance(role_config, dict):
+            continue
+        if role_config.get("roleFile") != target_role_file:
+            continue
+        worker_type = role_config.get("workerType")
+        if isinstance(worker_type, str) and worker_type:
+            return worker_type
+        return "claude"
+
+    return "claude"
 
 
 def validate_worktree(worktree_path: pathlib.Path) -> bool:
@@ -658,8 +715,19 @@ def spawn_agent(
     worktree: str,
     repo_root: pathlib.Path,
     verify_timeout: int = DEFAULT_VERIFY_TIMEOUT,
+    worker_type: str = "claude",
 ) -> SpawnResult:
     """Spawn a Claude Code agent in a tmux session.
+
+    ``worker_type`` (issue #2, Phase 1 of epic #1: worker-runner
+    abstraction) selects which worker runner the process-liveness check
+    looks for and is surfaced to the session as ``LOOM_WORKER`` when it is
+    not the default ``"claude"``. It does NOT change the actual CLI
+    invocation below (that dispatch still hardcodes ``claude`` /
+    ``claude-wrapper.sh`` — swapping the invocation itself is Phase 2 of
+    epic #1, when a `spawn-codex.sh`-equivalent runner exists). Defaulting
+    to ``"claude"`` keeps this function's behavior unchanged for every
+    existing caller.
 
     Returns a SpawnResult indicating success or failure.
     """
@@ -730,6 +798,11 @@ def spawn_agent(
     _tmux("set-environment", "-t", session_name, "LOOM_TERMINAL_ID", name)
     _tmux("set-environment", "-t", session_name, "LOOM_WORKSPACE", str(working_dir))
     _tmux("set-environment", "-t", session_name, "LOOM_ROLE", role)
+    # Surface the resolved worker type to the session (issue #2, Phase 1 of
+    # epic #1). Only set when non-default so sessions using the implicit
+    # "claude" default see zero behavior change (no new env var at all).
+    if worker_type != "claude":
+        _tmux("set-environment", "-t", session_name, "LOOM_WORKER", worker_type)
     # Clear CLAUDECODE to prevent nested session guard from blocking subprocess.
     # Use explicit empty set instead of -u (unset): tmux's -u removes the
     # session-level override, causing the session to INHERIT the variable from
@@ -892,9 +965,9 @@ def spawn_agent(
             log_error(f"tmux session disappeared: {session_name}")
             return SpawnResult(status="error", name=name, error="session_disappeared")
 
-        # Check for claude process
+        # Check for the worker process
         shell_pid = _get_pane_pid(session_name)
-        if shell_pid and _is_claude_running(shell_pid):
+        if shell_pid and _is_claude_running(shell_pid, process_name=worker_type):
             log_info(f"Claude process detected after {elapsed}s")
             break
 
@@ -1024,6 +1097,11 @@ def run(config: SpawnConfig) -> int:
         else:
             cleanup_dead_session(config.name)
 
+    # Resolve the worker type from .loom/config.json's roleConfig.workerType
+    # (issue #2, Phase 1 of epic #1 -- makes the historically write-only
+    # workerType field live). Defaults to "claude" when unset/unreadable.
+    worker_type = resolve_worker_type_from_config(config.role, repo_root)
+
     # Spawn the agent
     spawn_result = spawn_agent(
         role=config.role,
@@ -1032,6 +1110,7 @@ def run(config: SpawnConfig) -> int:
         worktree=config.worktree,
         repo_root=repo_root,
         verify_timeout=config.verify_timeout,
+        worker_type=worker_type,
     )
 
     if spawn_result.status == "error":

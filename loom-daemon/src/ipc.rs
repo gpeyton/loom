@@ -769,11 +769,12 @@ fn handle_request(
             kind,
             idempotency_key,
             model,
+            worker_type,
         } => {
             let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
-            match sr.dispatch(&kind, idempotency_key, model.as_deref()) {
+            match sr.dispatch(&kind, idempotency_key, model.as_deref(), worker_type.as_deref()) {
                 Ok(outcome) => Response::SweepDispatched {
                     sweep_id: outcome.sweep_id,
                     pid: outcome.pid,
@@ -1120,6 +1121,7 @@ exit 0
                 kind: SweepKind::Issue(2024),
                 idempotency_key: None,
                 model: None,
+                worker_type: None,
             },
             &tm,
             &db,
@@ -1163,6 +1165,7 @@ exit 0
                 kind: SweepKind::PrSet(vec![100, 200]),
                 idempotency_key: None,
                 model: None,
+                worker_type: None,
             },
             &tm,
             &db,
@@ -1194,10 +1197,31 @@ exit 0
                 kind,
                 idempotency_key,
                 model,
+                worker_type,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
                 assert!(model.is_none(), "absent model field must default to None");
+                assert!(worker_type.is_none(), "absent worker_type field must default to None");
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    /// Issue #2 (Phase 1 of epic #1): a wire payload WITHOUT the
+    /// `worker_type` field (the pre-#2 client shape, which itself may also
+    /// lack `model`) must deserialize with `worker_type == None` —
+    /// `#[serde(default)]` keeps existing clients compatible.
+    #[test]
+    fn test_dispatch_sweep_deserializes_without_worker_type_field() {
+        let json = r#"{"type":"DispatchSweep","payload":{"kind":{"type":"Issue","value":42},"idempotency_key":null,"model":"claude-sonnet-4-6"}}"#;
+        let request: Request = serde_json::from_str(json).expect("pre-#2 payload must parse");
+        match request {
+            Request::DispatchSweep {
+                model, worker_type, ..
+            } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+                assert!(worker_type.is_none(), "absent worker_type field must default to None");
             }
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
@@ -1209,6 +1233,7 @@ exit 0
             kind: SweepKind::Issue(7),
             idempotency_key: Some("key-B".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
+            worker_type: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1217,6 +1242,7 @@ exit 0
                 kind,
                 idempotency_key,
                 model,
+                ..
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -1232,11 +1258,51 @@ exit 0
             kind: SweepKind::Issue(8),
             idempotency_key: None,
             model: None,
+            worker_type: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
         match back {
             Request::DispatchSweep { model, .. } => assert!(model.is_none()),
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    /// Issue #2 (Phase 1 of epic #1): `worker_type` round-trips through
+    /// serde just like `model` does.
+    #[test]
+    fn test_dispatch_sweep_serde_round_trip_with_worker_type() {
+        let request = Request::DispatchSweep {
+            kind: SweepKind::Issue(9),
+            idempotency_key: None,
+            model: None,
+            worker_type: Some("codex".to_string()),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Request::DispatchSweep {
+                kind, worker_type, ..
+            } => {
+                assert!(matches!(kind, SweepKind::Issue(9)));
+                assert_eq!(worker_type.as_deref(), Some("codex"));
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_sweep_serde_round_trip_without_worker_type() {
+        let request = Request::DispatchSweep {
+            kind: SweepKind::Issue(10),
+            idempotency_key: None,
+            model: None,
+            worker_type: None,
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Request::DispatchSweep { worker_type, .. } => assert!(worker_type.is_none()),
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
     }
@@ -1361,6 +1427,7 @@ exit 0
                 kind: SweepKind::Issue(444),
                 idempotency_key: None,
                 model: None,
+                worker_type: None,
             },
             &tm,
             &db,
