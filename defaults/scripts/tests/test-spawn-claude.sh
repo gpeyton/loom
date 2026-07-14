@@ -135,6 +135,61 @@ result=$(classify_error "" 2)
 assert_eq "RECOVERABLE" "$result" "unknown exit=2 -> RECOVERABLE"
 
 # ============================================================
+# Section 1b: provider pattern-table selection (issue #3, epic #1)
+# ============================================================
+
+echo ""
+echo "Testing classify_error provider table selection..."
+
+# Vector #19: explicit "claude" provider param is bit-identical to default
+result=$(classify_error "OAuth token has expired" 1 "claude")
+assert_eq "TOKEN_EXPIRED" "$result" "explicit provider=claude: OAuth expired -> TOKEN_EXPIRED"
+
+# Vector #20: explicit "claude" provider still honors the #3233 regression
+# guard (clean exit is SUCCESS regardless of stdout content or provider).
+result=$(classify_error "successfully merged PR #500 with status 200" 0 "claude")
+assert_eq "SUCCESS" "$result" "explicit provider=claude: exit=0 with '500' is SUCCESS (#3233 regression)"
+
+# Vector #21: codex is a documented stub — Claude-specific CWD-deleted
+# phrasing does NOT match under the codex table (no pattern defined yet),
+# so it falls through to the RECOVERABLE catch-all instead of CWD_DELETED.
+result=$(classify_error "current working directory was deleted" 1 "codex")
+assert_eq "RECOVERABLE" "$result" "provider=codex: Claude's cwd-deleted phrase does not match stub table"
+
+# Vector #22: codex still gets the generic HTTP/network patterns (429).
+result=$(classify_error "429 Too Many Requests" 1 "codex")
+assert_eq "RECOVERABLE" "$result" "provider=codex: generic 429 pattern still applies"
+
+# Vector #23: unknown/unrecognized provider — Claude's token-expired phrase
+# does not match (no provider-specific table), falls to RECOVERABLE.
+result=$(classify_error "OAuth token has expired" 1 "some-unknown-provider")
+assert_eq "RECOVERABLE" "$result" "unknown provider: no provider-specific pattern for OAuth phrase -> RECOVERABLE"
+
+# Vector #24: unknown provider still gets the generic HTTP/network patterns
+# (503) — "defaults to generic HTTP/network patterns" per issue #3 AC.
+result=$(classify_error "503 Service Unavailable" 1 "some-unknown-provider")
+assert_eq "RECOVERABLE" "$result" "unknown provider: generic 503 pattern still applies"
+
+# Vector #25: exit-code-first / SUCCESS short-circuit is provider-invariant —
+# even a nonsense provider name doesn't change exit=0 handling.
+result=$(classify_error "rate limit headers indicate 4500 remaining" 0 "some-unknown-provider")
+assert_eq "SUCCESS" "$result" "unknown provider: exit=0 with 'rate limit' is still SUCCESS (#3233 regression)"
+
+# Vector #26: LOOM_WORKER env var selects the provider table when no
+# explicit 3rd argument is passed.
+result=$(LOOM_WORKER="codex" classify_error "current working directory was deleted" 1)
+assert_eq "RECOVERABLE" "$result" "LOOM_WORKER=codex env var selects codex table (cwd-deleted phrase does not match)"
+
+# Vector #27: explicit 3rd-arg provider takes precedence over LOOM_WORKER.
+result=$(LOOM_WORKER="codex" classify_error "current working directory was deleted" 1 "claude")
+assert_eq "CWD_DELETED" "$result" "explicit provider arg overrides LOOM_WORKER env var"
+
+# Vector #28: default provider (no 3rd arg, no LOOM_WORKER set) is "claude".
+unset LOOM_WORKER 2>/dev/null || true
+result=$(classify_error "hit your weekly limit" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "no provider arg / no LOOM_WORKER -> defaults to claude table"
+
+# ============================================================
 # Section 2: spawn-claude.sh dispatch (with stub `claude`)
 # ============================================================
 
