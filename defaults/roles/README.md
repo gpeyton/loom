@@ -22,6 +22,29 @@ To edit a role definition:
 1. Edit the file in `.claude/commands/loom/<role>.md`
 2. The symlink in `roles/<role>.md` automatically reflects changes
 
+### Runtime-Neutral Cross-References (Epic #1, Phase 1)
+
+A role file frequently needs to point at a sibling reference document (e.g.
+`architect.md` -> `architect-patterns.md`, `champion.md` ->
+`champion-pr-merge.md`). **Role files must reference these siblings by bare
+filename** (e.g. `architect-patterns.md`), never by a `.claude/`-rooted
+path (e.g. `.claude/commands/loom/architect-patterns.md`).
+
+**Why**: `.claude/` only exists for the Claude Code runtime. A Codex (or any
+non-Claude) worker resolves role files from `.loom/roles/` directly and has
+no `.claude/` directory at all -- a hardcoded `.claude/` path is a dead
+reference for that runtime. The bare filename is resolvable the same way
+regardless of which tree loaded the role file (`.loom/roles/`,
+`defaults/roles/`, or `.claude/commands/loom/` in a Claude Code install),
+because all three trees contain the full set of sibling reference files
+side by side.
+
+This is the canonical, documented location decision for Epic #1 Issue #5:
+role-support content lives in this same role-reference tree, addressed by
+bare filename; `.claude/commands/loom/` remains a thin, Claude Code-specific
+entry point onto that same content (see "Why Symlinks?" above), not a
+separate canonical location.
+
 ## Available Roles
 
 | Role | Purpose | Autonomous |

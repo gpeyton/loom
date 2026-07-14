@@ -25,6 +25,15 @@ coordination point** for:
 - **Reaping** dead PIDs (every 30s) to maintain registry liveness and
   emit `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
 
+> **MCP tool naming.** This document refers to daemon MCP tools by their
+> runtime-neutral bare name (e.g. `list_sweeps`, `dispatch_sweep`) —
+> "the `<tool>` tool on the `loom` MCP server." Claude Code's specific
+> tool-naming convention prefixes every MCP tool with
+> `mcp__<server>__<tool>`, so a Claude Code session invokes these as
+> `mcp__loom__list_sweeps`, `mcp__loom__dispatch_sweep`, etc. Other MCP
+> clients (e.g. a Codex session) expose the same underlying tools under
+> their own naming scheme.
+
 It is **not** a work generator. It does not poll the forge for ready
 issues, it does not maintain a `shepherd-N` pool, and it does not run
 support roles on cron. Those responsibilities live in `spawn-loop.sh`
@@ -35,7 +44,7 @@ support roles on cron. Those responsibilities live in `spawn-loop.sh`
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                      MCP clients (Claude Code)                 │
+│              MCP clients (Claude Code, Codex, etc.)            │
 │  - dispatch_sweep, list_sweeps                          (A)    │
 │  - publish_event, subscribe_to_events                   (B)    │
 │  - get_sweep_status, tail_sweep_log, cancel_sweep       (C)    │
