@@ -82,9 +82,17 @@ git checkout -- <out-of-scope-file>
 
 ## Argument Handling
 
-Check for an argument passed via the slash command:
+Check for an invocation argument:
 
 **Arguments**: `$ARGUMENTS`
+
+> **Runtime note**: `$ARGUMENTS` is populated with whatever text follows the
+> command name, regardless of runtime. Claude Code resolves it from the
+> slash-command invocation (e.g. `/builder 42`, `/judge 123`) via
+> `.claude/commands/loom/`; Codex resolves the equivalent value from its own
+> custom-prompt invocation and discovery mechanism. Discovery differs per
+> runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
+> on.
 
 ### Test Fix Mode (from Shepherd)
 

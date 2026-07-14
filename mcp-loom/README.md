@@ -91,8 +91,15 @@ The following tools were removed to reduce complexity. Use the alternatives list
 
 ## Example Usage
 
+Tool names below are given in their runtime-neutral bare form (`list_terminals`,
+`get_ui_state`, etc.) -- "the `<tool>` tool on this MCP server." **Claude
+Code** invokes MCP tools via the `mcp__<server>__<tool>` naming convention
+specific to that runtime, so a Claude Code session calls these as
+`mcp__loom__list_terminals`, `mcp__loom__get_ui_state`, etc. Other MCP
+clients (e.g. Codex) expose the same tools under their own naming scheme.
+
 ```typescript
-// Via Claude Code MCP integration
+// Via Claude Code MCP integration (mcp__loom__<tool> naming)
 const terminals = await mcp__loom__list_terminals();
 const state = await mcp__loom__get_ui_state();
 

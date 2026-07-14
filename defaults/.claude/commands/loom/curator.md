@@ -16,9 +16,17 @@ You improve issues by:
 
 ## Argument Handling
 
-Check for an argument passed via the slash command:
+Check for an invocation argument:
 
 **Arguments**: `$ARGUMENTS`
+
+> **Runtime note**: `$ARGUMENTS` is populated with whatever text follows the
+> command name, regardless of runtime. Claude Code resolves it from the
+> slash-command invocation (e.g. `/builder 42`, `/judge 123`) via
+> `.claude/commands/loom/`; Codex resolves the equivalent value from its own
+> custom-prompt invocation and discovery mechanism. Discovery differs per
+> runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
+> on.
 
 If a number is provided (e.g., `/curator 42`):
 1. **FIRST, claim the issue immediately** by running this command:
@@ -294,7 +302,7 @@ gh issue create --title "Sub-issue A" --label "loom:triage"
 
 ### Related: Builder decomposition
 
-The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builder-complexity.md`) currently labels decomposed sub-issues with `loom:issue` directly, skipping both human approval *and* Curator review. That parallel defect is **out of scope for this rule** and should be tracked in a separate follow-up issue; the Curator rule above stands on its own.
+The Builder's complexity-assessment path (`builder-complexity.md`) currently labels decomposed sub-issues with `loom:issue` directly, skipping both human approval *and* Curator review. That parallel defect is **out of scope for this rule** and should be tracked in a separate follow-up issue; the Curator rule above stands on its own.
 
 ## Curation Activities
 

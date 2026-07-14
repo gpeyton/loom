@@ -74,7 +74,7 @@ When skipped, the next Builder hits these issues at implementation time -- usual
 
 ### Related: Curator-side decomposition
 
-The Curator role enforces the same rule from its side (see `defaults/.claude/commands/loom/curator.md` -> "Decomposing Oversized Issues" section, added in #3266 / PR #3272).
+The Curator role enforces the same rule from its side (see `curator.md` -> "Decomposing Oversized Issues" section, added in #3266 / PR #3272).
 
 ### Decomposition Criteria
 
