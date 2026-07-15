@@ -64,20 +64,33 @@
 #   TOKEN_EXHAUSTED marks it with reason `exhausted` (TTL-expires). This
 #   mirrors the reason strings the Claude flow's bad-token tracking uses.
 #
-# Permissions mapping (SAFETY-CRITICAL — do not weaken):
+# Permissions mapping (SAFETY-CRITICAL — do not weaken; inverted in #31,
+# epic #30 Phase 1 — full autonomy is now the default):
 #   Loom automation always spawns agents with the skip-permissions convention
-#   (`--dangerously-skip-permissions` for Claude). Codex must never run with
-#   FEWER guards than Claude, so that convention maps to:
-#     - default:                  `--full-auto`
-#                                 (auto-approves actions, keeps the sandbox)
-#     - LOOM_CODEX_UNSAFE=1 only:  `--dangerously-bypass-approvals-and-sandbox`
-#                                 (drops the sandbox AND approvals — reserved
-#                                  for fully isolated runners)
-#   The bypass-everything flag is gated behind BOTH the skip-permissions
-#   convention being present AND an explicit `LOOM_CODEX_UNSAFE=1` opt-in.
+#   (`--dangerously-skip-permissions` for Claude), and that convention now
+#   maps Codex to full autonomy by default — the same "no approvals needed"
+#   posture Claude gets from `--dangerously-skip-permissions`:
+#     - default:                    `--dangerously-bypass-approvals-and-sandbox`
+#                                   (drops the sandbox AND approvals; matches
+#                                    Loom's skip-permissions convention)
+#     - LOOM_CODEX_SAFE=1 opt-out:   `--full-auto`
+#                                   (restores the sandboxed, workspace-write,
+#                                    approval-on-request behavior that used to
+#                                    be the default)
+#   Precedence when both LOOM_CODEX_SAFE=1 and LOOM_CODEX_UNSAFE=1 are set:
+#   LOOM_CODEX_SAFE=1 ALWAYS WINS — safe is the more conservative choice, so
+#   it takes priority regardless of ordering or of LOOM_CODEX_UNSAFE.
+#   LOOM_CODEX_UNSAFE=1 is kept as a backward-compatible NO-OP ALIAS for full
+#   access for one transition release: setting it alone behaves identically
+#   to the new default (full access) and prints a deprecation warning
+#   pointing at LOOM_CODEX_SAFE=1. It never errors and is never required for
+#   autonomy.
+#   Exactly one structured `spawn-codex: permissions=... source=...` log line
+#   is emitted per launch so operators can grep spawn logs for the effective
+#   posture.
 #   When no skip-permissions flag is passed, NO permission flag is injected
-#   and Codex uses its own default (sandboxed, approval-gated) mode — more
-#   guards, never fewer.
+#   and Codex uses its own default (sandboxed, approval-gated) mode — this
+#   part is unchanged.
 #
 # Behavior on missing binary:
 #   When `codex` is not on PATH, exits 78 (EX_CONFIG) with an install hint,
@@ -95,9 +108,15 @@
 #                       an explicit `-m`/`--model` in the passthrough args
 #                       always wins. When neither is set, NO model flag is
 #                       emitted and the Codex CLI default is preserved.
-#   LOOM_CODEX_UNSAFE   When set to 1, the skip-permissions convention maps to
-#                       `--dangerously-bypass-approvals-and-sandbox` instead of
-#                       `--full-auto`. Off by default.
+#   LOOM_CODEX_SAFE     When set to 1, the skip-permissions convention maps to
+#                       `--full-auto` (sandboxed) instead of the full-access
+#                       default. Off by default (full access is the default).
+#   LOOM_CODEX_UNSAFE   DEPRECATED no-op alias for full access (the new
+#                       default). Setting it alone has no effect beyond a
+#                       deprecation warning pointing at LOOM_CODEX_SAFE=1.
+#                       If LOOM_CODEX_SAFE=1 is also set, LOOM_CODEX_SAFE
+#                       wins. Off by default. Kept for one transition
+#                       release.
 #   OPENAI_API_KEY      Honored if pre-set (exported to the codex child);
 #                       pool selection is skipped when set.
 #   LOOM_WORKSPACE      Override repo root detection (pool lookup).
@@ -212,22 +231,33 @@ else
 fi
 
 # --- Permissions mapping (SAFETY-CRITICAL, see header) ---
-# The skip-permissions convention maps to --full-auto by default, or to the
-# bypass-everything flag ONLY when LOOM_CODEX_UNSAFE=1 is explicitly set.
+# The skip-permissions convention now maps to full autonomy by default
+# (--dangerously-bypass-approvals-and-sandbox), matching Claude's
+# --dangerously-skip-permissions convention. LOOM_CODEX_SAFE=1 is the
+# opt-out that restores the sandboxed --full-auto behavior. LOOM_CODEX_UNSAFE
+# is a backward-compatible no-op alias for full access (deprecated, warns,
+# never errors); LOOM_CODEX_SAFE=1 always wins if both are set.
 PERMISSION_FLAG=""
 if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
-    if [[ "${LOOM_CODEX_UNSAFE:-}" == "1" ]]; then
-        PERMISSION_FLAG="--dangerously-bypass-approvals-and-sandbox"
-        log_warn "spawn-codex: LOOM_CODEX_UNSAFE=1 — using $PERMISSION_FLAG (sandbox AND approvals dropped)"
-    else
-        PERMISSION_FLAG="--full-auto"
-        log_info "spawn-codex: skip-permissions -> $PERMISSION_FLAG"
+    if [[ "${LOOM_CODEX_UNSAFE:-}" == "1" && "${LOOM_CODEX_SAFE:-}" != "1" ]]; then
+        log_warn "spawn-codex: LOOM_CODEX_UNSAFE=1 is deprecated — full access is now the loom-default; use LOOM_CODEX_SAFE=1 instead to opt into the sandboxed --full-auto behavior"
     fi
-elif [[ "${LOOM_CODEX_UNSAFE:-}" == "1" ]]; then
-    # UNSAFE requested but no skip-permissions convention present: the bypass
-    # flag stays gated behind BOTH conditions, so nothing is injected. Warn so
-    # the operator knows the opt-in had no effect.
-    log_warn "spawn-codex: LOOM_CODEX_UNSAFE=1 set but no --dangerously-skip-permissions passed; no permission flag injected"
+    if [[ "${LOOM_CODEX_SAFE:-}" == "1" ]]; then
+        PERMISSION_FLAG="--full-auto"
+        log_info "spawn-codex: permissions=workspace-write approvals=on-request source=LOOM_CODEX_SAFE"
+    else
+        PERMISSION_FLAG="--dangerously-bypass-approvals-and-sandbox"
+        log_info "spawn-codex: permissions=danger-full-access approvals=never source=loom-default"
+    fi
+elif [[ "${LOOM_CODEX_SAFE:-}" == "1" || "${LOOM_CODEX_UNSAFE:-}" == "1" ]]; then
+    # LOOM_CODEX_SAFE / LOOM_CODEX_UNSAFE requested but no skip-permissions
+    # convention present: neither has any effect without
+    # --dangerously-skip-permissions. Warn so the operator knows the env var
+    # had no effect (mirrors the previous LOOM_CODEX_UNSAFE-only gate).
+    if [[ "${LOOM_CODEX_UNSAFE:-}" == "1" && "${LOOM_CODEX_SAFE:-}" != "1" ]]; then
+        log_warn "spawn-codex: LOOM_CODEX_UNSAFE=1 is deprecated — use LOOM_CODEX_SAFE=1 instead"
+    fi
+    log_warn "spawn-codex: LOOM_CODEX_SAFE/LOOM_CODEX_UNSAFE set but no --dangerously-skip-permissions passed; no permission flag injected"
 fi
 
 # --- Repo root resolution (handles worktrees; mirrors spawn-claude.sh) ---

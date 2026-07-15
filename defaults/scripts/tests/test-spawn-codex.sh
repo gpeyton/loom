@@ -172,22 +172,48 @@ assert_contains "spawn-codex: model=default" "$output" \
 echo ""
 echo "Testing permissions mapping..."
 
-# skip-permissions -> --full-auto by default; Claude flag not forwarded
+# skip-permissions -> full access (--dangerously-bypass-approvals-and-sandbox)
+# by default; Claude flag not forwarded (issue #31, epic #30 Phase 1: default
+# inverted so no env vars set now means full autonomy)
 output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
     "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" --dangerously-skip-permissions 2>&1 || true)
-assert_contains "stub-codex args=exec --full-auto hello" "$output" \
-    "skip-permissions maps to --full-auto by default"
+assert_contains "stub-codex args=exec --dangerously-bypass-approvals-and-sandbox hello" "$output" \
+    "no env vars set -> skip-permissions maps to --dangerously-bypass-approvals-and-sandbox by default"
 assert_not_contains "--dangerously-skip-permissions" "$(stub_lines "$output")" \
     "the Claude-specific --dangerously-skip-permissions flag is NOT forwarded to codex"
+assert_contains "spawn-codex: permissions=danger-full-access approvals=never source=loom-default" "$output" \
+    "structured permission log line present, naming source=loom-default"
 
-# LOOM_CODEX_UNSAFE=1 -> bypass-everything flag instead of --full-auto
+# LOOM_CODEX_SAFE=1 -> --full-auto (sandboxed opt-out)
+output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+    LOOM_CODEX_SAFE=1 \
+    "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" --dangerously-skip-permissions 2>&1 || true)
+assert_contains "stub-codex args=exec --full-auto hello" "$output" \
+    "LOOM_CODEX_SAFE=1 maps skip-permissions to --full-auto"
+assert_not_contains "--dangerously-bypass-approvals-and-sandbox" "$(stub_lines "$output")" \
+    "sandboxed mode does not also pass the bypass flag"
+assert_contains "spawn-codex: permissions=workspace-write approvals=on-request source=LOOM_CODEX_SAFE" "$output" \
+    "structured permission log line present, naming source=LOOM_CODEX_SAFE"
+
+# LOOM_CODEX_UNSAFE=1 alone (no LOOM_CODEX_SAFE) -> backward-compatible
+# no-op alias for full access, with a deprecation warning; never errors
 output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
     LOOM_CODEX_UNSAFE=1 \
     "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" --dangerously-skip-permissions 2>&1 || true)
 assert_contains "stub-codex args=exec --dangerously-bypass-approvals-and-sandbox hello" "$output" \
-    "LOOM_CODEX_UNSAFE=1 maps skip-permissions to --dangerously-bypass-approvals-and-sandbox"
-assert_not_contains "--full-auto" "$(stub_lines "$output")" \
-    "bypass mode does not also pass --full-auto"
+    "LOOM_CODEX_UNSAFE=1 alone behaves identically to the new default (full access)"
+assert_contains "LOOM_CODEX_UNSAFE=1 is deprecated" "$output" \
+    "LOOM_CODEX_UNSAFE=1 alone prints a deprecation warning pointing at LOOM_CODEX_SAFE=1"
+
+# Both LOOM_CODEX_SAFE=1 and LOOM_CODEX_UNSAFE=1 set -> LOOM_CODEX_SAFE wins
+# (full-auto); no deprecation warning needed since UNSAFE is redundant here
+output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+    LOOM_CODEX_SAFE=1 LOOM_CODEX_UNSAFE=1 \
+    "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" --dangerously-skip-permissions 2>&1 || true)
+assert_contains "stub-codex args=exec --full-auto hello" "$output" \
+    "both LOOM_CODEX_SAFE=1 and LOOM_CODEX_UNSAFE=1 set -> LOOM_CODEX_SAFE wins (full-auto)"
+assert_not_contains "is deprecated" "$output" \
+    "no deprecation warning when LOOM_CODEX_SAFE=1 also set (UNSAFE is redundant but harmless)"
 
 # No skip-permissions -> no permission flag injected (Codex default sandbox)
 output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
@@ -196,6 +222,13 @@ assert_not_contains "--full-auto" "$(stub_lines "$output")" \
     "no skip-permissions -> no --full-auto injected"
 assert_not_contains "--dangerously-bypass-approvals-and-sandbox" "$(stub_lines "$output")" \
     "no skip-permissions -> no bypass flag injected"
+
+# LOOM_CODEX_SAFE=1 WITHOUT skip-permissions -> stays gated (no flag)
+output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+    LOOM_CODEX_SAFE=1 \
+    "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+assert_not_contains "--full-auto" "$(stub_lines "$output")" \
+    "LOOM_CODEX_SAFE=1 alone (no skip-permissions) does NOT inject --full-auto"
 
 # LOOM_CODEX_UNSAFE=1 WITHOUT skip-permissions -> bypass stays gated (no flag)
 output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
