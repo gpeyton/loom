@@ -113,7 +113,18 @@ echo "Testing spawn-codex-wave.sh dispatch..."
 
 STUB_DIR="$(mktemp -d)"
 LOG_DIR="$(mktemp -d)"
-trap 'rm -rf "$STUB_DIR" "$LOG_DIR"' EXIT
+trap 'rm -rf "$STUB_DIR" "$LOG_DIR" "$CLAIM_WORKSPACE"' EXIT
+
+# Issue #53: spawn-codex-wave.sh now gates each child on sweep-claim.sh, whose
+# claim/lock files live under `<repo-root>/.loom/{sweep-claims,locks}/` --
+# repo-root being resolved via `git rev-parse --git-common-dir` when
+# LOOM_WORKSPACE is unset (the same convention worktree.sh/spawn-claude.sh
+# use). Running this suite from inside the real repo/worktree WITHOUT an
+# isolated LOOM_WORKSPACE would therefore leak real claim files into the
+# developer's actual `.loom/` directory. Export an isolated LOOM_WORKSPACE
+# for the whole suite so every invocation below is fully self-contained.
+CLAIM_WORKSPACE="$(mktemp -d)"
+export LOOM_WORKSPACE="$CLAIM_WORKSPACE"
 
 cat > "$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash
@@ -358,8 +369,10 @@ PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$FRESH_LOG_DIR" \
 child_log="$(cat "$FRESH_LOG_DIR/spawn-codex-wave-issue-42.log" 2>/dev/null || echo "")"
 assert_contains "args=exec --dangerously-bypass-approvals-and-sandbox" "$child_log" \
     "single-issue wave child invokes 'codex exec --dangerously-bypass-approvals-and-sandbox ...' exactly like a direct spawn-codex.sh call (issue #31 default)"
-assert_contains "loom-sweep.md" "$child_log" \
-    "single-issue wave child's prompt references the .codex/prompts/loom-sweep.md shim"
+assert_contains ".agents/skills/loom-sweep/SKILL.md" "$child_log" \
+    "single-issue wave child's prompt references the canonical loom-sweep skill (issue #53 -- repointed off the retired .codex/prompts/loom-sweep.md shim)"
+assert_not_contains ".codex/prompts/loom-sweep.md" "$child_log" \
+    "single-issue wave child's prompt no longer references the retired .codex/prompts/loom-sweep.md shim (issue #53)"
 assert_contains "issue 42" "$child_log" \
     "single-issue wave child's prompt names the correct issue number"
 rm -rf "$FRESH_LOG_DIR"
@@ -636,6 +649,231 @@ output=$(PATH="$NO_DEADLINE_STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$NO
 assert_contains "outcome breakdown -- completed=1 failed=0 cancelled=0" "$output" \
     "without LOOM_CODEX_WAVE_HARD_DEADLINE_SEC set, no deadline is applied -- the default process-level path has no inactivity/time timeout"
 rm -rf "$NO_DEADLINE_LOG_DIR" "$NO_DEADLINE_STUB_DIR"
+
+# ============================================================
+# Section 15: claim/lease preflight (issue #53) -- reproduction of the #51
+# "silent no-op rerun" defect and its fix. A retry must skip a genuinely
+# LIVE claim without spawning a child, and must reclaim + spawn on an
+# ORPHANED claim (the exact curator-done + loom:building + partial-diff +
+# no-PR + no-live-owner scenario from the issue).
+# ============================================================
+
+echo ""
+echo "Testing claim/lease preflight -- skip live, reclaim orphaned (issue #53)..."
+
+SWEEP_CLAIM_BIN_UNDER_TEST="$SCRIPTS_DIR/sweep-claim.sh"
+
+# --- 15a: a LIVE claim (real, currently-running owner) is never stolen ---
+CLAIM_WS_LIVE="$(mktemp -d)"
+CLAIM_LOG_DIR_LIVE="$(mktemp -d)"
+sleep 30 &
+LIVE_OWNER_PID=$!
+LOOM_WORKSPACE="$CLAIM_WS_LIVE" "$SWEEP_CLAIM_BIN_UNDER_TEST" acquire 9401 --pid "$LIVE_OWNER_PID" --runtime codex >/dev/null
+
+set +e
+output=$(PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$CLAIM_LOG_DIR_LIVE" \
+    LOOM_WORKSPACE="$CLAIM_WS_LIVE" \
+    "$SCRIPTS_DIR/spawn-codex-wave.sh" 9401 2>&1)
+exit_code=$?
+set -e
+assert_eq "0" "$exit_code" "a retry against a genuinely live claim exits 0 (a skip, not a failure)"
+assert_contains "has a LIVE claim -- not spawning a child" "$output" \
+    "the wave logs that issue #9401's live claim blocked spawning a child"
+assert_contains "outcome breakdown -- completed=0 failed=0 cancelled=0 skipped=1" "$output" \
+    "the outcome breakdown counts the live-claim issue as skipped, not completed"
+assert_eq "0" "$([[ -f "$CLAIM_LOG_DIR_LIVE/spawn-codex-wave-issue-9401.log" ]] && echo 1 || echo 0)" \
+    "no per-issue log file was created for a skipped issue -- no child was ever spawned"
+
+if command -v jq &>/dev/null; then
+    skipped_outcome=$(jq -r '.children[0].outcome' "$CLAIM_LOG_DIR_LIVE/spawn-codex-wave-status.json" 2>/dev/null)
+    skipped_pid=$(jq -r '.children[0].pid' "$CLAIM_LOG_DIR_LIVE/spawn-codex-wave-status.json" 2>/dev/null)
+    assert_eq "skipped" "$skipped_outcome" "structured status: the live-claim issue's outcome is 'skipped', distinct from 'completed'"
+    assert_eq "null" "$skipped_pid" "structured status: a skipped issue has no child pid (none was ever spawned)"
+fi
+
+live_claim_status=$(LOOM_WORKSPACE="$CLAIM_WS_LIVE" "$SWEEP_CLAIM_BIN_UNDER_TEST" status 9401)
+assert_contains '"status": "active"' "$live_claim_status" \
+    "the live claim itself is untouched by the skip -- still active, never disturbed"
+
+kill "$LIVE_OWNER_PID" 2>/dev/null || true
+rm -rf "$CLAIM_WS_LIVE" "$CLAIM_LOG_DIR_LIVE"
+
+# --- 15b: an ORPHANED claim (owner dead) is reclaimed and a child spawned;
+# this is the exact #51 reproduction: curator-done + loom:building +
+# worktree partial diff + no PR + no live owner -- rerunning must NOT no-op.
+# The fixture also plants a sweep-checkpoint (phase=curator-done) and a fake
+# worktree directory with a "partial diff" marker file, matching the full
+# reproduction scenario verbatim -- and asserts BOTH survive the reclaim
+# untouched (spawn-codex-wave.sh's own claim gate never inspects or mutates
+# checkpoints/worktrees; that stays the LLM session's job per worktree.sh's
+# idempotency contract).
+CLAIM_WS_ORPHAN="$(mktemp -d)"
+CLAIM_LOG_DIR_ORPHAN="$(mktemp -d)"
+SWEEP_CHECKPOINT_BIN_UNDER_TEST="$SCRIPTS_DIR/sweep-checkpoint.sh"
+
+# Plant the checkpoint (curator-done) and a fake worktree with a partial diff.
+LOOM_WORKSPACE="$CLAIM_WS_ORPHAN" "$SWEEP_CHECKPOINT_BIN_UNDER_TEST" write 9402 curator-done --task-id "repro-53" >/dev/null
+mkdir -p "$CLAIM_WS_ORPHAN/.loom/worktrees/issue-9402"
+echo "diff --git a/foo.txt b/foo.txt (partial builder work, pre-interruption)" \
+    > "$CLAIM_WS_ORPHAN/.loom/worktrees/issue-9402/PARTIAL_DIFF_MARKER"
+
+( exit 0 ) &
+DEAD_OWNER_SRC=$!
+wait "$DEAD_OWNER_SRC" 2>/dev/null
+DEAD_OWNER_PID=$DEAD_OWNER_SRC
+LOOM_WORKSPACE="$CLAIM_WS_ORPHAN" "$SWEEP_CLAIM_BIN_UNDER_TEST" acquire 9402 --pid "$DEAD_OWNER_PID" --runtime codex >/dev/null
+
+set +e
+output=$(PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$CLAIM_LOG_DIR_ORPHAN" \
+    LOOM_WORKSPACE="$CLAIM_WS_ORPHAN" \
+    "$SCRIPTS_DIR/spawn-codex-wave.sh" 9402 2>&1)
+exit_code=$?
+set -e
+assert_eq "0" "$exit_code" "a retry against an orphaned (dead-owner) claim exits 0 (reclaimed and completed)"
+assert_contains "outcome breakdown -- completed=1 failed=0 cancelled=0 skipped=0" "$output" \
+    "the outcome breakdown counts the reclaimed issue as completed -- a real child was spawned and ran, not a no-op"
+assert_eq "1" "$([[ -f "$CLAIM_LOG_DIR_ORPHAN/spawn-codex-wave-issue-9402.log" ]] && echo 1 || echo 0)" \
+    "a per-issue log file WAS created for the reclaimed issue -- this is the #51 fix: the retry actually ran Builder instead of silently no-op'ing"
+
+reclaimed_status=$(LOOM_WORKSPACE="$CLAIM_WS_ORPHAN" "$SWEEP_CLAIM_BIN_UNDER_TEST" status 9402)
+assert_contains '"status": "released"' "$reclaimed_status" \
+    "after a completed reclaim, the claim is released (a clean terminal state, not left dangling active)"
+
+checkpoint_phase_after="$(LOOM_WORKSPACE="$CLAIM_WS_ORPHAN" "$SWEEP_CHECKPOINT_BIN_UNDER_TEST" phase 9402)"
+assert_eq "curator-done" "$checkpoint_phase_after" \
+    "the curator-done checkpoint survives the reclaim untouched -- spawn-codex-wave.sh's claim gate never mutates checkpoints (that stays the sweep skill's job)"
+assert_eq "1" "$([[ -f "$CLAIM_WS_ORPHAN/.loom/worktrees/issue-9402/PARTIAL_DIFF_MARKER" ]] && echo 1 || echo 0)" \
+    "the worktree's partial diff marker survives the reclaim untouched -- reused, not discarded or duplicated"
+
+rm -rf "$CLAIM_WS_ORPHAN" "$CLAIM_LOG_DIR_ORPHAN"
+
+# --- 15c: on FAILURE, the wave releases the claim to 'resumable' (not left
+# active/undead) so the NEXT retry can reclaim it too -- this is the
+# "owning runner releases the claim" half of the #53 contract.
+CLAIM_WS_FAIL="$(mktemp -d)"
+CLAIM_LOG_DIR_FAIL="$(mktemp -d)"
+FAIL_ONE_STUB_DIR="$(mktemp -d)"
+cat > "$FAIL_ONE_STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$FAIL_ONE_STUB_DIR/codex"
+
+set +e
+output=$(PATH="$FAIL_ONE_STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$CLAIM_LOG_DIR_FAIL" \
+    LOOM_WORKSPACE="$CLAIM_WS_FAIL" \
+    "$SCRIPTS_DIR/spawn-codex-wave.sh" 9403 2>&1)
+set -e
+assert_contains "outcome breakdown -- completed=0 failed=1" "$output" "a genuinely failing child is still counted as failed (unchanged #52 behavior)"
+failed_claim_status=$(LOOM_WORKSPACE="$CLAIM_WS_FAIL" "$SWEEP_CLAIM_BIN_UNDER_TEST" status 9403)
+assert_contains '"status": "resumable"' "$failed_claim_status" \
+    "after a failed child, the claim is released to resumable -- the next retry can reclaim it without operator intervention"
+
+rm -rf "$CLAIM_WS_FAIL" "$CLAIM_LOG_DIR_FAIL" "$FAIL_ONE_STUB_DIR"
+
+# --- 15d: on CANCELLATION (SIGTERM), the wave releases the claim to
+# 'resumable' too -- cancellation is recoverable, not corrupt (per #52's
+# outcome taxonomy, consumed verbatim by #53).
+if command -v python3 &>/dev/null; then
+    CLAIM_WS_CANCEL="$(mktemp -d)"
+    CLAIM_LOG_DIR_CANCEL="$(mktemp -d)"
+    CANCEL_STUB_DIR="$(mktemp -d)"
+    cat > "$CANCEL_STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+trap 'exit 143' TERM
+sleep 30
+exit 0
+STUB
+    chmod +x "$CANCEL_STUB_DIR/codex"
+
+    CANCEL_OUTFILE="$(mktemp)"
+    set +e
+    CANCEL_STUB_DIR="$CANCEL_STUB_DIR" SPAWN_CODEX_WAVE_SH="$SCRIPTS_DIR/spawn-codex-wave.sh" \
+    CANCEL_LOG_DIR="$CLAIM_LOG_DIR_CANCEL" CANCEL_WORKSPACE="$CLAIM_WS_CANCEL" CANCEL_OUTFILE="$CANCEL_OUTFILE" \
+    python3 - <<'PYEOF'
+import os, signal, subprocess, time
+
+script = os.environ["SPAWN_CODEX_WAVE_SH"]
+env = dict(os.environ)
+env["PATH"] = os.environ["CANCEL_STUB_DIR"] + ":" + env.get("PATH", "")
+env["LOOM_CODEX_WAVE_LOG_DIR"] = os.environ["CANCEL_LOG_DIR"]
+env["LOOM_WORKSPACE"] = os.environ["CANCEL_WORKSPACE"]
+
+with open(os.environ["CANCEL_OUTFILE"], "wb") as f:
+    proc = subprocess.Popen([script, "9404"], stdout=f, stderr=subprocess.STDOUT, env=env)
+    time.sleep(1)
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=15)
+PYEOF
+    set -e
+    cancel_output="$(cat "$CANCEL_OUTFILE" 2>/dev/null)"
+    assert_contains "cancelled_by_parent" "$cancel_output" "the cancelled child's outcome is reported as cancelled_by_parent"
+
+    cancelled_claim_status=$(LOOM_WORKSPACE="$CLAIM_WS_CANCEL" "$SWEEP_CLAIM_BIN_UNDER_TEST" status 9404)
+    assert_contains '"status": "resumable"' "$cancelled_claim_status" \
+        "after a parent-cancelled child, the claim is released to resumable -- cancellation is recoverable, not corrupt (#52 taxonomy consumed by #53)"
+
+    rm -f "$CANCEL_OUTFILE"
+    rm -rf "$CLAIM_WS_CANCEL" "$CLAIM_LOG_DIR_CANCEL" "$CANCEL_STUB_DIR"
+else
+    echo "  (python3 not available -- skipping cancellation-releases-claim assertion)"
+fi
+
+# --- 15e: CONCURRENCY at the wave level -- two spawn-codex-wave.sh
+# invocations racing on the SAME single issue must result in exactly one
+# child actually running (the other must see the live claim the first
+# invocation acquired and skip). This is the wave-level analogue of
+# test-sweep-claim.sh's lower-level acquire race, exercised through the
+# actual script under test end-to-end.
+echo ""
+echo "Testing wave-level concurrent retries are atomic (issue #53)..."
+
+CLAIM_WS_RACE="$(mktemp -d)"
+RACE_LOG_DIR_A="$(mktemp -d)"
+RACE_LOG_DIR_B="$(mktemp -d)"
+SLOW_STUB_DIR="$(mktemp -d)"
+cat > "$SLOW_STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+exit 0
+STUB
+chmod +x "$SLOW_STUB_DIR/codex"
+
+RACE_OUT_A="$(mktemp)"
+RACE_OUT_B="$(mktemp)"
+(
+    PATH="$SLOW_STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$RACE_LOG_DIR_A" LOOM_WORKSPACE="$CLAIM_WS_RACE" \
+        "$SCRIPTS_DIR/spawn-codex-wave.sh" 9405 >"$RACE_OUT_A" 2>&1
+) &
+WAVE_JOB_A=$!
+(
+    PATH="$SLOW_STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$RACE_LOG_DIR_B" LOOM_WORKSPACE="$CLAIM_WS_RACE" \
+        "$SCRIPTS_DIR/spawn-codex-wave.sh" 9405 >"$RACE_OUT_B" 2>&1
+) &
+WAVE_JOB_B=$!
+set +e
+wait "$WAVE_JOB_A" "$WAVE_JOB_B" 2>/dev/null
+set -e
+
+race_out_a="$(cat "$RACE_OUT_A" 2>/dev/null)"
+race_out_b="$(cat "$RACE_OUT_B" 2>/dev/null)"
+
+# Exactly one of the two concurrent wave invocations should have actually
+# spawned a child (a per-issue log file with real content); the other must
+# have skipped without spawning.
+log_a_exists=0; log_b_exists=0
+[[ -f "$RACE_LOG_DIR_A/spawn-codex-wave-issue-9405.log" ]] && log_a_exists=1
+[[ -f "$RACE_LOG_DIR_B/spawn-codex-wave-issue-9405.log" ]] && log_b_exists=1
+spawned_count=$((log_a_exists + log_b_exists))
+assert_eq "1" "$spawned_count" "exactly one of two concurrent spawn-codex-wave.sh invocations for the same issue actually spawns a child"
+
+skip_count=0
+[[ "$race_out_a" == *"has a LIVE claim -- not spawning a child"* ]] && skip_count=$((skip_count + 1))
+[[ "$race_out_b" == *"has a LIVE claim -- not spawning a child"* ]] && skip_count=$((skip_count + 1))
+assert_eq "1" "$skip_count" "exactly one of the two concurrent invocations reports the other's live claim and skips"
+
+rm -f "$RACE_OUT_A" "$RACE_OUT_B"
+rm -rf "$CLAIM_WS_RACE" "$RACE_LOG_DIR_A" "$RACE_LOG_DIR_B" "$SLOW_STUB_DIR"
 
 # ============================================================
 # Summary

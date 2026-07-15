@@ -4,7 +4,10 @@
 # and #20's guardrail parity). Issue #52 (follow-up to #51's two real-incident
 # reproductions) hardened this script's supervision contract -- see the
 # "Cancellation & the patience contract" section below before touching any of
-# the trap / status-file / outcome-taxonomy code.
+# the trap / status-file / outcome-taxonomy code. Issue #53 added the
+# claim/lease preflight gate (see "Claim/lease preflight (issue #53)" below)
+# so a retry of an issue whose prior child was cancelled or crashed reclaims
+# and resumes instead of silently no-op'ing on a stale loom:building label.
 #
 # ---------------------------------------------------------------------------
 # What this is
@@ -19,8 +22,10 @@
 # Given a wave (a list of issue numbers), this script:
 #   1. Spawns one child per issue, each running the existing single-role
 #      sequential Codex sweep lifecycle (Curator -> Builder -> Judge ->
-#      Doctor -> Merge, one session, via spawn-codex.sh + the
-#      `.codex/prompts/loom-sweep.md` shim — the same machinery #19 shipped).
+#      Doctor -> Merge, one session, via spawn-codex.sh + the canonical
+#      `.agents/skills/loom-sweep/SKILL.md` entry point -- the same
+#      machinery #19 shipped, repointed off the retired
+#      `.codex/prompts/loom-sweep.md` prompt by issue #53).
 #   2. Waits for EVERY child in the wave to exit before returning.
 #   3. Reports a non-zero exit code if ANY child failed.
 #
@@ -112,6 +117,12 @@
 #                         | bucket; not expected in normal operation, only
 #                         | meaningful when reading a status file whose wave
 #                         | process is no longer alive to finish updating it)
+#   skipped               | (issue #53) no child was spawned for this issue at
+#                         | all because the claim/lease preflight found a
+#                         | LIVE owner already working it -- a genuine no-op,
+#                         | distinct from every outcome above. Never confuse
+#                         | this with `completed`: `completed` means a child
+#                         | ran and exited 0; `skipped` means no child ran.
 #
 # `LOOM_CODEX_WAVE_CANCEL_INITIATOR` (values: "operator" | "parent") lets an
 # explicit caller override the signal-based default mapping (SIGINT ->
@@ -144,6 +155,48 @@
 # how long the child has been quiet. See `.claude/commands/loom/sweep.md`'s
 # "Codex Child Supervision Contract" section for the full policy this script
 # implements the mechanical half of.
+#
+# ---------------------------------------------------------------------------
+# Claim/lease preflight (issue #53)
+# ---------------------------------------------------------------------------
+# The #51 incident's second half: after a Builder child was cancelled or
+# crashed, rerunning `spawn-codex-wave.sh <issue>` exited 0 without doing any
+# Builder work, because the ONLY signal available was the forge's
+# `loom:building` label -- and a label can't tell you whether the process
+# that set it is still alive. This script now consults a local, atomically-
+# updated ownership lease (`sweep-claim.sh`, `.loom/sweep-claims/issue-<N>.json`)
+# BEFORE spawning each child:
+#
+#   - If a LIVE claim exists for the issue (status=active, pid alive) --
+#     i.e. #52's own structured state would show that issue as `running` --
+#     this script does NOT spawn a child for it at all. The per-issue outcome
+#     is `skipped`, a distinct bucket from `completed`/`failed`/`cancelled_*`
+#     (see the outcome table below) -- so a retry that finds nothing to do
+#     because the claim is genuinely still live is never confused with a
+#     completed run in the structured status file or the summary line.
+#   - Otherwise (no claim, or an orphaned claim -- status resumable/released,
+#     or status active with a dead pid) the lease is atomically acquired
+#     (`sweep-claim.sh acquire`, mkdir-lock guarded -- see that script's own
+#     header for the concurrency guarantee) and a child IS spawned. Because
+#     `worktree.sh` is idempotent, the fresh child re-enters the SAME
+#     worktree and reuses whatever partial diff a prior, now-dead child left
+#     behind -- no duplicate clone, no discarded work.
+#   - On the child's terminal outcome, this script (which holds the lease
+#     for the child's whole lifetime, by construction: it acquired the lease
+#     right before forking and is the one process that `wait`s on the
+#     child) releases the lease itself rather than trusting a child that may
+#     have been killed to clean up after itself:
+#       * `completed`            -> release --status released
+#       * `failed`               -> release --status resumable
+#       * `cancelled_by_*`       -> release --status resumable
+#     A `resumable` lease is exactly what makes the NEXT retry's acquire
+#     succeed instead of refusing -- this is the mechanical fix for the #51
+#     "silent no-op rerun" defect.
+#
+# See `sweep-claim.sh`'s own header for the full lease schema, the mkdir-lock
+# atomicity argument, and why `flock` is not used (stock-macOS compat, same
+# precedent as `loom_tools.tokens.bad_tokens` and `worktree.sh`'s own
+# `acquire_worktree_lock`).
 #
 # ---------------------------------------------------------------------------
 # Opt-in gating (CONCURRENCY — orthogonal to spawn-codex.sh's permission env
@@ -220,16 +273,27 @@
 #   LOOM_SPAWN_CODEX_BIN     Override path to spawn-codex.sh. Default:
 #                            script-relative spawn-codex.sh. Tests use this to
 #                            swap in fixtures.
+#   SWEEP_CLAIM_BIN          (issue #53) Override path to sweep-claim.sh, the
+#                            claim/lease preflight helper this script gates
+#                            each child on. Default: script-relative
+#                            sweep-claim.sh. Tests use this to swap in
+#                            fixtures / point at an isolated LOOM_WORKSPACE.
 #   LOOM_MODEL, OPENAI_API_KEY, LOOM_WORKSPACE, LOOM_SPAWN_NO_EXPORT,
 #   LOOM_PYTHON, LOOM_PACKAGE_PATH
 #                            All forwarded to spawn-codex.sh unchanged; see
 #                            that script's header for their semantics.
+#                            LOOM_WORKSPACE is ALSO consulted directly by this
+#                            script and by sweep-claim.sh to resolve
+#                            `.loom/sweep-claims/` and `.loom/locks/` (issue
+#                            #53) -- same resolution rule spawn-codex.sh
+#                            already uses.
 #
 # Exit codes:
 #   0    every child in the wave completed with exit 0 (or, on cancellation,
-#        every child had already completed before the signal arrived)
+#        every child had already completed before the signal arrived, or
+#        every issue in the wave was skipped because its claim was live)
 #   1    at least one child exited non-zero as a genuine failure (per-issue
-#        exit codes are printed) -- NOT set for cancelled children
+#        exit codes are printed) -- NOT set for cancelled or skipped children
 #   78   EX_CONFIG: no issue numbers supplied, or an argument is not a
 #        positive integer, or spawn-codex.sh is missing
 #   130  the wave was cancelled via SIGINT (128 + signal 2)
@@ -325,16 +389,95 @@ if [[ ! -x "$SPAWN_CODEX_BIN" ]]; then
     exit 78  # EX_CONFIG
 fi
 
+# --- Resolve sweep-claim.sh location (issue #53 claim/lease preflight) ---
+SWEEP_CLAIM_BIN="${SWEEP_CLAIM_BIN:-$SCRIPT_DIR/sweep-claim.sh}"
+CLAIM_GATE_AVAILABLE=1
+if [[ ! -x "$SWEEP_CLAIM_BIN" ]]; then
+    log_warn "sweep-claim.sh not found or not executable at: $SWEEP_CLAIM_BIN -- claim/lease preflight disabled, all issues will be spawned unconditionally (pre-#53 behavior)"
+    CLAIM_GATE_AVAILABLE=0
+fi
+
 # --- Build the Codex sweep prompt for one issue ---
 # Mirrors the codex branch of `encode_child_prompt` in
 # loom-daemon/src/sweep_registry.rs (the daemon's own single source of truth
 # for codex worker_type child prompts). This script runs independently of the
 # daemon (see "Coordination substrate decision" above), so it carries its own
 # equivalent copy rather than shelling out to Rust; keep the two in sync by
-# hand if either wording changes.
+# hand if either wording changes. Repointed off the retired
+# `.codex/prompts/loom-sweep.md` prompt onto the canonical
+# `.agents/skills/loom-sweep/SKILL.md` entry point by issue #53 (both this
+# copy and the Rust one were found still pointing at the retired prompt in
+# the same #51/#53 reproduction that motivated the claim/lease work below).
 _encode_prompt() {
     local issue="$1"
-    printf 'Read the file .codex/prompts/loom-sweep.md in this repository and follow it exactly to run a Loom sweep for issue %s (treat its arguments as: %s). You are running under the Codex runtime: `codex exec` cannot resolve Claude slash commands or Codex slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor -> Merge lifecycle sequentially in this one session per that shim'"'"'s Codex guidance -- do not attempt Claude Code Task-tool subagents.' "$issue" "$issue"
+    printf 'Read the file .agents/skills/loom-sweep/SKILL.md in this repository and follow it exactly to run a Loom sweep for issue %s (treat its arguments as: %s). You are running under the Codex runtime: `codex exec` cannot resolve Claude slash commands or Codex slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor -> Merge lifecycle sequentially in this one session per that skill'"'"'s Codex guidance -- do not attempt Claude Code Task-tool subagents.' "$issue" "$issue"
+}
+
+# --- Claim/lease preflight (issue #53) ---
+# Returns 0 and prints the acquired run_id on stdout if this issue is safe to
+# spawn a child for (no live owner). Returns 4 (sweep-claim.sh's own "refused,
+# still live" exit code) and prints nothing to stdout if a live claim already
+# owns the issue -- the caller must NOT spawn a child in that case. Any other
+# non-zero exit (lock timeout, I/O error) is treated as "cannot determine,
+# fail open and spawn anyway" -- a claim-system hiccup must never be able to
+# wedge a wave that would otherwise have made progress.
+#
+# Uses THIS SCRIPT's own PID ($$), not the not-yet-forked child's PID, as the
+# lease's liveness anchor. This is deliberate and correct: spawn-codex-wave.sh
+# always forks the child and then synchronously `wait`s on it (sequentially
+# per-issue, or collected and waited-on at the settling boundary in concurrent
+# mode) -- so this process's lifetime is a superset of the child's lifetime by
+# construction. If this process dies (killed, crashed) before the child
+# settles, `$$` goes dead and the NEXT invocation's `kill -0 $$`-based
+# liveness check correctly reports the claim as orphaned -- exactly the #51
+# scenario this issue fixes. There is no need for a separate
+# acquire-then-update-pid dance.
+_claim_acquire() {
+    local issue="$1"
+    if [[ "$CLAIM_GATE_AVAILABLE" != "1" ]]; then
+        echo ""  # no run_id to track; caller treats empty as "no claim tracked"
+        return 0
+    fi
+    local errfile="$LOG_DIR/.claim-acquire-err.$$.$issue"
+    local run_id code
+    # NOTE: capture $? on the SAME line as the command substitution, not
+    # after an `if cmd; then ...; fi` block -- when such a block's condition
+    # is false and there is no `else`, the *if construct's own* exit status
+    # is unconditionally 0 (POSIX if-semantics), which silently discards the
+    # command's real exit code. This bit us during development (#53): a
+    # refused acquire (exit 4) was misread as exit 0 because `local code=$?`
+    # was placed after the `fi` instead of right after the substitution.
+    run_id="$("$SWEEP_CLAIM_BIN" acquire "$issue" --pid "$$" --runtime codex 2>"$errfile")"
+    code=$?
+    if [[ "$code" -eq 0 ]]; then
+        rm -f "$errfile" 2>/dev/null
+        echo "$run_id"
+        return 0
+    fi
+    local errtext=""
+    [[ -f "$errfile" ]] && errtext="$(cat "$errfile" 2>/dev/null)"
+    rm -f "$errfile" 2>/dev/null
+    if [[ "$code" -eq 4 ]]; then
+        log_warn "spawn-codex-wave: issue #$issue has a LIVE claim -- not spawning a child (retry found nothing to do; this is the #53 fix, not a bug). $errtext"
+        return 4
+    fi
+    log_warn "spawn-codex-wave: sweep-claim.sh acquire failed for issue #$issue for a reason other than a live claim (exit $code) -- failing open and spawning anyway. $errtext"
+    echo ""
+    return 0
+}
+
+# Release a claim this script acquired, mapping the child's terminal outcome
+# to the claim status per the "Claim/lease preflight (issue #53)" contract
+# above: completed -> released, failed/cancelled_by_* -> resumable. Best
+# effort -- a release failure must never fail the wave.
+_claim_release() {
+    local issue="$1" run_id="$2" outcome="$3"
+    [[ "$CLAIM_GATE_AVAILABLE" == "1" ]] || return 0
+    [[ -n "$run_id" ]] || return 0
+    local status="resumable"
+    [[ "$outcome" == "completed" ]] && status="released"
+    "$SWEEP_CLAIM_BIN" release "$issue" --run-id "$run_id" --status "$status" \
+        --reason "spawn-codex-wave.sh child outcome=$outcome" >/dev/null 2>&1 || true
 }
 
 # --- Run one issue's Codex sweep child, logging to a per-issue file ---
@@ -368,6 +511,7 @@ CHILD_OUTCOME=()
 CHILD_EXIT_CODE=()
 CHILD_SIGNAL=()
 CHILD_INITIATOR=()
+CHILD_RUN_ID=()
 DEADLINE_WATCHER_PID_FOR=()
 
 for i in "${!ISSUES[@]}"; do
@@ -558,6 +702,13 @@ _wait_and_record() {
         fi
     fi
     _reap_deadline_watcher "$idx"
+    # Release the claim/lease this script acquired for this issue (issue
+    # #53), mapping the now-final outcome to the lease status per the
+    # "Claim/lease preflight" contract: completed -> released,
+    # failed/cancelled_by_* -> resumable. This runner -- not the (possibly
+    # already-dead) child -- is responsible for the release, because it is
+    # the process that held the lease's liveness anchor ($$) the whole time.
+    _claim_release "$issue" "${CHILD_RUN_ID[$idx]:-}" "${CHILD_OUTCOME[$idx]:-unknown}"
     _status_write
 }
 
@@ -573,6 +724,19 @@ if [[ "${LOOM_CODEX_MULTI_WAVE:-}" == "1" && "$TOTAL" -gt 1 ]]; then
             log_warn "spawn-codex-wave: wave already cancelled -- not starting issue #$issue"
             continue
         fi
+        # Claim/lease preflight (issue #53): skip spawning entirely if a
+        # live owner already holds this issue's claim -- see "Claim/lease
+        # preflight" in the header and _claim_acquire's own comment.
+        claim_run_id=""
+        claim_run_id="$(_claim_acquire "$issue")"
+        claim_code=$?
+        if [[ "$claim_code" -eq 4 ]]; then
+            CHILD_OUTCOME[$i]="skipped"
+            CHILD_FINISHED_AT[$i]="$(_now)"
+            _status_write
+            continue
+        fi
+        CHILD_RUN_ID[$i]="$claim_run_id"
         _run_child "$issue" &
         pid="$!"
         PIDS[$i]="$pid"
@@ -605,6 +769,19 @@ else
             log_warn "spawn-codex-wave: wave already cancelled -- not starting issue #$issue"
             continue
         fi
+        # Claim/lease preflight (issue #53): skip spawning entirely if a
+        # live owner already holds this issue's claim -- see "Claim/lease
+        # preflight" in the header and _claim_acquire's own comment.
+        claim_run_id=""
+        claim_run_id="$(_claim_acquire "$issue")"
+        claim_code=$?
+        if [[ "$claim_code" -eq 4 ]]; then
+            CHILD_OUTCOME[$i]="skipped"
+            CHILD_FINISHED_AT[$i]="$(_now)"
+            _status_write
+            continue
+        fi
+        CHILD_RUN_ID[$i]="$claim_run_id"
         _run_child "$issue" &
         pid="$!"
         CHILD_PID[$i]="$pid"
@@ -621,22 +798,25 @@ _status_write
 echo "spawn-codex-wave: wave settled -- $TOTAL issue(s), ${#FAILED_ISSUES[@]} failed" >&2
 
 # Outcome breakdown (issue #52 AC: wave summaries distinguish completed /
-# failed / cancelled / still-running-unknown). This is an ADDITIONAL line --
-# the "wave settled" line above is kept byte-for-byte for existing callers.
+# failed / cancelled / still-running-unknown; issue #53 adds `skipped` --
+# see the outcome taxonomy in the header). This is an ADDITIONAL line -- the
+# "wave settled" line above is kept byte-for-byte for existing callers.
 N_COMPLETED=0
 N_FAILED=0
 N_CANCELLED=0
+N_SKIPPED=0
 N_UNKNOWN=0
 for i in "${!ISSUES[@]}"; do
     case "${CHILD_OUTCOME[$i]:-unknown}" in
         completed) N_COMPLETED=$((N_COMPLETED + 1)) ;;
         failed) N_FAILED=$((N_FAILED + 1)) ;;
         cancelled_by_*) N_CANCELLED=$((N_CANCELLED + 1)) ;;
+        skipped) N_SKIPPED=$((N_SKIPPED + 1)) ;;
         running) N_UNKNOWN=$((N_UNKNOWN + 1)) ;;
         *) N_UNKNOWN=$((N_UNKNOWN + 1)) ;;
     esac
 done
-echo "spawn-codex-wave: outcome breakdown -- completed=$N_COMPLETED failed=$N_FAILED cancelled=$N_CANCELLED still-running-or-unknown=$N_UNKNOWN" >&2
+echo "spawn-codex-wave: outcome breakdown -- completed=$N_COMPLETED failed=$N_FAILED cancelled=$N_CANCELLED skipped=$N_SKIPPED still-running-or-unknown=$N_UNKNOWN" >&2
 
 if [[ "$WAVE_CANCELLED" == "1" ]]; then
     log_error "spawn-codex-wave: wave cancelled via SIG${WAVE_CANCEL_SIGNAL} (initiator=${WAVE_CANCEL_INITIATOR})"

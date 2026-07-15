@@ -19,7 +19,7 @@
     "clippy:fix": "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged",
     "test": "cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture",
     "test:python": "cd loom-tools && uv run pytest tests/ -x -q",
-    "test:codex": "bash defaults/scripts/tests/test-spawn-worker.sh && bash defaults/scripts/tests/test-spawn-codex.sh && bash defaults/scripts/tests/test-spawn-codex-wave.sh && bash defaults/scripts/tests/test-codex-parity.sh",
+    "test:codex": "bash defaults/scripts/tests/test-spawn-worker.sh && bash defaults/scripts/tests/test-spawn-codex.sh && bash defaults/scripts/tests/test-spawn-codex-wave.sh && bash defaults/scripts/tests/test-codex-parity.sh && bash defaults/scripts/tests/test-sweep-claim.sh && bash defaults/scripts/tests/test-stale-building-check.sh",
     "check:all": "pnpm format:rust && pnpm clippy && pnpm check && pnpm test",
     "check:ci": "pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm test && pnpm test:python",
     "worktree": "./scripts/worktree.sh",

@@ -72,6 +72,7 @@ Thumbs.db
 .loom/claude-config/
 .loom/tokens/
 .loom/sweep-checkpoint/
+.loom/sweep-claims/
 .loom/spawn-loop.pid
 .loom/spawn-loop-state.json
 .loom/stop-spawn-loop

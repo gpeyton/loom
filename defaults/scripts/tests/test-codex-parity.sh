@@ -120,6 +120,14 @@ STUB_DIR="$(mktemp -d)"
 TEST_WS="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" "$TEST_WS"' EXIT
 
+# Issue #53: spawn-codex-wave.sh now gates each child on sweep-claim.sh,
+# whose claim/lock files live under `<repo-root>/.loom/{sweep-claims,locks}/`
+# (resolved via `git rev-parse --git-common-dir` when LOOM_WORKSPACE is
+# unset). Export TEST_WS as LOOM_WORKSPACE so this suite's spawn-codex-wave.sh
+# invocations below stay fully self-contained instead of leaking claim files
+# into the developer's real repo `.loom/` directory.
+export LOOM_WORKSPACE="$TEST_WS"
+
 cat > "$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash
 echo "stub-codex args=$*"
