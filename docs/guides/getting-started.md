@@ -14,6 +14,7 @@ This comprehensive guide walks you through installing and setting up Loom, wheth
 - [First-Time Setup](#first-time-setup)
 - [Verifying Your Setup](#verifying-your-setup)
 - [Next Steps](#next-steps)
+- [Using Codex with Loom](#using-codex-with-loom)
 - [Troubleshooting](#troubleshooting)
 
 ## Before You Install
@@ -537,6 +538,66 @@ Read the comprehensive workflow documentation:
 - [WORKFLOWS.md](../workflows.md) - Agent coordination patterns
 - [Agent Archetypes](../philosophy/agent-archetypes.md) - Role philosophy
 - [Git Workflow](git-workflow.md) - Branch strategy and PR process
+
+## Using Codex with Loom
+
+Loom installs OpenAI Codex CLI support alongside the Claude Code
+configuration (dual-runtime, Epic #1 Phase 2): a project-scoped
+`.codex/config.toml` and thin role prompt shims under `.codex/prompts/`.
+
+### Config placement: repo-local `.codex/config.toml` (vs `~/.codex` merge)
+
+Codex reads user-level config from `~/.codex/config.toml` (or
+`$CODEX_HOME/config.toml` if you relocate the Codex home), and it
+natively loads **project-scoped overrides** from a repo-local
+`.codex/config.toml` — but only for projects you have marked as
+**trusted** in Codex. Loom relies on that native mechanism: trust the
+repo in Codex and the installed `.codex/config.toml` is picked up
+automatically. No merge into `~/.codex/config.toml` is required, and you
+should avoid `CODEX_HOME=$(pwd)/.codex codex` (it drags auth and session
+state into the repo tree).
+
+The `loom` MCP server entry ships commented out because the `mcp-loom`
+server lives in the Loom source checkout at a machine-specific path. To
+materialize it, run from your Loom checkout:
+
+```bash
+./scripts/setup-mcp.sh --codex
+```
+
+This writes an absolute-path `[mcp_servers.loom]` entry (idempotent,
+marker-delimited) generated from the same variables as the Claude Code
+`.mcp.json` — one source of truth for both runtimes.
+
+### Prompt invocation
+
+Codex discovers custom prompts only in `$CODEX_HOME/prompts/` (default
+`~/.codex/prompts/`), not in the repo. One-time setup from the repo root:
+
+```bash
+mkdir -p ~/.codex/prompts
+ln -sf "$(pwd)/.codex/prompts/"*.md ~/.codex/prompts/
+rm -f ~/.codex/prompts/README.md
+```
+
+Then invoke roles as slash commands inside Codex — `/builder 42`,
+`/judge 123`, `/curator`, `/doctor`, `/champion`, `/guide`, `/auditor`,
+or `/loom-sweep 42`. Each shim reads the canonical
+`.loom/roles/<role>.md` file, so role behavior stays identical across
+runtimes.
+
+### Current limitations (honest list)
+
+- **No hooks**: Loom's Claude Code guardrail hooks have no Codex
+  equivalent yet — Codex sessions run without the pre-tool-use guards.
+- **No subagents**: `/loom-sweep` under Codex runs the lifecycle phases
+  sequentially in one session instead of dispatching parallel subagents.
+- **Prompts are a deprecated Codex surface**: Codex recommends skills
+  over custom prompts; the shims still work, and a skills port is
+  planned.
+
+All three gaps are Epic #1 Phase 3 scope (see Epic #1 in the issue
+tracker).
 
 ## Troubleshooting
 

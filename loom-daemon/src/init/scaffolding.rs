@@ -2,9 +2,10 @@
 //!
 //! Sets up CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ directories.
 //!
-//! `.codex/` is currently vestigial: `defaults/.codex/` does not ship (it was
-//! removed per issue #2026 / PR #2034 and will be reintroduced in dual-runtime
-//! Phase 2 — see epic #1). The copy call below silently no-ops until then.
+//! `defaults/.codex/` ships as of dual-runtime Phase 2 (epic #1, issue #11):
+//! a project-scoped OpenAI Codex CLI `config.toml` (MCP server entry) plus
+//! thin role prompt shims under `prompts/`. The copy call below remains a
+//! silent no-op for defaults trees without a `.codex/` directory.
 
 use std::collections::HashSet;
 use std::fs;
@@ -886,14 +887,11 @@ pub fn setup_repository_scaffolding(
         }
     }
 
-    // Copy .codex/ directory. Currently a silent no-op in every install:
-    // `defaults/.codex/` does not ship (removed per issue #2026 / PR #2034;
-    // will be reintroduced in dual-runtime Phase 2, see epic #1). The
-    // `copy_directory` closure's `if src.exists()` guard means this call
-    // has zero effect — no report entries, no directory creation — until
-    // that source directory exists again. Kept here (rather than removed)
-    // so Phase 2 only has to add the `defaults/.codex/` tree, not restore
-    // this call site.
+    // Copy .codex/ directory (OpenAI Codex CLI config.toml + prompt shims;
+    // ships as of dual-runtime Phase 2 — epic #1, issue #11). The
+    // `copy_directory` closure's `if src.exists()` guard keeps this a
+    // silent no-op for defaults trees without a `.codex/` directory (see
+    // test_codex_directory_copy_is_silent_noop_when_absent).
     copy_directory(
         &defaults_path.join(".codex"),
         &workspace_path.join(".codex"),
@@ -1958,11 +1956,12 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
 
     #[test]
     fn test_codex_directory_copy_is_silent_noop_when_absent() {
-        // Issue #4: `defaults/.codex/` does not currently ship (removed per
-        // #2026/#2034; reintroduced in dual-runtime Phase 2). Verify that
-        // running scaffolding setup with no `defaults/.codex/` present does
-        // not error, does not create `<workspace>/.codex/`, and does not
-        // add any report entries referencing `.codex`.
+        // Issue #4: even though `defaults/.codex/` now ships (issue #11),
+        // scaffolding must stay a silent no-op for defaults trees WITHOUT a
+        // `.codex/` directory. Verify that running scaffolding setup with no
+        // `defaults/.codex/` present does not error, does not create
+        // `<workspace>/.codex/`, and does not add any report entries
+        // referencing `.codex`.
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let defaults = temp_dir.path().join("defaults");
@@ -1989,6 +1988,56 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
                 .any(|p| p.contains(".codex")),
             "no report entries should reference .codex when the source directory is absent"
         );
+    }
+
+    #[test]
+    fn test_codex_directory_copied_when_present() {
+        // Issue #11 (dual-runtime Phase 2): now that `defaults/.codex/`
+        // ships (config.toml + prompt shims), the scaffolding copy path must
+        // materialize it in the workspace — complementing the
+        // absent-is-noop test above (#8).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".codex").join("prompts")).unwrap();
+        fs::write(defaults.join(".codex").join("config.toml"), "# codex config").unwrap();
+        fs::write(defaults.join(".codex").join("prompts").join("builder.md"), "builder shim")
+            .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // Fresh install: both files copied verbatim and reported as added.
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex").join("config.toml")).unwrap(),
+            "# codex config"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex").join("prompts").join("builder.md"))
+                .unwrap(),
+            "builder shim"
+        );
+        assert!(report.added.contains(&".codex/config.toml".to_string()));
+        assert!(report
+            .added
+            .contains(&".codex/prompts/builder.md".to_string()));
+
+        // Reinstall without force (merge mode): existing files preserved,
+        // so re-install is idempotent and never clobbers a user-customized
+        // .codex/config.toml.
+        fs::write(workspace.join(".codex").join("config.toml"), "user-customized").unwrap();
+        let mut report2 = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report2).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join(".codex").join("config.toml")).unwrap(),
+            "user-customized",
+            "merge-mode reinstall must preserve an existing .codex/config.toml"
+        );
+        assert!(report2
+            .preserved
+            .contains(&".codex/config.toml".to_string()));
     }
 
     #[test]

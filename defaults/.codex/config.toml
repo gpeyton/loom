@@ -1,0 +1,66 @@
+# Loom — OpenAI Codex CLI project-scoped configuration
+# =====================================================
+#
+# How Codex resolves configuration
+# --------------------------------
+# - User-level config lives at `~/.codex/config.toml`. The `~/.codex`
+#   directory is Codex's home; setting `$CODEX_HOME` relocates it
+#   (`$CODEX_HOME/config.toml` then becomes the user-level config, and
+#   auth, sessions, logs, and custom prompts move with it).
+# - Codex ALSO natively loads project-scoped overrides from a repo-local
+#   `.codex/config.toml` (this file). Discovery is closest-wins from the
+#   repo root down to the working directory, and project-scoped layers are
+#   only loaded for projects you have marked as TRUSTED in Codex. Project
+#   config takes precedence over profiles and user config; CLI flags and
+#   `--config` overrides beat everything.
+#   Reference: https://developers.openai.com/codex/config-reference
+#
+# Chosen install mechanism (least surprising)
+# -------------------------------------------
+# Loom installs this file at `<repo>/.codex/config.toml` and relies on
+# Codex's native project-scoped loading: once you trust this project in
+# Codex, the MCP server entry below is picked up automatically — no
+# copying, no `~/.codex` merge step, no wrapper invocation.
+#
+# Alternatives (documented for completeness, not the default):
+# - `CODEX_HOME="$(pwd)/.codex" codex` — points ALL Codex state (config,
+#   auth, sessions, prompts) at the repo copy. It works, but it also moves
+#   your auth and session storage into the repo tree; only use it for
+#   fully isolated setups.
+# - Manually merging the `[mcp_servers.loom]` entry into
+#   `~/.codex/config.toml`.
+#
+# Prompts caveat: Codex reads custom prompts ONLY from
+# `$CODEX_HOME/prompts/` (default `~/.codex/prompts/`) — the repo-local
+# `.codex/prompts/` directory is NOT scanned. See `.codex/prompts/README.md`
+# for the one-time copy/symlink step.
+#
+# MCP server entry — single source of truth
+# -----------------------------------------
+# The command/args/env for the `loom` MCP server below MUST match the
+# `loom` server entry that `scripts/setup-mcp.sh` (in the Loom source
+# checkout) writes into `.mcp.json` for Claude Code:
+#
+#     command: node
+#     args:    <loom-checkout>/mcp-loom/dist/index.js
+#     env:     LOOM_WORKSPACE=<loom-checkout>
+#
+# That script is the single source of truth for the mcp-loom invocation —
+# do not hand-edit this file into a different invocation.
+#
+# Because mcp-loom lives inside the Loom source checkout (not inside this
+# repository), the absolute path is machine-specific and cannot ship
+# pre-filled. EITHER run, from your Loom checkout:
+#
+#     ./scripts/setup-mcp.sh --codex
+#
+# which builds mcp-loom (if needed) and writes a concrete, absolute-path
+# `[mcp_servers.loom]` entry (idempotent, marker-delimited), OR uncomment
+# the template below and substitute `/path/to/loom` yourself.
+#
+# [mcp_servers.loom]
+# command = "node"
+# args = ["/path/to/loom/mcp-loom/dist/index.js"]
+#
+# [mcp_servers.loom.env]
+# LOOM_WORKSPACE = "/path/to/loom"

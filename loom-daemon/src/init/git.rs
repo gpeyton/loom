@@ -196,6 +196,18 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
     // a validation issue for those repos.
     report.has_agents_md = workspace_path.join("AGENTS.md").exists();
 
+    // Check .codex/ (dual-runtime Phase 2, issue #11). OPTIONAL: repos
+    // without Codex support are fully valid, so absence is never flagged.
+    // When the directory IS present it must carry config.toml —
+    // present-and-valid or absent, never a hard requirement.
+    let codex_dir = workspace_path.join(".codex");
+    report.has_codex_dir = codex_dir.is_dir();
+    if report.has_codex_dir && !codex_dir.join("config.toml").exists() {
+        report
+            .issues
+            .push(".codex/ present but missing config.toml".to_string());
+    }
+
     // Check labels.yml
     report.has_labels_yml = workspace_path.join(".github").join("labels.yml").exists();
     if !report.has_labels_yml {
@@ -381,5 +393,43 @@ mod tests {
         // Should now be valid
         let result = validate_git_repository(workspace.to_str().unwrap());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_codex_dir_is_optional() {
+        // Issue #11 (dual-runtime Phase 2): `.codex/` must never be a hard
+        // requirement — absent is valid, present with config.toml is valid,
+        // present without config.toml is flagged.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Absent: not flagged, no codex-related issue.
+        let report = validate_loom_source_repo(workspace);
+        assert!(!report.has_codex_dir);
+        assert!(
+            !report.issues.iter().any(|i| i.contains(".codex")),
+            "absent .codex/ must not produce a validation issue, got: {:?}",
+            report.issues
+        );
+
+        // Present but missing config.toml: flagged.
+        fs::create_dir(workspace.join(".codex")).unwrap();
+        let report = validate_loom_source_repo(workspace);
+        assert!(report.has_codex_dir);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i == ".codex/ present but missing config.toml"));
+
+        // Present and valid: no codex-related issue.
+        fs::write(workspace.join(".codex").join("config.toml"), "# loom").unwrap();
+        let report = validate_loom_source_repo(workspace);
+        assert!(report.has_codex_dir);
+        assert!(
+            !report.issues.iter().any(|i| i.contains(".codex")),
+            "valid .codex/ must not produce a validation issue, got: {:?}",
+            report.issues
+        );
     }
 }

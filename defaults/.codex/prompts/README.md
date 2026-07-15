@@ -1,0 +1,43 @@
+# Loom prompts for OpenAI Codex CLI
+
+Thin shim prompts that expose the core Loom role entry points as Codex
+slash commands. Each shim references the canonical role definition under
+`.loom/roles/` (or the sweep skill file) rather than duplicating its
+content — the same pattern the repo's `.claude/` shims use, so role
+updates land in one place.
+
+## One-time setup (required)
+
+Codex discovers custom prompts ONLY in `$CODEX_HOME/prompts/`
+(default `~/.codex/prompts/`); it does not scan this repo-local
+directory. Codex also only reads top-level Markdown files there — no
+subdirectories. Symlink (or copy) the shims once, from the repo root:
+
+```bash
+mkdir -p ~/.codex/prompts
+ln -sf "$(pwd)/.codex/prompts/"*.md ~/.codex/prompts/
+rm -f ~/.codex/prompts/README.md   # this README is not a prompt
+```
+
+Symlinks keep the prompts current when Loom updates them; plain `cp`
+works too but needs re-copying after upgrades.
+
+## Invocation
+
+Type `/` in Codex and pick the prompt by filename, passing arguments
+after the name — e.g. `/builder 42`, `/judge 123`, `/loom-sweep 42`.
+Arguments flow into the shim via the `$ARGUMENTS` placeholder
+(positional `$1`–`$9` also work).
+
+## Current limitations (Epic #1, Phase 2)
+
+- **No hooks**: Loom's Claude Code guardrail hooks (`.claude/settings.json`)
+  have no Codex equivalent yet (Epic #1 Phase 3).
+- **No subagents**: `loom-sweep` under Codex runs the lifecycle phases
+  sequentially in one session instead of dispatching subagents
+  (Epic #1 Phase 3).
+- **Prompts vs skills**: Codex marks custom prompts as deprecated in
+  favor of skills. The shims still work; a skills port is Phase 3 scope.
+
+The MCP server that these roles use for Loom coordination is configured
+in `.codex/config.toml` (see its header for setup).
