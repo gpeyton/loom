@@ -300,14 +300,15 @@ log_contents="$(cat "$LOG_DIR/spawn-codex-wave-issue-901.log" 2>/dev/null || ech
 assert_contains "dangerously-bypass-approvals-and-sandbox" "$log_contents" \
     "LOOM_CODEX_UNSAFE=1 is forwarded through to the spawn-codex.sh child unchanged"
 
-# Without LOOM_CODEX_UNSAFE, no bypass flag appears in the child's argv
+# Without any permission env vars, the child gets spawn-codex.sh's own
+# default posture unchanged by the wave script (issue #31, epic #30 Phase 1:
+# spawn-codex.sh's default is now full access, and spawn-codex-wave.sh does
+# not touch permission posture at all -- see the header note above).
 output=$(PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$LOG_DIR" \
     "$SCRIPTS_DIR/spawn-codex-wave.sh" 902 2>&1)
 log_contents="$(cat "$LOG_DIR/spawn-codex-wave-issue-902.log" 2>/dev/null || echo "")"
-assert_not_contains "dangerously-bypass-approvals-and-sandbox" "$log_contents" \
-    "no LOOM_CODEX_UNSAFE -> no bypass flag in the child's argv"
-assert_contains "full-auto" "$log_contents" \
-    "default permissions posture (--full-auto) is still applied to each wave child"
+assert_contains "dangerously-bypass-approvals-and-sandbox" "$log_contents" \
+    "no permission env vars -> spawn-codex.sh's full-access default is still applied to each wave child"
 
 # ============================================================
 # Section 8: per-issue log files
@@ -355,8 +356,8 @@ FRESH_LOG_DIR="$(mktemp -d)"
 PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$FRESH_LOG_DIR" \
     "$SCRIPTS_DIR/spawn-codex-wave.sh" 42 >/dev/null 2>&1
 child_log="$(cat "$FRESH_LOG_DIR/spawn-codex-wave-issue-42.log" 2>/dev/null || echo "")"
-assert_contains "args=exec --full-auto" "$child_log" \
-    "single-issue wave child invokes 'codex exec --full-auto ...' exactly like a direct spawn-codex.sh call"
+assert_contains "args=exec --dangerously-bypass-approvals-and-sandbox" "$child_log" \
+    "single-issue wave child invokes 'codex exec --dangerously-bypass-approvals-and-sandbox ...' exactly like a direct spawn-codex.sh call (issue #31 default)"
 assert_contains "loom-sweep.md" "$child_log" \
     "single-issue wave child's prompt references the .codex/prompts/loom-sweep.md shim"
 assert_contains "issue 42" "$child_log" \
