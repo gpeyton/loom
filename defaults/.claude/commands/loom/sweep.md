@@ -389,12 +389,12 @@ The Claude escalation ladder (`sweep.escalation`, default `["sonnet", "opus"]`) 
 - The Codex model comes from **one** source of truth: the centralized `codex-model` input default in `.github/workflows/loom-role.yml` (currently `gpt-5-codex`, the code-optimized Codex model). Bump it there, in one place, for all Codex runs. `spawn-codex.sh` honours an explicit `-m/--model` or `LOOM_MODEL` override above that default, exactly as its Claude sibling does.
 - Because there is effectively one code-optimized Codex tier, "escalate one rung on Judge rejection" collapses to "re-run Doctor on the same Codex model." This is intentional and documented, not an omission.
 
-### Guardrail parity + autonomy (hard prerequisite — issue #20)
+### Guardrail parity + autonomy (issue #20 — landed, but read the residual-gap doc)
 
-A Codex sweep that runs **autonomously with write access** is only as trustworthy as its guardrails. Loom's Claude path is protected by PreToolUse hooks (`guard-destructive.sh`, `guard-worktree-paths.sh`, the `gh pr merge` block); **Codex has no hook equivalent yet — that is issue #20 (guardrail parity), a concurrent hard prerequisite.** Until #20 lands:
+A Codex sweep that runs **autonomously with write access** is only as trustworthy as its guardrails. Loom's Claude path is protected by PreToolUse hooks (`guard-destructive.sh`, `guard-worktree-paths.sh`, the `gh pr merge` block). Issue #20 (guardrail parity, landed concurrently with this issue) maps that Claude-hook safety posture onto the Codex sandbox — see `defaults/.codex/GUARDRAIL-PARITY.md` for the hook-by-hook covered/partial/no-equivalent table and the documented residual gaps:
 
-- **A fully-autonomous Codex sweep with write access is NOT a default and must not be enabled by default.** `spawn-codex.sh` already keeps the sandbox on (`--full-auto`) unless `LOOM_CODEX_UNSAFE=1` is *explicitly* set; the bypass-everything flag stays gated behind that opt-in. Do not remove or weaken that gate here.
-- **Any Codex-sweep path that runs with fewer guards than the Claude path is opt-in and loudly documented** (this section, plus the `.codex/prompts/README.md` limitations list). Cross-reference #20 before trusting an unattended Codex sweep.
+- **A fully-autonomous Codex sweep with write access is still NOT a default.** `spawn-codex.sh` keeps the sandbox on (`--full-auto`) unless `LOOM_CODEX_UNSAFE=1` is *explicitly* set; the bypass-everything flag stays gated behind that opt-in regardless of #20's parity work. Do not remove or weaken that gate here.
+- **Any Codex-sweep path that runs with fewer guards than the Claude path is opt-in and loudly documented** (this section, `defaults/.codex/GUARDRAIL-PARITY.md`, and the `.codex/prompts/README.md` limitations list). Read the residual-gap section of the parity doc before trusting an unattended Codex sweep — parity is a mapping to the Codex sandbox model, not a byte-identical hook port.
 
 ### Scope note — multi-wave process-level Codex orchestration is deferred (follow-up #24)
 

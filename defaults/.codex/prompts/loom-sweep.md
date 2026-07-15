@@ -29,10 +29,13 @@ Codex strategy, the model-tier mapping, and the guardrail-parity gate.
 - The "one level deep" #3289 constraint is Claude-specific and does not
   apply to this process-level path — but still **settle each PR fully**
   (Judge → optional single Doctor→Judge cycle → Merge) before moving on.
-- **Guardrail parity is issue #20**: Codex has no PreToolUse-hook
-  equivalent yet, so an autonomous write-access Codex sweep stays
-  opt-in (`spawn-codex.sh` keeps the sandbox on unless
-  `LOOM_CODEX_UNSAFE=1` is explicitly set). Do not treat it as a default.
+- **Guardrail parity (issue #20, landed)**: Codex has no PreToolUse-hook
+  runtime, but #20 maps the Claude hook safety posture onto the Codex
+  sandbox — see `defaults/.codex/GUARDRAIL-PARITY.md` for the covered/
+  partial/no-equivalent table and residual gaps. An autonomous
+  write-access Codex sweep still stays opt-in (`spawn-codex.sh` keeps
+  the sandbox on unless `LOOM_CODEX_UNSAFE=1` is explicitly set) — do
+  not treat it as a default even with parity in place.
 - **Multi-wave process-level Codex orchestration** (fanning out multiple
   `codex exec` children as the analogue of `--builders-per-wave`) is a
   deferred follow-up: **#24**. Today, multiple issues run sequentially.
