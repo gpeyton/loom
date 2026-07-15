@@ -32,7 +32,11 @@ Arguments flow into the shim via the `$ARGUMENTS` placeholder
 ## Current limitations (Epic #1, Phase 2)
 
 - **No hooks**: Loom's Claude Code guardrail hooks (`.claude/settings.json`)
-  have no Codex equivalent yet (Epic #1 Phase 3).
+  have no Codex hook equivalent — Codex has no hooks system. Their safety
+  intent is mapped instead to Codex's native sandbox + approval posture in
+  `../config.toml`; see `../GUARDRAIL-PARITY.md` (Epic #1 Phase 3, #20) for the
+  hook-by-hook covered / partial / no-equivalent classification and the
+  documented residual gaps.
 - **No subagents**: `loom-sweep` under Codex runs the lifecycle phases
   sequentially in one session instead of dispatching subagents
   (Epic #1 Phase 3).

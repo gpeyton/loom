@@ -129,6 +129,11 @@ jobs:
         # Codex can't resolve Claude slash commands, so inline the role prompt
         # from the repo. Sandbox is pinned to workspace-write (the equivalent of
         # the deprecated --full-auto flag) - never a bypass-everything flag.
+        # This posture matches the documented Codex guardrail parity level
+        # (defaults/.codex/GUARDRAIL-PARITY.md, #20): workspace-write is the
+        # load-bearing guard in non-interactive runs. Do NOT add a
+        # --dangerously-bypass-approvals-and-sandbox / danger-full-access flag
+        # here — that would silently drop CI below the Claude guarantee.
         run: |
           role_file=".loom/roles/${ROLE}.md"
           if [ ! -f "$role_file" ]; then
