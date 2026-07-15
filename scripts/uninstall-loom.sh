@@ -1300,9 +1300,12 @@ else
 
   export COMMIT_MSG="Remove Loom orchestration framework
 
-Removes Loom configuration, roles, scripts, and tooling:
+Removes Loom configuration, roles, scripts, and tooling for both worker
+runtimes:
 - .loom/ directory (configuration, roles, scripts)
-- .claude/ slash commands and agent definitions
+- .claude/ slash commands and agent definitions (Claude Code)
+- .codex/ config, prompt shims, and custom agents (Codex)
+- .agents/skills/ Codex skills (\$loom, \$loom-sweep)
 - .github/ Loom-specific labels and issue templates
 - CLAUDE.md and AGENTS.md documentation
 - .gitignore Loom patterns
