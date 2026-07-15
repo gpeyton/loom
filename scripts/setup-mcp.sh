@@ -3,30 +3,57 @@
 # Builds the unified MCP server if dist/index.js is missing
 #
 # Usage:
-#   ./scripts/setup-mcp.sh            # Generate .mcp.json (Claude Code)
-#   ./scripts/setup-mcp.sh --codex    # Also emit the Codex CLI MCP entry
-#                                     # into .codex/config.toml
+#   ./scripts/setup-mcp.sh                          # Generate .mcp.json (Claude Code)
+#   ./scripts/setup-mcp.sh --codex                   # Also emit the Codex CLI MCP entry
+#                                                     # into .codex/config.toml
+#   ./scripts/setup-mcp.sh --target /path/to/consumer-repo [--codex]
+#                                                     # Write .mcp.json / .codex/config.toml
+#                                                     # into a consumer repository instead of
+#                                                     # this Loom source checkout, with
+#                                                     # LOOM_WORKSPACE pointed at the consumer.
+#                                                     # --workspace is accepted as an alias.
 #
 # The mcp-loom invocation (command/args/env) defined here is the single
 # source of truth for BOTH runtimes: the `loom` server entry in .mcp.json
 # (Claude Code) and the `[mcp_servers.loom]` entry in .codex/config.toml
 # (OpenAI Codex CLI) are generated from the same variables below. See
 # defaults/.codex/config.toml for the Codex-side documentation.
+#
+# `mcp-loom` itself only ever lives in the Loom SOURCE checkout (it is not
+# installed into consumer repos), so args always point at this checkout's
+# mcp-loom/dist/index.js regardless of --target. Only the OUTPUT location
+# (where .mcp.json / .codex/config.toml get written) and LOOM_WORKSPACE
+# (the env var mcp-loom uses to find the repo it operates on) move to the
+# target when --target/--workspace is given. See issue #49 finding 7.
 
 set -euo pipefail
 
 EMIT_CODEX=false
-for arg in "$@"; do
-  case "$arg" in
+TARGET_ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --codex)
       EMIT_CODEX=true
+      shift
+      ;;
+    --target|--workspace)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: $1 requires a path argument" >&2
+        exit 2
+      fi
+      TARGET_ARG="$2"
+      shift 2
+      ;;
+    --target=*|--workspace=*)
+      TARGET_ARG="${1#*=}"
+      shift
       ;;
     -h|--help)
-      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
-      echo "Unknown argument: $arg (supported: --codex)" >&2
+      echo "Unknown argument: $1 (supported: --codex, --target/--workspace <path>)" >&2
       exit 2
       ;;
   esac
@@ -34,10 +61,27 @@ done
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Get the workspace root (parent of scripts/)
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The Loom SOURCE checkout root (parent of scripts/) -- mcp-loom always
+# lives here, regardless of --target.
+LOOM_SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-MCP_DIR="$WORKSPACE_ROOT/mcp-loom"
+# OUTPUT_TARGET is where .mcp.json / .codex/config.toml get written, and
+# what LOOM_WORKSPACE gets set to. Defaults to the Loom source checkout
+# itself (unchanged, self-targeting behavior) unless --target/--workspace
+# names a consumer repository.
+if [[ -n "$TARGET_ARG" ]]; then
+  # Expand tilde and resolve to an absolute path; must already exist.
+  TARGET_ARG="${TARGET_ARG/#\~/$HOME}"
+  if [[ ! -d "$TARGET_ARG" ]]; then
+    echo "Error: --target/--workspace directory does not exist: $TARGET_ARG" >&2
+    exit 2
+  fi
+  OUTPUT_TARGET="$(cd "$TARGET_ARG" && pwd)"
+else
+  OUTPUT_TARGET="$LOOM_SOURCE_ROOT"
+fi
+
+MCP_DIR="$LOOM_SOURCE_ROOT/mcp-loom"
 MCP_ENTRY="$MCP_DIR/dist/index.js"
 
 # Build the unified MCP server if not already built
@@ -59,12 +103,15 @@ fi
 
 # Single source of truth for the mcp-loom server invocation. Both the
 # .mcp.json generation below and the --codex emission reuse these values.
+# MCP_ARG always points at the source checkout (mcp-loom is never installed
+# into consumer repos); MCP_ENV_LOOM_WORKSPACE follows OUTPUT_TARGET so
+# mcp-loom operates on the intended repository.
 MCP_COMMAND="node"
 MCP_ARG="$MCP_ENTRY"
-MCP_ENV_LOOM_WORKSPACE="$WORKSPACE_ROOT"
+MCP_ENV_LOOM_WORKSPACE="$OUTPUT_TARGET"
 
 # Generate .mcp.json with unified loom server
-cat > "$WORKSPACE_ROOT/.mcp.json" <<EOF
+cat > "$OUTPUT_TARGET/.mcp.json" <<EOF
 {
   "mcpServers": {
     "loom": {
@@ -79,8 +126,9 @@ cat > "$WORKSPACE_ROOT/.mcp.json" <<EOF
 EOF
 
 echo "Generated .mcp.json with unified loom MCP server"
-echo "  Workspace: $WORKSPACE_ROOT"
-echo "  Server: mcp-loom/dist/index.js"
+echo "  Output:    $OUTPUT_TARGET/.mcp.json"
+echo "  Workspace: $MCP_ENV_LOOM_WORKSPACE"
+echo "  Server:    $MCP_ARG"
 
 # Optionally emit the same server entry for OpenAI Codex CLI.
 #
@@ -90,7 +138,7 @@ echo "  Server: mcp-loom/dist/index.js"
 # this script is idempotent and hand-authored content around the block is
 # preserved.
 if [[ "$EMIT_CODEX" == "true" ]]; then
-  CODEX_DIR="$WORKSPACE_ROOT/.codex"
+  CODEX_DIR="$OUTPUT_TARGET/.codex"
   CODEX_CONFIG="$CODEX_DIR/config.toml"
   BEGIN_MARKER="# BEGIN LOOM MCP (generated by scripts/setup-mcp.sh --codex)"
   END_MARKER="# END LOOM MCP"

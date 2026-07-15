@@ -211,6 +211,26 @@ verify_install() {
   fi
 }
 
+# Returns 0 (true / stale) if the loom-daemon release binary is missing, OR
+# if the source tree it would be built from is newer than the binary on
+# disk (e.g. `git pull` landed a newer commit since the binary was last
+# built). A bare "does it exist" check lets `install.sh --quick` silently
+# reuse a stale binary built from an older commit after a source update --
+# issue #49 finding 4. `find -newer` catches both "never built" (the -f
+# check below) and "built from a prior commit" in one pass.
+loom_daemon_binary_stale() {
+  local loom_root="$1"
+  local binary="$loom_root/target/release/loom-daemon"
+
+  [[ -f "$binary" ]] || return 0
+
+  local newer_file
+  newer_file="$(find "$loom_root/loom-daemon" "$loom_root/loom-api" \
+      "$loom_root/Cargo.toml" "$loom_root/Cargo.lock" \
+      -type f -newer "$binary" 2>/dev/null | head -n1)"
+  [[ -n "$newer_file" ]]
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -225,6 +245,11 @@ echo ""
 # Parse flags
 NON_INTERACTIVE=false
 INSTALL_TYPE=""
+# Explicit acknowledgement that a reinstall over an existing (or legacy)
+# .loom/ installation is destructive (it uninstalls before reinstalling).
+# Required in addition to --quick/--yes/--full when an existing install is
+# detected -- see the reinstall gate below and issue #49 finding 1.
+CONFIRM_REINSTALL=false
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes)
@@ -249,6 +274,10 @@ while [[ "${1:-}" == -* ]]; do
       NON_INTERACTIVE=true  # --full implies non-interactive
       shift
       ;;
+    --confirm-reinstall)
+      CONFIRM_REINSTALL=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
@@ -256,12 +285,20 @@ while [[ "${1:-}" == -* ]]; do
       echo "  -y, --yes    Non-interactive mode (skip confirmation prompts)"
       echo "  --quick      Quick Install - direct install without GitHub workflow"
       echo "  --full       Full Install - creates issue, worktree, and PR"
+      echo "  --confirm-reinstall"
+      echo "               Acknowledge a destructive reinstall over an existing"
+      echo "               .loom/ install. Required alongside --quick/--yes/--full"
+      echo "               when the target already has Loom installed -- without"
+      echo "               it, non-interactive runs stop and ask you to inventory"
+      echo "               customizations first (interactive runs still get a"
+      echo "               y/N prompt instead)."
       echo "  -h, --help   Show this help message"
       echo ""
       echo "Examples:"
       echo "  ./install.sh --quick ~/projects/my-app"
       echo "  ./install.sh --full /path/to/team-project"
       echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
+      echo "  ./install.sh --quick --confirm-reinstall ~/projects/my-app  # Reinstall over an existing install"
       exit 0
       ;;
     *)
@@ -520,14 +557,59 @@ is_loom_source_repo() {
   return 1
 }
 
+# Portable (BSD- and GNU-sort compatible) semver "$1 >= $2" comparison.
+# Avoids `sort -V`, which is a GNU-sort-only flag and not reliably present
+# on stock macOS /usr/bin/sort. Compares up to three dot-separated numeric
+# fields via `sort -t. -k1,1n -k2,2n -k3,3n`, which is portable POSIX sort.
+version_ge() {
+  local v1="$1" v2="$2"
+  [[ "$(printf '%s\n%s' "$v2" "$v1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" == "$v2" ]]
+}
+
 # Detect the common v0.9.x installation shape whose source checkout still
 # points at rjwalters/loom. Legacy consumers often carry project-owned hooks
 # and scripts inside Loom-managed directories, so an uninstall-first upgrade
 # deserves a much louder warning than an ordinary reinstall.
+#
+# Metadata (`.loom/install-metadata.json`, written by modern loom-daemon-init
+# installs) is checked FIRST and is authoritative when present: a v0.10.0+
+# `loom_version` or a `loom_source` remote that is not rjwalters/loom means
+# this is NOT a legacy install, full stop -- even if generated docs still
+# mention "rjwalters/loom" in prose (upstream attribution, migration-guide
+# links, etc). Only when metadata is absent or inconclusive do we fall back
+# to the older string-marker heuristic. See issue #49 finding 2: a v0.10.5
+# fork install was misclassified as legacy purely because its generated
+# CLAUDE.md/AGENTS.md mentioned "rjwalters/loom" in a link or footer.
 is_legacy_rjwalters_install() {
   local target="$1"
-  local marker source_path source_remote
+  local metadata="$target/.loom/install-metadata.json"
+  local marker source_path source_remote loom_version
 
+  if [[ -f "$metadata" ]] && command -v node &> /dev/null; then
+    loom_version="$(node -pe "try{require('$metadata').loom_version||''}catch(e){''}" 2>/dev/null || true)"
+    source_path="$(node -pe "try{require('$metadata').loom_source||''}catch(e){''}" 2>/dev/null || true)"
+
+    if [[ -n "$loom_version" && "$loom_version" != "unknown" ]] && version_ge "$loom_version" "0.10.0"; then
+      # Authoritative: a v0.10.0+ install is never legacy, regardless of
+      # remote or any "rjwalters/loom" prose elsewhere in generated docs.
+      return 1
+    fi
+
+    if [[ -n "$source_path" && -d "$source_path" ]]; then
+      source_remote="$(git -C "$source_path" remote get-url origin 2>/dev/null || true)"
+      if [[ -n "$source_remote" ]]; then
+        if [[ "$source_remote" == *"rjwalters/loom"* ]]; then
+          return 0
+        fi
+        # Authoritative: metadata resolved a concrete, non-rjwalters source
+        # remote. Trust it over string markers in generated prose.
+        return 1
+      fi
+    fi
+  fi
+
+  # Fallback: no usable metadata (pre-install-metadata.json installs, or
+  # metadata present but inconclusive -- missing/unreadable loom_source).
   for marker in \
     "$target/.loom/CLAUDE.md" \
     "$target/.loom/AGENTS.md" \
@@ -598,8 +680,16 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       info "Installation cancelled"
       exit 0
     fi
+  elif [[ "$CONFIRM_REINSTALL" == true ]]; then
+    info "Non-interactive mode: proceeding with reinstall (--confirm-reinstall acknowledged)"
   else
-    info "Non-interactive mode: proceeding with reinstall"
+    # Issue #49 finding 1: --quick / --yes / --full previously set
+    # NON_INTERACTIVE=true and fell straight through to the destructive
+    # uninstall-then-reinstall path, skipping the warning above entirely.
+    # A non-interactive run over an existing (or legacy) install now MUST
+    # pass --confirm-reinstall explicitly -- it cannot silently cross this
+    # boundary just because it also passed --quick/--yes/--full.
+    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
   # Uninstall existing installation (local mode, no separate PR)
@@ -615,9 +705,15 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Running fresh Quick Install..."
     echo ""
 
-    # Check if loom-daemon is built
-    if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-      warning "loom-daemon binary not found"
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #49 finding 4 -- a bare existence check reuses a binary
+    # built from an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        warning "loom-daemon binary is stale (source tree updated since last build)"
+      else
+        warning "loom-daemon binary not found"
+      fi
       info "Building loom-daemon (this may take a minute)..."
       cd "$LOOM_ROOT"
       pnpm daemon:build || error "Failed to build loom-daemon"
@@ -752,9 +848,15 @@ case "$METHOD" in
     info "Running Quick Install..."
     echo ""
 
-    # Check if loom-daemon is built
-    if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-      warning "loom-daemon binary not found"
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #49 finding 4 -- a bare existence check reuses a binary
+    # built from an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        warning "loom-daemon binary is stale (source tree updated since last build)"
+      else
+        warning "loom-daemon binary not found"
+      fi
       info "Building loom-daemon (this may take a minute)..."
       cd "$LOOM_ROOT"
       pnpm daemon:build || error "Failed to build loom-daemon"

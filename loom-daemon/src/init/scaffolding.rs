@@ -344,7 +344,29 @@ fn merge_hooks(
     result
 }
 
-/// Merge hook commands within a single matcher entry, deduplicating by command path.
+/// Normalize a hook command string for semantic-duplicate comparison.
+///
+/// Loom-generated hook commands are a single `${CLAUDE_PROJECT_DIR}`-prefixed
+/// path. Some installer generations wrapped that path in double quotes (to
+/// survive a project path containing spaces); the current template emits it
+/// unquoted. Byte-for-byte comparison treats
+/// `"${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh"` and
+/// `${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh` as different commands, so a
+/// reinstall over a quoted-form install appended a second, functionally
+/// identical hook entry on every run (issue #49 finding 5). Stripping quote
+/// characters and collapsing whitespace before comparing treats them as the
+/// same hook without discarding either side's original on-disk formatting.
+fn normalize_hook_command(cmd: &str) -> String {
+    cmd.chars()
+        .filter(|c| *c != '"' && *c != '\'')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Merge hook commands within a single matcher entry, deduplicating by
+/// semantically-normalized command (see [`normalize_hook_command`]).
 ///
 /// Also strips legacy Loom hook entries (bare `.loom/hooks/...` paths from pre-3265
 /// installs) so that re-running install does not leave duplicate hook invocations
@@ -369,19 +391,21 @@ fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
         !cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX) || cmd.starts_with(LOOM_HOOK_PREFIX)
     });
 
-    // Collect existing command paths for dedup
+    // Collect existing command paths for dedup, normalized so quoted and
+    // unquoted forms of the same command collide.
     let existing_commands: std::collections::HashSet<String> = existing_hooks
         .iter()
-        .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .map(normalize_hook_command)
         .collect();
 
-    // Add Loom hooks that aren't already present
+    // Add Loom hooks that aren't already present (by normalized command)
     for loom_hook in loom_hooks {
         let cmd = loom_hook
             .get("command")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if !existing_commands.contains(cmd) {
+        if !existing_commands.contains(&normalize_hook_command(cmd)) {
             existing_hooks.push(loom_hook.clone());
         }
     }
@@ -2567,6 +2591,64 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
             .map(|h| h["command"].as_str().unwrap())
             .collect();
         assert!(commands.contains(&"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"));
+        assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
+    }
+
+    #[test]
+    fn test_merge_settings_deduplicates_hooks_with_quoted_paths() {
+        // Issue #49 finding 5: a prior installer generation wrote the
+        // Loom hook command wrapped in double quotes (to survive a project
+        // path containing spaces). Reinstalling with the current, unquoted
+        // template must recognize this as the SAME hook and not append a
+        // second, functionally identical entry.
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""},
+                        {"type": "command", "command": ".claude/hooks/custom-bash-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+
+        // Exactly 2 entries: the original quoted Loom hook (preserved as-is,
+        // not rewritten) + the custom project hook. No unquoted duplicate.
+        assert_eq!(
+            hooks_arr.len(),
+            2,
+            "Should not append an unquoted duplicate of an existing quoted Loom hook: {hooks_arr:?}"
+        );
+
+        let commands: Vec<&str> = hooks_arr
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert!(
+            commands.contains(&"\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""),
+            "Original quoted entry should be preserved unchanged"
+        );
         assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
     }
 
