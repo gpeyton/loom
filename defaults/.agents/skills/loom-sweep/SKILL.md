@@ -52,6 +52,25 @@ Codex has no Task-tool subagents, so `$loom-sweep` runs the lifecycle
   two child directories containing `auth.json` under `LOOM_CODEX_HOMES_DIR`.
   Claude's `.loom/tokens/` and `ACCOUNT_KEY_*` values are not a Codex pool.
 
+## Codex child supervision (issue #52 — read before supervising any Codex wave)
+
+Log silence is **never** proof that a Codex child has stalled. Editing, builds,
+tests, and long tool calls can legitimately produce no log output for minutes.
+There is **no implicit inactivity timeout** anywhere in this contract — cancel
+only for an explicit user stop, a separately configured hard wall-clock
+deadline (`LOOM_CODEX_WAVE_HARD_DEADLINE_SEC`, opt-in, never silence-based), or
+a confirmed unrecoverable failure. The default monitoring pattern is a
+**blocking join** (start the wave, wait for it to return) — not aggressive
+1/10/20/30-second polling. A parent/root **must never** enter or edit a
+Builder-owned worktree (`.loom/worktrees/issue-N`) while that Builder's child
+is still alive. A parent-initiated stop is a cancellation
+(`cancelled_by_operator` / `cancelled_by_parent` / `cancelled_by_deadline`),
+never the generic `failed` outcome — read non-destructive structured state via
+`spawn-codex-wave.sh --status` rather than parsing prose logs. **Full contract,
+outcome taxonomy, and the forward reference to #53's resume mechanics**: see
+`.claude/commands/loom/sweep.md`'s "Codex Child Supervision Contract" section
+— it is canonical and binding on this skill.
+
 Keep daemon MCP dispatch, checkpointing (`.loom/sweep-checkpoint/`), label
 validation, confirmation gates, and dry-run behavior unchanged — this
 skill is a routing layer over the canonical sweep spec, not a new one.

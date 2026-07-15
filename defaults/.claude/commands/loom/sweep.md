@@ -407,6 +407,80 @@ Issue #19 landed **runtime detection + a single-role / single-issue sequential C
 - **Guardrail parity is unaffected.** Each fanned-out child is a normal `spawn-codex.sh` invocation — same `--full-auto` default, same `LOOM_CODEX_UNSAFE=1` escalation gate documented in `defaults/.codex/GUARDRAIL-PARITY.md`. Fan-out changes *how many* children run concurrently, never *what guards* an individual child runs under.
 - **Tests**: `defaults/scripts/tests/test-spawn-codex-wave.sh` (fan-out concurrency via timing assertions, sequential degrade without the opt-in, failure propagation, settling boundary, log-file layout) and the unchanged `defaults/scripts/tests/test-spawn-codex.sh` (single-role Codex sweep regression guard, issues #19/#20).
 
+## Codex Child Supervision Contract (issue #52)
+
+Two real Loom 0.10.6 incidents (documented in the umbrella issue #51) showed a Codex root/supervisor session treat a quiet-but-alive Builder child as "stalled" after only about 94 seconds of no log output, send `SIGINT`, declare the child "failed," and take over Builder work itself mid-flight — while `defaults/scripts/spawn-codex-wave.sh` itself never timed out; it blocks in `wait` with no inactivity deadline. The premature cancellation in both incidents was an ad hoc policy the *supervising agent* improvised, because nothing in Loom's docs gave it an explicit patience contract. This section is that contract. It is canonical and binding on **every** Codex supervision path — the process-level runner (`spawn-codex-wave.sh`), a single sequential Codex sweep session (#19), and any future native-Codex-agent backend (#54).
+
+### The patience contract (read this first)
+
+1. **A live Codex child is `running` by default, and log silence alone is never proof of a stall.** Editing, builds, tests, dependency installs, and long tool calls can legitimately produce zero log output for minutes. **Silence != stall.** A supervising agent MUST keep waiting while the child process is alive, no matter how long the log has been quiet.
+2. **There is no implicit inactivity deadline, anywhere in this contract, ever.** Do not invent one. Do not "give it one more short interval" and then cancel — that is exactly the failure mode #51 documented. Cancellation is authorized **only** for one of these three reasons:
+   - An **explicit user/operator stop** (the human running the sweep says to stop, or sends a real stop signal from their own terminal/tool).
+   - A **separately configured hard run deadline** — an explicit, opt-in, wall-clock (not silence-based) limit the operator configured in advance (see `LOOM_CODEX_WAVE_HARD_DEADLINE_SEC` below). Absent that configuration, there is no deadline at all.
+   - A **confirmed unrecoverable failure** — the child itself has exited and reported failure, or some other unambiguous, non-inferential signal establishes the process is genuinely gone and cannot make progress (not "it's been quiet a while, so I've decided it's stuck").
+3. **Status checks are non-destructive and back off — they are not "the" operator loop.** The default, and by far the preferred, monitoring pattern is a **blocking join**: start the wave, then wait for it to return. If a supervising agent wants situational awareness while a wave runs (e.g., in a separate terminal, not blocking the wave itself), it may poll `spawn-codex-wave.sh --status` (read-only, see below) — but on a **bounded, increasing backoff schedule**, never a fixed aggressive interval. A reasonable schedule: 30s, 60s, 120s, 300s, capped at 300s. **1/10/20/30-second polling, as happened in the #51 incidents, is exactly the anti-pattern this contract forbids.** No status check of any kind — reading logs, reading the status file, checking `ps`, checking forge state — may ever trigger a kill, an interrupt, a replacement, or a takeover. Status checks observe; they never act.
+4. **A parent/root must never enter or edit a Builder-owned worktree while that Builder is alive.** If `spawn-codex-wave.sh --status` (or any other observation) shows a child's issue as `running`, the corresponding `.loom/worktrees/issue-N` is off-limits to the supervising session — no reads for the purpose of "finishing the work yourself," no edits, no commits. This is true regardless of how long the child has been quiet. The correct response to a slow-seeming child is patience, not takeover.
+5. **Cancellation is not failure, and the two must never be conflated.** If a stop genuinely is warranted (one of the three reasons in point 2), the resulting outcome is a `cancelled_*` outcome, never the generic `failed` outcome. `cancelled_by_operator` / `cancelled_by_parent` / `cancelled_by_deadline` are distinct from `failed` in every log line, every structured status record, and every wave summary. A parent-caused stop must never be reported in a way that makes the child look like it had a defect.
+6. **Recovery after a legitimate cancellation routes through the resumable-claim work, not an ad hoc takeover.** See "Recovery after cancellation" below.
+
+### Cancellation-outcome taxonomy (the shared vocabulary)
+
+This is the exact vocabulary implemented by `defaults/scripts/spawn-codex-wave.sh` and expected from any other Codex supervision surface (a single sequential sweep session, a future native-agent backend). **Issue #53 (atomic reclaim of interrupted Builder claims) consumes this vocabulary directly — do not rename these values without updating #53's consumer.**
+
+| Outcome | Meaning |
+|---|---|
+| `running` | The child is alive. The default state. No deadline is implied by this state alone. |
+| `completed` | The child exited `0` on its own. |
+| `failed` | The child exited nonzero **on its own** — a real failure, not the result of a signal the supervisor sent. |
+| `cancelled_by_operator` | The supervising process received `SIGINT` (the conventional "a human hit Ctrl-C" signal) and forwarded it to the child. |
+| `cancelled_by_parent` | The supervising process received `SIGTERM` (the conventional "a supervising process asked me to stop" signal) and forwarded it to the child, or an explicit override recorded "parent" as the initiator regardless of which signal arrived. |
+| `cancelled_by_deadline` | The opt-in, explicit, wall-clock `LOOM_CODEX_WAVE_HARD_DEADLINE_SEC` was configured and this child's runtime exceeded it. This is **never** inferred from log silence — it is a configured duration measured from child start, irrespective of the child's log activity. |
+| `unknown` | Terminal state could not be determined. A defensive bucket only; not expected in normal operation. |
+
+`cancelled_by_operator`, `cancelled_by_parent`, and `cancelled_by_deadline` are collectively "a cancellation outcome" throughout this contract and throughout wave summaries — they are never folded into `failed`, and `failed` is never folded into them.
+
+### Structured, machine-readable per-child state (not prose-log parsing)
+
+`spawn-codex-wave.sh` maintains a structured JSON status file at `<LOG_DIR>/spawn-codex-wave-status.json` (default `LOG_DIR` is `.loom/logs`), rewritten at every state transition (child spawn, child terminal state, wave cancellation). Read it non-destructively — including while the wave is still running — with:
+
+```bash
+.loom/scripts/spawn-codex-wave.sh --status
+```
+
+This is always safe: it never mutates anything and never triggers cancellation. Each child record carries: `issue`, `pid`, `phase` (reserved for future use), `outcome` (from the taxonomy above), `started_at`, `finished_at`, `exit_code`, `signal`, `cancellation_initiator`, and `log_file`. The top-level object additionally carries `wave_started_at`, `multi_wave`, `wave_cancelled`, `wave_cancel_initiator`, and `wave_cancel_signal`. A machine-readable status command is deliberately preferred over parsing prose log lines — a supervising agent (or a human operator) that wants situational awareness should read this file, not `tail` a log and guess.
+
+### The default monitoring loop is a blocking join
+
+The documented default — and the only pattern this contract endorses as "the operator loop" — is: **start the wave, then block until it returns.** `spawn-codex-wave.sh` already implements the settling boundary this requires (it does not return until every child in the wave has exited). A supervising agent's job is to invoke it and wait, exactly as it would wait on any other long-running build step. Any optional progress display layered on top (e.g., a human watching a second terminal run `--status` on a backoff schedule) is exactly that — optional, informational, and never load-bearing for correctness. The wave completes on its own; nothing about the join needs "help."
+
+### Signals and cancellation provenance (the mechanical half)
+
+`spawn-codex-wave.sh` traps `INT` and `TERM` on its own process. On receipt of either:
+
+- It records **who** asked for the stop (`operator` for `SIGINT`, `parent` for `SIGTERM`, overridable via `LOOM_CODEX_WAVE_CANCEL_INITIATOR`) and **how** (the signal name), before doing anything else.
+- It marks every still-running child's outcome as the corresponding `cancelled_by_*` value and forwards the same signal to that child, rather than silently killing it and reporting `failed`.
+- The wave's final summary and exit code reflect the cancellation distinctly from a normal failure (see "Wave summaries" below).
+
+`LOOM_CODEX_WAVE_HARD_DEADLINE_SEC` (a positive integer, seconds) is the **only** inactivity-adjacent knob this contract exposes, and it is explicitly **not** a silence detector: it is a wall-clock duration measured from child start, configured in advance by an operator, honored regardless of how active or quiet the child's log is. Unset (the default) means there is no deadline of any kind.
+
+For native Codex collaboration agents (`spawn_agent` / `wait_agent` / `interrupt_agent`-style primitives), should Loom ever formally adopt them: `interrupt_agent` must map to a cancellation outcome (`cancelled_by_operator` or `cancelled_by_parent` as appropriate), never to `failed`, and replacement/takeover of a target that is still alive is prohibited under the same rule as point 4 above. As of this writing Loom does not reference or support these primitives (tracked as a forward reference in issue #54, the native-agent backend policy issue) — this paragraph exists so that if/when #54 lands, it inherits this contract's outcome taxonomy rather than reinventing one.
+
+### Wave summaries distinguish every outcome bucket
+
+`spawn-codex-wave.sh`'s final summary reports two lines: the original `wave settled -- N issue(s), K failed` line (unchanged for existing callers), plus an outcome breakdown that separately counts `completed`, `failed`, `cancelled` (any `cancelled_by_*`), and `still-running-or-unknown`. A wave summary that only ever says "N failed" — collapsing cancellation into failure — is the exact defect this issue closes; do not regress it.
+
+### Worktree non-interference (mechanical restatement of point 4 above)
+
+A parent/root Codex session MUST NOT enter or edit a Builder-owned worktree (`.loom/worktrees/issue-N`) while that Builder's child process is still alive per the structured status file. The correct response to a child that seems slow is patience — the default with no inactivity timeout — followed, only after the child has actually exited, by a rerun of the sweep for that issue (which reuses the same worktree via `worktree.sh`'s idempotency). Ad hoc takeover of a live Builder's worktree is exactly the failure mode #51 documented and is forbidden regardless of how long the child has been quiet.
+
+### Recovery after cancellation (forward reference to issue #53)
+
+When a cancellation genuinely was warranted (one of the three reasons in the patience contract above), the correct next step is to **rerun the sweep for the affected issue** so it can resume from its last completed phase (per the existing checkpoint mechanism, #3373) and reclaim its existing worktree. **The atomic-reclaim mechanics for a stale-but-recoverable `loom:building` claim are owned by the companion issue #53 ("atomic reclaim of interrupted Builder claims"), which is not yet built as of this writing.** This section's job is only to make sure the vocabulary #53 will consume is unambiguous:
+
+- A `cancelled_by_operator` / `cancelled_by_parent` / `cancelled_by_deadline` outcome on a Builder child means the issue's `loom:building` claim and worktree are in a **recoverable, not corrupt** state — #53's reclaim logic is expected to treat these outcomes as "safe to reclaim," in contrast to some hypothetical future "unrecoverable" outcome that might require different handling.
+- Until #53 lands, an operator recovering from a cancelled Builder should follow the existing documented recovery path (`gh issue edit <N> --remove-label loom:building --add-label loom:issue` after verifying no PR exists and the worktree's partial diff is either preserved intentionally or discarded deliberately, then rerun `/loom:sweep <N>` or `spawn-codex-wave.sh <N>`), **not** an inline takeover by the supervising session.
+- This section does not implement #53's reclaim mechanics — only the outcome taxonomy and structured state #53 will read.
+
 ## Stage -1: Backend detection (Phase D of #3449)
 
 Before **any** other stage — including the dry-run gate and all wave lifecycles — decide whether to **delegate dispatch to the in-process loom-daemon** or **fall through to the existing in-process subagent dispatch**. This stage is prose for the LLM running this skill; it does not run a separate binary. Implementation is small, side-effect-free probes followed by a single routing decision.

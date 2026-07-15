@@ -45,3 +45,17 @@ Codex strategy, the model-tier mapping, and the guardrail-parity gate.
   it, multiple issues still run sequentially, one at a time, as before. See
   the sweep skill's "Multi-wave process-level Codex orchestration" section
   for the full substrate decision and settling-discipline rationale.
+- **Child supervision (issue #52) — binding on this session and on any
+  `spawn-codex-wave.sh` you launch**: log silence is never proof a child has
+  stalled; there is no implicit inactivity timeout anywhere in this
+  contract. Cancel a live child only for an explicit user stop, a
+  separately configured hard wall-clock deadline
+  (`LOOM_CODEX_WAVE_HARD_DEADLINE_SEC`, opt-in, never silence-based), or a
+  confirmed unrecoverable failure. Default to a blocking join (start, then
+  wait) rather than aggressive polling. Never enter or edit a Builder-owned
+  worktree while that Builder's child is alive. A parent-initiated stop is
+  a cancellation outcome (`cancelled_by_operator` / `cancelled_by_parent` /
+  `cancelled_by_deadline`), never the generic `failed` outcome — read
+  `spawn-codex-wave.sh --status` for structured state instead of parsing
+  logs. Full contract and outcome taxonomy: the sweep skill's "Codex Child
+  Supervision Contract" section.
