@@ -143,11 +143,21 @@ pub enum Request {
     /// When `None` (or absent on the wire — `#[serde(default)]` keeps
     /// existing clients compatible), NO `--model` flag is emitted and the
     /// session/CLI default is preserved.
+    ///
+    /// `worker_type` (issue #2, Phase 1 of epic #1) optionally selects the
+    /// worker runner for the spawned child (e.g. `"claude"`). When `Some`
+    /// and non-empty, the daemon sets `LOOM_WORKER=<value>` in the spawned
+    /// child's environment so `spawn-worker.sh` resolves to the matching
+    /// runner. When `None` (or absent on the wire — `#[serde(default)]`
+    /// keeps existing clients compatible) or empty, NO `LOOM_WORKER` env var
+    /// is set at all and the spawn layer's own default (`claude`) applies.
     DispatchSweep {
         kind: SweepKind,
         idempotency_key: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        worker_type: Option<String>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {

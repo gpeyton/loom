@@ -92,22 +92,27 @@ def get_session_shell_pid(session_name: str) -> str:
     return TmuxSession(session_name).get_shell_pid() or ""
 
 
-def claude_is_running(shell_pid: str) -> bool:
-    """Check if a claude process is running under the given shell PID.
+def claude_is_running(shell_pid: str, process_name: str = "claude") -> bool:
+    """Check if a worker process is running under the given shell PID.
 
     Checks both direct children and grandchildren (for wrapper scripts).
+
+    ``process_name`` is the ``pgrep -f`` needle (issue #2, Phase 1 of epic
+    #1: worker-runner abstraction). Defaults to ``"claude"`` for zero
+    behavior change; callers pass a worker-type-derived value to detect a
+    different runner's process.
     """
     try:
         # Check direct children
         result = subprocess.run(
-            ["pgrep", "-P", shell_pid, "-f", "claude"],
+            ["pgrep", "-P", shell_pid, "-f", process_name],
             capture_output=True,
             check=False,
         )
         if result.returncode == 0:
             return True
 
-        # Check grandchildren (claude-wrapper.sh -> claude)
+        # Check grandchildren (claude-wrapper.sh -> <process_name>)
         children_result = subprocess.run(
             ["pgrep", "-P", shell_pid],
             capture_output=True,
@@ -120,7 +125,7 @@ def claude_is_running(shell_pid: str) -> bool:
                 if not child_pid:
                     continue
                 grandchild_result = subprocess.run(
-                    ["pgrep", "-P", child_pid, "-f", "claude"],
+                    ["pgrep", "-P", child_pid, "-f", process_name],
                     capture_output=True,
                     check=False,
                 )
