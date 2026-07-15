@@ -10,19 +10,35 @@ Loom spawns AI agents that claim issues, implement features, review PRs, and mer
 
 **Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A ForgeClient abstraction layer makes the workflow identical regardless of forge.
 
+**Supported worker runtimes**: [Claude Code](https://claude.com/claude-code) and the [OpenAI Codex CLI](https://developers.openai.com/codex) are **co-equal** — neither is primary. The label-driven coordination layer (worktrees, the sweep lifecycle, merge scripts) behaves identically on either; pick whichever runtime you already use.
+
 ## Quick Start
 
 ```bash
 # Clone and install to your repository
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/gpeyton/loom
 cd loom
 ./install.sh /path/to/your/repo
+```
 
-# Start autonomous development on a single issue from Claude Code
+Then start autonomous development on a single issue from either runtime:
+
+**Claude Code:**
+```bash
 cd /path/to/your/repo
 # In Claude Code:
 /loom:sweep 42
 ```
+
+**Codex** (the `$loom-sweep` skill):
+```bash
+cd /path/to/your/repo && codex
+$loom-sweep 42
+```
+
+Loom automation gets **unrestricted permissions by default on both runtimes** — Claude Code via `--dangerously-skip-permissions`, and Codex via `--dangerously-bypass-approvals-and-sandbox` (no filesystem sandbox, no network restriction, no approval prompts). Set `LOOM_CODEX_SAFE=1` in the environment to opt Codex back into a sandboxed `--full-auto` posture. Before relying on unattended workers of either kind, read [`defaults/.codex/GUARDRAIL-PARITY.md`](defaults/.codex/GUARDRAIL-PARITY.md) — it documents the trust boundary this default assumes and exactly where the Codex sandbox does and doesn't cover the same ground as Claude's guardrail hooks.
+
+**Authentication**: Claude Code workers authenticate via OAuth token rotation (`.loom/tokens/` — see [Token Rotation](CLAUDE.md#token-rotation-multi-account-claude-code) in `CLAUDE.md`). Codex workers authenticate via a precedence chain — a pre-set `OPENAI_API_KEY`, a provider-aware API-key pool, or a ChatGPT-authenticated `CODEX_HOME` profile (rotated across multiple logged-in profiles via `LOOM_CODEX_HOME` / `LOOM_CODEX_HOMES_DIR`) — documented in full in [`defaults/scripts/spawn-codex.sh`](defaults/scripts/spawn-codex.sh)'s header comment and in [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md#codex-worker-troubleshooting-runtime-parity).
 
 For multi-issue autonomous batches, start the spawn loop instead:
 
@@ -113,7 +129,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 - macOS (Linux support planned)
 - Git repository
 - tmux (`brew install tmux`)
-- [Claude Code](https://claude.ai/code) for AI agents
+- A worker runtime for AI agents — [Claude Code](https://claude.com/claude-code) or the [OpenAI Codex CLI](https://developers.openai.com/codex) (co-equal; pick one)
 
 ### Install Options
 
@@ -135,9 +151,12 @@ your-repo/
 │   ├── config.json      # Terminal configuration
 │   ├── roles/           # Agent role definitions
 │   └── scripts/         # Helper scripts
-├── .claude/commands/loom/  # Slash commands
+├── .claude/commands/loom/  # Claude Code slash commands
+├── .codex/                 # Codex config, prompt shims, custom agents
+├── .agents/skills/          # Codex skills (loom, loom-sweep)
 ├── .github/labels.yml   # Workflow labels
-└── CLAUDE.md            # AI context document
+├── CLAUDE.md            # AI context document (Claude Code)
+└── AGENTS.md            # AI context document (Codex)
 ```
 
 ## Usage
@@ -230,7 +249,7 @@ gh pr create --label "loom:review-requested"
 
 ```bash
 # Clone and setup
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/gpeyton/loom
 cd loom
 
 # Run the daemon in dev mode

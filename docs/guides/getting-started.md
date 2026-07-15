@@ -30,7 +30,7 @@ Loom supports **two co-equal worker runtimes** — [Claude Code](https://claude.
 - **Claude Code** discovers Loom roles as slash commands under `.claude/commands/loom/` and reads repository context from `CLAUDE.md`.
 - **OpenAI Codex CLI** discovers repository context from `AGENTS.md` (via AGENTS.md ancestor traversal) and Loom role prompts from a project-scoped `.codex/` config plus prompt shims. See [Using Codex with Loom](#using-codex-with-loom) below for the full setup.
 
-Both runtimes participate in the same label-driven workflow. Where a runtime has a gap relative to the other — most notably Claude Code's guardrail hooks vs. Codex's sandbox/approval model — the safety mapping and residual gaps are captured in the guardrail-parity doc (forthcoming — issue #20) and summarized under [Using Codex with Loom](#using-codex-with-loom).
+Both runtimes participate in the same label-driven workflow, and both get **unrestricted permissions by default** for Loom-spawned automation — Claude Code via `--dangerously-skip-permissions`, Codex via `--dangerously-bypass-approvals-and-sandbox` (set `LOOM_CODEX_SAFE=1` to opt Codex back into a sandboxed `--full-auto` posture). Where a runtime has a gap relative to the other — most notably Claude Code's guardrail hooks vs. Codex's sandbox/approval model — the safety mapping, trust-boundary rationale, and residual gaps are captured in [`defaults/.codex/GUARDRAIL-PARITY.md`](../../defaults/.codex/GUARDRAIL-PARITY.md) and summarized under [Using Codex with Loom](#using-codex-with-loom).
 
 ### What Gets Installed
 
@@ -46,10 +46,9 @@ Running `loom-daemon init` creates these files in your repository:
 
 **Tooling (Commit these)**:
 - `.claude/commands/loom/` - Claude Code slash commands for each role
+- `.codex/` - Codex config (`config.toml`), prompt shims (`.codex/prompts/`, deprecated — see below), and custom agents (`.codex/agents/*.toml`)
+- `.agents/skills/` - Codex skills (`loom`, `loom-sweep`) — the documented Codex entry point, replacing the deprecated `.codex/prompts/` shims
 - `.github/labels.yml` - Workflow label definitions
-
-`.codex/` (Codex-specific configuration) is planned but not yet shipped — see
-dual-runtime epic #1. It will be documented here once Phase 2 lands.
 
 **Gitignored (Local only)**:
 - `.loom/state.json` - Runtime terminal state
@@ -98,10 +97,10 @@ Minimal requirements to use Loom:
    ```
 
    You do not need both — pick the runtime you prefer. Codex setup (project trust,
-   `.codex/config.toml`, prompt shims, MCP config) is covered in
+   `.codex/config.toml`, the `$loom` / `$loom-sweep` skills, MCP config) is covered in
    [Using Codex with Loom](#using-codex-with-loom). The Claude-vs-Codex safety-model
-   mapping (hooks vs. sandbox/approval) lives in the guardrail-parity doc
-   (forthcoming — issue #20).
+   mapping (hooks vs. sandbox/approval) and the full-autonomy-by-default trust boundary
+   live in [`defaults/.codex/GUARDRAIL-PARITY.md`](../../defaults/.codex/GUARDRAIL-PARITY.md).
 
 That's all you need to use Loom!
 
@@ -192,7 +191,7 @@ Perfect for end users who want to use Loom without building from source.
 
 ```bash
 # Download latest release
-curl -L https://github.com/rjwalters/loom/releases/latest/download/loom-daemon -o loom-daemon
+curl -L https://github.com/gpeyton/loom/releases/latest/download/loom-daemon -o loom-daemon
 chmod +x loom-daemon
 
 # Initialize your repository
@@ -212,7 +211,7 @@ For contributors or users who want the latest development version.
 
 ```bash
 # Clone Loom repository
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/gpeyton/loom
 cd loom
 
 # Install dependencies
@@ -239,7 +238,7 @@ Uses the interactive install script for guided installation with two workflows.
 
 ```bash
 # Clone Loom first (if you haven't)
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/gpeyton/loom
 cd loom
 
 # Run interactive installer (will prompt for target repo if not provided)
@@ -568,8 +567,17 @@ Read the comprehensive workflow documentation:
 ## Using Codex with Loom
 
 Loom installs OpenAI Codex CLI support alongside the Claude Code
-configuration (dual-runtime, Epic #1 Phase 2): a project-scoped
-`.codex/config.toml` and thin role prompt shims under `.codex/prompts/`.
+configuration: a project-scoped `.codex/config.toml`, a custom agent per
+role under `.codex/agents/*.toml`, and — the documented entry point for
+new setups — Codex **skills** under `.agents/skills/loom/` and
+`.agents/skills/loom-sweep/`. Codex runs with **unrestricted permissions
+by default** (`--dangerously-bypass-approvals-and-sandbox`, no sandbox,
+no approval prompts), matching the Claude Code default
+(`--dangerously-skip-permissions`). Set `LOOM_CODEX_SAFE=1` in the
+environment to opt a Codex worker back into a sandboxed `--full-auto`
+posture. See [`defaults/.codex/GUARDRAIL-PARITY.md`](../../defaults/.codex/GUARDRAIL-PARITY.md)
+for the full trust-boundary rationale and the hook-by-hook safety mapping
+against Claude Code's guardrail hooks.
 
 ### Config placement: repo-local `.codex/config.toml` (vs `~/.codex` merge)
 
@@ -595,9 +603,29 @@ This writes an absolute-path `[mcp_servers.loom]` entry (idempotent,
 marker-delimited) generated from the same variables as the Claude Code
 `.mcp.json` — one source of truth for both runtimes.
 
-### Prompt invocation
+### Skill invocation (primary entry point)
 
-Codex discovers custom prompts only in `$CODEX_HOME/prompts/` (default
+Codex auto-discovers skills committed to the repo under `.agents/skills/`
+— no symlink or one-time setup step is required (unlike the legacy
+prompts below). From a trusted repo, invoke:
+
+```text
+$loom-sweep 42     # Curator → Builder → Judge → Doctor → Merge for issue 42
+$loom-sweep --prs 123
+$loom builder 42   # single-role entry point for an individual role
+```
+
+Each skill is a thin router onto the canonical `.claude/commands/loom/*.md`
+/ `.loom/roles/<role>.md` definitions, so role behavior stays identical
+across runtimes — see `.agents/skills/loom/SKILL.md` and
+`.agents/skills/loom-sweep/SKILL.md` for the full routing contract.
+
+### Prompt invocation (deprecated, transitional)
+
+Codex marks custom prompts as a deprecated surface in favor of skills.
+Loom's `.codex/prompts/` shims still work during the transition window
+but new setups should use the skills above instead. Codex discovers
+custom prompts only in `$CODEX_HOME/prompts/` (default
 `~/.codex/prompts/`), not in the repo. One-time setup from the repo root:
 
 ```bash
@@ -608,22 +636,27 @@ rm -f ~/.codex/prompts/README.md
 
 Then invoke roles as slash commands inside Codex — `/builder 42`,
 `/judge 123`, `/curator`, `/doctor`, `/champion`, `/guide`, `/auditor`,
-or `/loom-sweep 42`. Each shim reads the canonical
-`.loom/roles/<role>.md` file, so role behavior stays identical across
-runtimes.
+or `/loom-sweep 42`. Each shim reads the same canonical
+`.loom/roles/<role>.md` file the skills route to.
 
 ### Current limitations (honest list)
 
-- **No hooks**: Loom's Claude Code guardrail hooks have no Codex
-  equivalent yet — Codex sessions run without the pre-tool-use guards.
-- **No subagents**: `/loom-sweep` under Codex runs the lifecycle phases
-  sequentially in one session instead of dispatching parallel subagents.
-- **Prompts are a deprecated Codex surface**: Codex recommends skills
-  over custom prompts; the shims still work, and a skills port is
-  planned.
+- **No subagents**: `$loom-sweep` under Codex runs the sweep lifecycle
+  phases (Curator → Builder → Judge → Doctor → Merge) sequentially in one
+  session instead of dispatching parallel Task-tool subagents the way the
+  Claude Code path does. Multi-issue parallelism is available at the
+  process level instead — see `defaults/scripts/spawn-codex-wave.sh` — but
+  that is a separate operator-driven mechanism, not automatic per-sweep
+  parallelism.
+- **No hook system**: Codex has no PreToolUse/UserPromptSubmit hook
+  equivalent — its safety guarantees come from the sandbox/approval model
+  instead. This is not an outstanding gap to fix; it's mapped in full in
+  [`defaults/.codex/GUARDRAIL-PARITY.md`](../../defaults/.codex/GUARDRAIL-PARITY.md),
+  including the residual gaps that remain even when `LOOM_CODEX_SAFE=1` is
+  set.
 
-All three gaps are Epic #1 Phase 3 scope (see Epic #1 in the issue
-tracker).
+See the [Epic #30](https://github.com/gpeyton/loom/issues/30) tracker for
+the dual-runtime full-autonomy work this section reflects.
 
 ## Troubleshooting
 
@@ -751,7 +784,7 @@ gh label sync -f .github/labels.yml
 
 - **Documentation**: Check [docs/guides/](.) for detailed guides
 - **Troubleshooting**: See [troubleshooting.md](troubleshooting.md)
-- **Issues**: Report bugs at [GitHub Issues](https://github.com/rjwalters/loom/issues)
+- **Issues**: Report bugs at [GitHub Issues](https://github.com/gpeyton/loom/issues)
 - **MCP Tools**: Use MCP servers for debugging (see [testing.md](testing.md))
 
 ## Summary
