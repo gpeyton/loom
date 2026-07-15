@@ -339,6 +339,67 @@ Rules:
 
 - **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
 
+## Runtime-aware orchestration (Claude vs Codex, issue #19)
+
+Loom supports two worker runtimes (epic #1): **Claude Code** (default, load-bearing production path) and **OpenAI Codex CLI**. The two runtimes have fundamentally different concurrency primitives, so `/sweep` picks an orchestration strategy per runtime. **The Claude strategy below is exactly the strategy documented in the rest of this skill — nothing about the Claude path changes.** The Codex strategy is a separate, explicitly-gated branch.
+
+### Runtime detection
+
+Determine the worker runtime once, at the top of the run, from these signals (first non-empty wins):
+
+1. **`LOOM_WORKER` environment variable** — set by the daemon dispatch seam (`sweep_registry.rs` threads `DispatchSweep.worker_type` → the child's `LOOM_WORKER`, issue #2). Values: `codex` selects the Codex strategy; `claude` (or any other value) selects the Claude strategy.
+2. **`.loom/config.json` → `terminals[].roleConfig.workerType`** — the workspace's configured worker type for the sweep terminal, if any.
+3. **Default: `claude`.** When neither signal resolves, **assume Claude.** This is the strict default — every ambiguous or unset case runs the unchanged Claude path.
+
+```text
+RUNTIME:
+  if $LOOM_WORKER == "codex":                         runtime = codex
+  elif roleConfig.workerType == "codex":              runtime = codex
+  else:                                               runtime = claude   # strict default
+```
+
+The check is case-insensitive on the token but exact on the value — only the literal `codex` diverges. Everything else, including an empty or missing value, is Claude.
+
+### Claude strategy (default — unchanged)
+
+Task-tool subagent waves exactly as documented in **Execution Model**, **Wave Lifecycle**, and **PR-set Wave Lifecycle** above. Builders parallelize within a wave (`--builders-per-wave`), Judge/Doctor run sequentially per-PR, one level deep, and the #3289 parallel-grandchild stall hazard bounds the nesting. **No behaviour change: if `runtime == claude`, ignore this whole section and run the rest of the skill verbatim.**
+
+### Codex strategy (process-level, sequential)
+
+Codex has **no** Task-tool subagents — there is nothing to dispatch a `loom-builder` / `loom-judge` / `loom-doctor` *into*. Parallelism, when it exists at all, is process-level (`codex exec` children or daemon-dispatched sweeps). For a single interactive Codex sweep the strategy is therefore:
+
+- **Run the lifecycle sequentially in this one session.** For the target issue, perform Curator → Builder → Judge → Doctor (if needed) → Merge **yourself, in order**, following the corresponding `.loom/roles/<role>.md` file at each phase (the same role contracts the Claude subagents load). Do **not** attempt Task-tool subagents; they do not exist under Codex.
+- **The "one level deep" #3289 constraint is Claude-specific and does not apply here** — there is no stream-pump and no parallel grandchildren to stall. **But preserve the sequencing #3289's policy also enforces:** settle each PR fully (Judge → optional single Doctor→Judge cycle → Merge) before touching the next, and honour the single Doctor→Judge cycle cap. The sequential settling is load-bearing regardless of runtime.
+- **Checkpointing, label discipline, `worktree.sh`, and `merge-pr.sh` are all runtime-agnostic** and used identically. The only thing that changes is *who* executes each phase (this session, sequentially) versus *what* executes it (a dispatched subagent).
+
+The repo-local Codex shim `.codex/prompts/loom-sweep.md` (#16) documents this sequential-in-session contract for a Codex operator; the daemon child-prompt encoding (below) points Codex children at it.
+
+### Daemon child-prompt encoding (runtime-aware, issue #19)
+
+When the daemon dispatches a sweep child (`sweep_registry.rs`), the `-p <prompt>` argument is now runtime-aware:
+
+- **Claude (default): `/loom:sweep <N>` — byte-identical to before.** Every non-`codex` `worker_type` (including `None`/empty) takes this path. Existing daemon dispatch is unchanged.
+- **Codex: a natural-language instruction pointing at `.codex/prompts/loom-sweep.md`.** `codex exec` (the non-interactive mode `spawn-codex.sh` uses) does **not** expand slash-command custom prompts (openai/codex#3641), so a Codex child cannot be handed `/loom-sweep <N>`. It receives a prose instruction to read and follow the shim, which encodes the sequential-in-session Codex lifecycle. Single source of truth: `encode_child_prompt` in `sweep_registry.rs`.
+
+### Model-tier mapping under Codex (single source of truth)
+
+The Claude escalation ladder (`sweep.escalation`, default `["sonnet", "opus"]`) and the `suggestedModel` role aliases are **Claude model identifiers** — they are meaningless to Codex (`codex -m sonnet` is not a valid Codex model). Under the Codex runtime:
+
+- The Claude alias tiers and the Judge-rejection escalation ladder **do not apply** — there is no second, hardcoded Codex ladder to keep in sync.
+- The Codex model comes from **one** source of truth: the centralized `codex-model` input default in `.github/workflows/loom-role.yml` (currently `gpt-5-codex`, the code-optimized Codex model). Bump it there, in one place, for all Codex runs. `spawn-codex.sh` honours an explicit `-m/--model` or `LOOM_MODEL` override above that default, exactly as its Claude sibling does.
+- Because there is effectively one code-optimized Codex tier, "escalate one rung on Judge rejection" collapses to "re-run Doctor on the same Codex model." This is intentional and documented, not an omission.
+
+### Guardrail parity + autonomy (hard prerequisite — issue #20)
+
+A Codex sweep that runs **autonomously with write access** is only as trustworthy as its guardrails. Loom's Claude path is protected by PreToolUse hooks (`guard-destructive.sh`, `guard-worktree-paths.sh`, the `gh pr merge` block); **Codex has no hook equivalent yet — that is issue #20 (guardrail parity), a concurrent hard prerequisite.** Until #20 lands:
+
+- **A fully-autonomous Codex sweep with write access is NOT a default and must not be enabled by default.** `spawn-codex.sh` already keeps the sandbox on (`--full-auto`) unless `LOOM_CODEX_UNSAFE=1` is *explicitly* set; the bypass-everything flag stays gated behind that opt-in. Do not remove or weaken that gate here.
+- **Any Codex-sweep path that runs with fewer guards than the Claude path is opt-in and loudly documented** (this section, plus the `.codex/prompts/README.md` limitations list). Cross-reference #20 before trusting an unattended Codex sweep.
+
+### Scope note — multi-wave process-level Codex orchestration is deferred (follow-up #24)
+
+This issue lands **runtime detection + a single-role / single-issue sequential Codex sweep** (Curator → Builder → Judge → Doctor → Merge, one session, no Task subagents) plus the runtime-aware daemon child-prompt encoding. **Full process-level multi-wave Codex orchestration** — fanning multiple `codex exec` children (or daemon-dispatched Codex sweeps) out as the process-level analogue of Claude's `--builders-per-wave` parallel waves — is **explicitly deferred to a follow-up issue (#24)**, not silently narrowed. Under Codex today, `--builders-per-wave > 1` degrades to sequential per-issue processing (there is no subagent to parallelize into); the follow-up adds true process-level fan-out.
+
 ## Stage -1: Backend detection (Phase D of #3449)
 
 Before **any** other stage — including the dry-run gate and all wave lifecycles — decide whether to **delegate dispatch to the in-process loom-daemon** or **fall through to the existing in-process subagent dispatch**. This stage is prose for the LLM running this skill; it does not run a separate binary. Implementation is small, side-effect-free probes followed by a single routing decision.
