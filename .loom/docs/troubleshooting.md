@@ -2,7 +2,16 @@
 
 ## Common Issues
 
-### Hooks not firing (`guard-destructive.sh` not blocking commands)
+### Hooks not firing (`guard-destructive.sh` not blocking commands) — Claude Code only
+
+> **Claude-runtime-only.** Loom's guardrail hooks (`guard-destructive.sh` and the
+> other `PreToolUse`/`PostToolUse` hooks under `.claude/`) are a **Claude Code**
+> mechanism — they are wired through Claude Code's permission/hook system. The
+> OpenAI Codex CLI does not run these hooks; Codex enforces safety through its
+> **sandbox mode** and **approval policy** instead (see
+> [Codex worker troubleshooting](#codex-worker-troubleshooting-runtime-parity) below). The
+> hook-to-sandbox safety mapping and the residual gaps between the two models are
+> documented in the guardrail-parity doc (forthcoming — issue #20).
 
 **Symptom**: Commands that should be blocked or confirmed by `guard-destructive.sh` (e.g., `git reset --hard`, `gh issue close`) are executing without any prompt or denial.
 
@@ -141,7 +150,7 @@ semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
 tail -f ~/.loom/daemon.log
 ```
 
-### Claude Code not found
+### Claude Code not found (Claude runtime)
 
 ```bash
 # Ensure Claude Code CLI is in PATH
@@ -150,7 +159,100 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
-### Sweep output invisible when invoked with `2>&1`
+### Codex worker troubleshooting (runtime parity)
+
+Loom supports the **OpenAI Codex CLI** as a co-equal worker runtime alongside
+Claude Code. The entries below are the Codex counterparts of the Claude-specific
+troubleshooting above. For first-time Codex setup, see
+[Using Codex with Loom](../../docs/guides/getting-started.md#using-codex-with-loom).
+
+#### `codex` command not found
+
+```bash
+# Ensure the Codex CLI is in PATH
+which codex
+codex --version
+
+# Install if missing:
+npm install -g @openai/codex
+# See https://developers.openai.com/codex for installation and auth
+```
+
+If a scheduled support-role workflow selected the `codex` runtime but the job
+fails at startup, confirm `@openai/codex` installed and that `OPENAI_API_KEY` is
+set as a repository secret (the `claude` runtime uses `CLAUDE_API_KEY` instead —
+the two runtimes require different secrets).
+
+#### Sandbox / approval blocking (Codex safety model)
+
+Codex enforces safety through a **sandbox mode** plus an **approval policy** —
+this is Codex's equivalent of Loom's Claude Code guardrail hooks (there is no
+Codex hook system). Symptom: Codex refuses to write files, run commands, or reach
+the network, or it stops to ask for approval mid-run.
+
+- **Sandbox modes** (`sandbox_mode` in `.codex/config.toml`, or `--sandbox` on the
+  CLI): `read-only`, `workspace-write` (Loom's default for autonomous role runs —
+  allows edits inside the workspace but still gates network/out-of-workspace
+  access), and `danger-full-access` (no sandbox — use only in already-isolated
+  environments such as CI containers).
+- **Approval policy** (`approval_policy`, or `--ask-for-approval`): valid values are
+  `untrusted`, `on-request`, `never`, and `granular` (`on-failure` is deprecated).
+  For non-interactive automation Loom runs `codex exec ... --sandbox workspace-write`
+  so the agent proceeds without interactive prompts, mirroring Claude Code's
+  `--dangerously-skip-permissions` posture.
+
+```bash
+# Non-interactive run with workspace-write sandbox (Loom's automation default):
+codex exec "<inlined role prompt>" --sandbox workspace-write -m <codex-model>
+```
+
+If Codex is blocking a legitimate write, widen the sandbox to `workspace-write`;
+if it is blocking network access a task genuinely needs, that is expected — the
+guardrail-parity doc (forthcoming — issue #20) documents which safety guarantees
+carry over from the Claude hooks and which are residual gaps.
+
+#### MCP config / `loom` tools not resolving under Codex
+
+Codex loads the `loom` MCP server from a **project-scoped** `.codex/config.toml`,
+but only for projects you have marked **trusted** in Codex. Symptoms: the `loom`
+MCP tools are missing in a Codex session, or `.codex/config.toml` overrides are
+ignored entirely.
+
+```bash
+# 1. Materialize the [mcp_servers.loom] entry (idempotent, absolute-path):
+./scripts/setup-mcp.sh --codex
+
+# 2. Trust the repository in Codex so it loads the project-scoped .codex/ layer.
+#    Untrusted projects skip project-local config, so the loom MCP entry never loads.
+
+# 3. Confirm the entry is present and uncommented in .codex/config.toml:
+grep -A3 'mcp_servers.loom' .codex/config.toml
+```
+
+Do **not** run `CODEX_HOME=$(pwd)/.codex codex` to force config loading — that
+drags auth/session state into the repo tree. Trust the project instead and rely
+on Codex's native project-scoped config merge.
+
+#### Codex prompts / slash commands not found
+
+Codex discovers custom prompts only in `$CODEX_HOME/prompts/` (default
+`~/.codex/prompts/`), **not** in the repo's `.codex/prompts/`. If `/builder`,
+`/judge`, etc. are unavailable in a Codex session, the one-time symlink setup is
+missing:
+
+```bash
+# From the repo root — symlink the repo's prompt shims into CODEX_HOME:
+mkdir -p ~/.codex/prompts
+ln -sf "$(pwd)/.codex/prompts/"*.md ~/.codex/prompts/
+rm -f ~/.codex/prompts/README.md
+```
+
+See [Using Codex with Loom → Prompt invocation](../../docs/guides/getting-started.md#using-codex-with-loom)
+for the full walkthrough. Note that custom prompts are a deprecated Codex surface
+(Codex recommends skills); the shims still work and a skills port is tracked under
+Epic #1.
+
+### Sweep output invisible when invoked with `2>&1` (Claude `claude -p`)
 
 When `claude -p "/loom:sweep N"` is run with `2>&1` redirection (e.g., from Claude Code's Bash tool for long-running processes), output may be silently dropped. This is because the Bash tool's capture buffer can be exhausted by a long-running child process when both stdout and stderr are forced through the same pipe.
 

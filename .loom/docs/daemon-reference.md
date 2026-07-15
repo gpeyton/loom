@@ -73,7 +73,7 @@ support roles on cron. Those responsibilities live in `spawn-loop.sh`
                               │ detached child
                               ▼
                        /loom:sweep <issue>
-                       (Claude Code session)
+                       (Claude Code or Codex session)
 ```
 
 ## IPC surface (Request/Response variants)
@@ -139,10 +139,12 @@ Inputs:
   A only fully implements `Issue`; `PrSet` is rejected by the registry.
 - `idempotency_key` (optional) — dedup key. Running sweeps with the same
   key return the existing `sweep_id` without spawning a new child.
-- `model` (optional, issue #3477 Phase 1) — Claude model for the spawned
-  child, as an alias (`sonnet`, `opus`, `haiku`) or a pinned ID
-  (`claude-sonnet-4-6`). Forwarded as `--model <value>` on the
-  `spawn-claude.sh` argv. When omitted (or empty), NO `--model` flag is
+- `model` (optional, issue #3477 Phase 1) — model for the spawned child. The
+  value is **runtime-dependent**: for a Claude Code child it is a Claude model
+  alias (`sonnet`, `opus`, `haiku`) or a pinned ID (`claude-sonnet-4-6`); for a
+  Codex child it is the runtime-appropriate Codex model identifier passed as
+  `-m <model>`. Forwarded as `--model <value>` on the `spawn-claude.sh` argv (the
+  daemon's Claude dispatch path). When omitted (or empty), NO `--model` flag is
   emitted and the child inherits the session/CLI default. The field is
   `#[serde(default)]` on the wire, so pre-#3477 clients remain compatible.
 
