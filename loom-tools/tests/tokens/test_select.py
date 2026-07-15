@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from loom_tools.tokens.check import AccountResult, ProbeReport, write_ranking_atomic
 from loom_tools.tokens.select import (
     EX_CONFIG,
     EmptyTokenPoolError,
@@ -38,9 +39,21 @@ def _make_workspace(tmp_path: Path, accounts: dict[str, str]) -> Path:
     return tmp_path
 
 
-def _write_ranking(workspace: Path, lines: list[str]) -> None:
+def _write_ranking(workspace: Path, entries: list[tuple[str, str]]) -> None:
+    """Write a ``.ranking`` file matching the real ``check.py`` JSON shape.
+
+    Args:
+        entries: ``(name, status)`` pairs, already in ranked order.
+    """
     rfile = workspace / ".loom" / "tokens" / ".ranking"
-    rfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    payload = {
+        "ranked_at": "2026-01-01T00:00:00Z",
+        "accounts": [
+            {"name": name, "status": status, "provider": "anthropic"}
+            for name, status in entries
+        ],
+    }
+    rfile.write_text(json.dumps(payload), encoding="utf-8")
     # Ensure mtime is fresh
     now = time.time()
     os.utime(rfile, (now, now))
@@ -182,7 +195,7 @@ def test_allowlist_with_no_existing_tokens_falls_through_to_random(tmp_path):
 
 def test_ranking_picks_first_unblocked(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
-    _write_ranking(workspace, ["a|exhausted", "b|", "c|"])
+    _write_ranking(workspace, [("a", "exhausted"), ("b", ""), ("c", "")])
     sel = select_token(workspace)
     assert sel.name == "b"
     assert sel.mode == "ranked"
@@ -190,14 +203,14 @@ def test_ranking_picks_first_unblocked(tmp_path):
 
 def test_ranking_skips_blocked_status(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, ["a|blocked", "b|"])
+    _write_ranking(workspace, [("a", "blocked"), ("b", "")])
     sel = select_token(workspace)
     assert sel.name == "b"
 
 
 def test_ranking_skips_bad_token(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, ["a|", "b|"])
+    _write_ranking(workspace, [("a", ""), ("b", "")])
     bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
     bad_file.write_text("2026-01-01T00:00:00Z a expired\n", encoding="utf-8")
     sel = select_token(workspace)
@@ -207,7 +220,14 @@ def test_ranking_skips_bad_token(tmp_path):
 def test_stale_ranking_falls_through_to_random(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
     rfile = workspace / ".loom" / "tokens" / ".ranking"
-    rfile.write_text("a|\nb|\n", encoding="utf-8")
+    payload = {
+        "ranked_at": "2026-01-01T00:00:00Z",
+        "accounts": [
+            {"name": "a", "status": ""},
+            {"name": "b", "status": ""},
+        ],
+    }
+    rfile.write_text(json.dumps(payload), encoding="utf-8")
     # Backdate by 11 minutes — past the 10-min freshness window
     old = time.time() - (11 * 60)
     os.utime(rfile, (old, old))
@@ -216,23 +236,183 @@ def test_stale_ranking_falls_through_to_random(tmp_path):
     assert sel.mode == "random"
 
 
-def test_ranking_with_comments_and_blank_lines(tmp_path):
+def test_ranking_tolerates_unknown_fields(tmp_path):
+    """Extra/unknown fields in each account entry are ignored, not fatal."""
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(
-        workspace,
-        ["# header comment", "", "a|exhausted", "b|"],
-    )
+    rfile = workspace / ".loom" / "tokens" / ".ranking"
+    payload = {
+        "ranked_at": "2026-01-01T00:00:00Z",
+        "accounts": [
+            {
+                "name": "a",
+                "status": "exhausted",
+                "5h_utilization": 0.99,
+                "7d_utilization": 0.99,
+                "7d_reset": "2026-01-02T00:00:00Z",
+            },
+            {"name": "b", "status": "", "5h_utilization": None},
+        ],
+    }
+    rfile.write_text(json.dumps(payload), encoding="utf-8")
+    now = time.time()
+    os.utime(rfile, (now, now))
     sel = select_token(workspace)
     assert sel.name == "b"
+    assert sel.mode == "ranked"
 
 
 def test_ranking_falls_through_when_all_exhausted(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, ["a|exhausted", "b|exhausted"])
+    _write_ranking(workspace, [("a", "exhausted"), ("b", "exhausted")])
     sel = select_token(workspace)
     # Falls through past tier 1 (all exhausted), past tier 2 (no allowlist),
     # to tier 3 (random).
     assert sel.mode == "random"
+
+
+def test_malformed_ranking_json_falls_through(tmp_path):
+    """A corrupt/legacy (e.g. pipe-delimited) .ranking file must not raise —
+    tier 1 declines and selection falls through to tier 2/3."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    rfile = workspace / ".loom" / "tokens" / ".ranking"
+    rfile.write_text("a|\nb|\n", encoding="utf-8")  # legacy pipe format, not JSON
+    now = time.time()
+    os.utime(rfile, (now, now))
+    sel = select_token(workspace)
+    assert sel.mode == "random"
+
+
+def test_ranking_json_not_a_dict_falls_through(tmp_path):
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    rfile = workspace / ".loom" / "tokens" / ".ranking"
+    rfile.write_text(json.dumps(["a", "b"]), encoding="utf-8")
+    now = time.time()
+    os.utime(rfile, (now, now))
+    sel = select_token(workspace)
+    assert sel.mode == "random"
+
+
+# ---------- writer/reader round-trip (issue #18) ----------
+#
+# These tests exercise the REAL production writer
+# (loom_tools.tokens.check.write_ranking_atomic) together with the REAL
+# production reader (loom_tools.tokens.select.select_token). This is the
+# regression test for #18: check.py writes JSON, select.py used to parse
+# pipe-delimited lines, so tier-1 (ranked) selection silently never
+# matched anything and every selection fell through to tier-2/tier-3.
+
+
+def _make_provider_workspace(
+    tmp_path: Path, accounts: dict[str, str], providers: dict[str, str]
+) -> Path:
+    """Like ``_make_workspace`` but also writes an ``index.json`` mapping
+    each account name to a provider, so ``select_token(..., provider=...)``
+    can filter eligibility the same way it does in production."""
+    workspace = _make_workspace(tmp_path, accounts)
+    tokens_dir = workspace / ".loom" / "tokens"
+    index = {
+        "version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "accounts": [
+            {"name": name, "file": f"{name}.token", "provider": prov}
+            for name, prov in providers.items()
+        ],
+    }
+    (tokens_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    return workspace
+
+
+def test_writer_reader_round_trip_picks_best_account(tmp_path):
+    """check.write_ranking_atomic() -> select.select_token() end to end."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    tokens_dir = workspace / ".loom" / "tokens"
+
+    report = ProbeReport(
+        ranked_at="2026-01-01T00:00:00Z",
+        accounts=[
+            AccountResult(name="a", status="exhausted"),
+            AccountResult(name="b", status="available"),
+            AccountResult(name="c", status="available"),
+        ],
+    )
+    write_ranking_atomic(report, tokens_dir / ".ranking")
+
+    sel = select_token(workspace)
+    assert sel.name == "b"
+    assert sel.mode == "ranked"
+
+
+def test_writer_reader_round_trip_respects_rank_order(tmp_path):
+    """The writer's list order IS the rank order; the reader must preserve it."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    tokens_dir = workspace / ".loom" / "tokens"
+
+    # "b" ranked ahead of "a" even though "a" sorts first alphabetically —
+    # the reader must pick "b" because it's first in the writer's list.
+    report = ProbeReport(
+        ranked_at="2026-01-01T00:00:00Z",
+        accounts=[
+            AccountResult(name="b", status="available"),
+            AccountResult(name="a", status="available"),
+        ],
+    )
+    write_ranking_atomic(report, tokens_dir / ".ranking")
+
+    sel = select_token(workspace)
+    assert sel.name == "b"
+    assert sel.mode == "ranked"
+
+
+def test_writer_reader_round_trip_provider_filtered(tmp_path):
+    """Mixed-provider round trip: each provider's select_token() call must
+    pick the correct account purely from the real writer's real output."""
+    workspace = _make_provider_workspace(
+        tmp_path,
+        {"claude-1": "ka", "codex-1": "kb"},
+        providers={"claude-1": "anthropic", "codex-1": "openai"},
+    )
+    tokens_dir = workspace / ".loom" / "tokens"
+
+    report = ProbeReport(
+        ranked_at="2026-01-01T00:00:00Z",
+        accounts=[
+            AccountResult(name="codex-1", status="available", provider="openai"),
+            AccountResult(name="claude-1", status="available", provider="anthropic"),
+        ],
+    )
+    write_ranking_atomic(report, tokens_dir / ".ranking")
+
+    sel_anthropic = select_token(workspace)
+    assert sel_anthropic.name == "claude-1"
+    assert sel_anthropic.mode == "ranked"
+
+    sel_openai = select_token(workspace, provider="openai")
+    assert sel_openai.name == "codex-1"
+    assert sel_openai.mode == "ranked"
+
+
+def test_writer_reader_round_trip_via_run_check(tmp_path, monkeypatch):
+    """Same contract, but going through run_check() (write_ranking=True)
+    instead of calling write_ranking_atomic() directly, to also exercise
+    build_report()'s sorting."""
+    from loom_tools.tokens import check as check_mod
+
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    tokens_dir = workspace / ".loom" / "tokens"
+
+    def fake_probe(provider, name, token, *, probe_prompt, model, session=None):
+        # "b" is available (ranks first), "a" is exhausted (ranks last).
+        if name == "b":
+            return AccountResult(name=name, status="available")
+        return AccountResult(name=name, status="exhausted")
+
+    monkeypatch.setattr(check_mod, "probe_account_for_provider", fake_probe)
+
+    check_mod.run_check(tokens_dir, write_ranking=True, stagger=False)
+
+    sel = select_token(workspace)
+    assert sel.name == "b"
+    assert sel.mode == "ranked"
 
 
 # ---------- CLI ----------
