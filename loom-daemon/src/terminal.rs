@@ -931,6 +931,176 @@ mod claude_config {
     }
 }
 
+/// Per-agent OpenAI Codex CLI config isolation (`CODEX_HOME`).
+///
+/// The Codex counterpart of [`claude_config`]. It is deliberately minimal and
+/// does NONE of the Claude-only work (no macOS Keychain cloning, no
+/// `.claude.json` onboarding-skip, no `.claude/{commands,agents}` symlinks).
+///
+/// Codex resolves configuration and custom prompts relative to `$CODEX_HOME`
+/// (default `~/.codex`); custom prompts are discovered ONLY in
+/// `$CODEX_HOME/prompts/`. See `defaults/.codex/` and issue #16 for the shipped
+/// project-scoped layout. This module gives each agent its own `CODEX_HOME` so
+/// concurrent Codex terminals don't share session/auth state, wiring the
+/// repo-local `.codex/config.toml` (MCP server entry) and `.codex/prompts/`
+/// (role shims) into that isolated home via symlinks.
+mod codex_config {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Create (or refresh) an isolated `CODEX_HOME` for a terminal.
+    ///
+    /// Layout produced under `.loom/codex-config/{agent_name}/`:
+    ///   - `config.toml`  → symlink to `<repo>/.codex/config.toml` (if present)
+    ///   - `prompts`      → symlink to `<repo>/.codex/prompts` (if present)
+    ///
+    /// Idempotent — safe to call multiple times. Returns the `CODEX_HOME` path
+    /// (which the caller exports on the tmux session). Returns `None` only if
+    /// the home directory itself cannot be created.
+    ///
+    /// Explicitly does NOT touch the macOS Keychain, `.claude.json`, or any
+    /// Claude config file — those belong exclusively to [`claude_config`].
+    pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
+        let config_dir = repo_root
+            .join(".loom")
+            .join("codex-config")
+            .join(agent_name);
+
+        if let Err(e) = fs::create_dir_all(&config_dir) {
+            log::warn!("Failed to create Codex CODEX_HOME dir {}: {e}", config_dir.display());
+            return None;
+        }
+
+        // Wire the repo-local `.codex/` project config + prompts into this
+        // isolated home so the loom MCP entry and role shims are discoverable.
+        let repo_codex = repo_root.join(".codex");
+        link_into_home(&repo_codex.join("config.toml"), &config_dir.join("config.toml"));
+        link_into_home(&repo_codex.join("prompts"), &config_dir.join("prompts"));
+
+        Some(config_dir)
+    }
+
+    /// Symlink `src` → `dst` when `src` exists and `dst` is not already present.
+    ///
+    /// Mirrors the conservative behaviour of the Claude preparer's shared-file
+    /// linking: missing source → skip; existing destination → leave alone.
+    fn link_into_home(src: &Path, dst: &Path) {
+        if !src.exists() || dst.exists() {
+            return;
+        }
+        // Canonicalize so the link survives cwd changes and moved worktrees.
+        let src_abs = match fs::canonicalize(src) {
+            Ok(p) => p,
+            Err(e) => {
+                log::debug!("Could not canonicalize Codex link source {}: {e}", src.display());
+                return;
+            }
+        };
+        if let Err(e) = std::os::unix::fs::symlink(&src_abs, dst) {
+            log::debug!("Failed to symlink {} -> {}: {e}", dst.display(), src_abs.display());
+        }
+    }
+
+    /// Remove one agent's `CODEX_HOME` directory. Returns `true` if it existed.
+    pub fn cleanup_agent_config_dir(agent_name: &str, repo_root: &Path) -> bool {
+        let config_dir = repo_root
+            .join(".loom")
+            .join("codex-config")
+            .join(agent_name);
+
+        if config_dir.is_dir() {
+            if let Err(e) = fs::remove_dir_all(&config_dir) {
+                log::warn!("Failed to remove Codex config dir {}: {e}", config_dir.display());
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The set of environment variables a preparer wants set on the tmux session,
+/// plus the config directory it materialized.
+struct PreparedEnv {
+    /// `(name, value)` pairs to `tmux set-environment` on the session.
+    env_vars: Vec<(String, String)>,
+}
+
+/// A per-worker-type "environment preparer".
+///
+/// `create_terminal` selects one of these from the terminal's `worker_type`
+/// (issue #21, epic #1). Each preparer materializes an isolated per-agent
+/// config directory and reports the environment variables the worker CLI needs.
+/// The two implementations are strictly disjoint: the Claude preparer performs
+/// ONLY Claude config work (Keychain clone, onboarding skip, `.claude` links)
+/// and the Codex preparer performs ONLY Codex config work (`CODEX_HOME`,
+/// prompts symlink) — neither touches the other's state.
+trait EnvironmentPreparer {
+    /// Short worker-type name (`"claude"` / `"codex"`), used for logging/tests.
+    fn name(&self) -> &'static str;
+
+    /// Materialize the isolated config dir and return the env vars to set.
+    ///
+    /// Returns `None` when the config dir could not be created (best-effort;
+    /// the caller then skips env setup for this terminal).
+    fn prepare(&self, agent_name: &str, repo_root: &Path) -> Option<PreparedEnv>;
+}
+
+/// Claude preparer — wraps the pre-existing [`claude_config`] module verbatim.
+struct ClaudePreparer;
+
+impl EnvironmentPreparer for ClaudePreparer {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
+    fn prepare(&self, agent_name: &str, repo_root: &Path) -> Option<PreparedEnv> {
+        let config_dir = claude_config::setup_agent_config_dir(agent_name, repo_root)?;
+        let config_dir_str = config_dir.to_string_lossy().to_string();
+        let tmp_dir_str = config_dir.join("tmp").to_string_lossy().to_string();
+        Some(PreparedEnv {
+            env_vars: vec![
+                ("CLAUDE_CONFIG_DIR".to_string(), config_dir_str),
+                ("TMPDIR".to_string(), tmp_dir_str),
+            ],
+        })
+    }
+}
+
+/// Codex preparer — sets up `CODEX_HOME`; skips all Claude config work.
+struct CodexPreparer;
+
+impl EnvironmentPreparer for CodexPreparer {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn prepare(&self, agent_name: &str, repo_root: &Path) -> Option<PreparedEnv> {
+        let config_dir = codex_config::setup_agent_config_dir(agent_name, repo_root)?;
+        let config_dir_str = config_dir.to_string_lossy().to_string();
+        Some(PreparedEnv {
+            env_vars: vec![("CODEX_HOME".to_string(), config_dir_str)],
+        })
+    }
+}
+
+/// Select the environment preparer for a terminal's `worker_type`.
+///
+/// Defaults to Claude when `worker_type` is `None`, empty, or unrecognized —
+/// matching the #2 empty-string-means-unset convention. Only an explicit
+/// `"codex"` (case-insensitive) selects the Codex preparer.
+fn select_environment_preparer(worker_type: Option<&str>) -> Box<dyn EnvironmentPreparer> {
+    match worker_type
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("codex") => Box::new(CodexPreparer),
+        _ => Box::new(ClaudePreparer),
+    }
+}
+
 /// Build the pipe-pane command string that strips ANSI escape sequences from output.
 ///
 /// The sed command removes:
@@ -1044,55 +1214,47 @@ impl TerminalManager {
         true
     }
 
-    /// Set up per-agent `CLAUDE_CONFIG_DIR` isolation for a tmux session.
+    /// Set up per-agent config-dir isolation for a tmux session.
     ///
-    /// Creates an isolated config directory and sets `CLAUDE_CONFIG_DIR` and `TMPDIR`
-    /// environment variables on the tmux session.
+    /// Selects a per-worker-type environment preparer (issue #21) from
+    /// `worker_type` — Claude by default, Codex for `worker_type == "codex"` —
+    /// materializes that runtime's isolated config directory, and sets the
+    /// resulting environment variables (`CLAUDE_CONFIG_DIR`/`TMPDIR` for Claude,
+    /// `CODEX_HOME` for Codex) on the tmux session.
     fn setup_config_dir_isolation(
         terminal_id: &str,
         working_dir: Option<&str>,
         tmux_session: &str,
+        worker_type: Option<&str>,
     ) {
         let Some(repo_root) = Self::find_repo_root(working_dir) else {
             log::debug!(
-                "No repo root found for terminal {terminal_id}; skipping CLAUDE_CONFIG_DIR isolation"
+                "No repo root found for terminal {terminal_id}; skipping config-dir isolation"
             );
             return;
         };
 
-        let Some(config_dir) = claude_config::setup_agent_config_dir(terminal_id, &repo_root)
-        else {
+        let preparer = select_environment_preparer(worker_type);
+        let Some(env) = preparer.prepare(terminal_id, &repo_root) else {
             return;
         };
 
-        let config_dir_str = config_dir.to_string_lossy();
-        let tmp_dir_str = config_dir.join("tmp").to_string_lossy().to_string();
+        for (var_name, var_value) in &env.env_vars {
+            let _ = Command::new("tmux")
+                .args(["-L", "loom"])
+                .args(["set-environment", "-t", tmux_session, var_name, var_value])
+                .output();
+        }
 
-        // Set CLAUDE_CONFIG_DIR on the tmux session
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "set-environment",
-                "-t",
-                tmux_session,
-                "CLAUDE_CONFIG_DIR",
-                &config_dir_str,
-            ])
-            .output();
-
-        // Set TMPDIR on the tmux session
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "set-environment",
-                "-t",
-                tmux_session,
-                "TMPDIR",
-                &tmp_dir_str,
-            ])
-            .output();
-
-        log::info!("Set CLAUDE_CONFIG_DIR={config_dir_str} for session {tmux_session}");
+        log::info!(
+            "Set {} isolation env for session {tmux_session}: {}",
+            preparer.name(),
+            env.env_vars
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     /// Handle tmux command errors with consistent logging
@@ -1215,6 +1377,7 @@ impl TerminalManager {
         working_dir: Option<String>,
         role: Option<&String>,
         instance_number: Option<u32>,
+        worker_type: Option<&str>,
     ) -> Result<TerminalId> {
         // Validate terminal ID to prevent command injection
         Self::validate_terminal_id(config_id)?;
@@ -1314,8 +1477,8 @@ impl TerminalManager {
         }
         log::info!("pipe-pane setup successful for session {tmux_session}");
 
-        // Set up per-agent CLAUDE_CONFIG_DIR isolation
-        Self::setup_config_dir_isolation(&id, working_dir.as_deref(), &tmux_session);
+        // Set up per-agent config-dir isolation for the selected worker type
+        Self::setup_config_dir_isolation(&id, working_dir.as_deref(), &tmux_session, worker_type);
 
         let info = TerminalInfo {
             id: id.clone(),
@@ -1492,10 +1655,15 @@ impl TerminalManager {
         let output_file = format!("/tmp/loom-{id}.out");
         let _ = std::fs::remove_file(output_file);
 
-        // Clean up per-agent CLAUDE_CONFIG_DIR
+        // Clean up per-agent config dirs. The worker type isn't recorded on the
+        // terminal, so attempt both preparers' dirs — each is a no-op when its
+        // directory is absent.
         if let Some(root) = Self::find_repo_root(info.working_dir.as_deref()) {
             if claude_config::cleanup_agent_config_dir(id, &root) {
                 log::info!("Cleaned up CLAUDE_CONFIG_DIR for terminal {id}");
+            }
+            if codex_config::cleanup_agent_config_dir(id, &root) {
+                log::info!("Cleaned up CODEX_HOME for terminal {id}");
             }
         }
 
@@ -2225,5 +2393,129 @@ mod tests {
         with_preserve_env(None, || {
             assert!(!TerminalManager::preserve_worktree_env());
         });
+    }
+
+    // ===== environment preparer selection (issue #21) =====
+
+    #[test]
+    fn test_select_preparer_defaults_to_claude() {
+        // None / unset / empty / whitespace / unknown all default to Claude.
+        assert_eq!(select_environment_preparer(None).name(), "claude");
+        assert_eq!(select_environment_preparer(Some("")).name(), "claude");
+        assert_eq!(select_environment_preparer(Some("   ")).name(), "claude");
+        assert_eq!(select_environment_preparer(Some("claude")).name(), "claude");
+        assert_eq!(select_environment_preparer(Some("gpt-9000")).name(), "claude");
+    }
+
+    #[test]
+    fn test_select_preparer_codex() {
+        // Explicit "codex" (case-insensitive, trimmed) selects the Codex preparer.
+        assert_eq!(select_environment_preparer(Some("codex")).name(), "codex");
+        assert_eq!(select_environment_preparer(Some("CODEX")).name(), "codex");
+        assert_eq!(select_environment_preparer(Some("  Codex  ")).name(), "codex");
+    }
+
+    #[test]
+    fn test_claude_preparer_sets_claude_env_and_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        let preparer = select_environment_preparer(Some("claude"));
+        let env = preparer.prepare("terminal-claude-1", repo_root).unwrap();
+
+        // Claude preparer exports CLAUDE_CONFIG_DIR + TMPDIR, never CODEX_HOME.
+        let keys: Vec<&str> = env.env_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"CLAUDE_CONFIG_DIR"));
+        assert!(keys.contains(&"TMPDIR"));
+        assert!(!keys.contains(&"CODEX_HOME"), "Claude preparer must not set CODEX_HOME");
+
+        // The Claude config dir (with its onboarding-skip .claude.json) is created.
+        let claude_dir = repo_root.join(".loom/claude-config/terminal-claude-1");
+        assert!(claude_dir.join(".claude.json").is_file());
+        // And no Codex home was materialized.
+        assert!(!repo_root
+            .join(".loom/codex-config/terminal-claude-1")
+            .exists());
+    }
+
+    #[test]
+    fn test_codex_preparer_sets_codex_home_and_skips_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+        // Ship a repo-local .codex/ so the preparer has something to link.
+        let repo_codex = repo_root.join(".codex");
+        fs::create_dir_all(repo_codex.join("prompts")).unwrap();
+        fs::write(repo_codex.join("config.toml"), "# loom\n").unwrap();
+        fs::write(repo_codex.join("prompts").join("builder.md"), "# builder\n").unwrap();
+
+        let preparer = select_environment_preparer(Some("codex"));
+        let env = preparer.prepare("terminal-codex-1", repo_root).unwrap();
+
+        // Codex preparer exports ONLY CODEX_HOME — no Claude env vars.
+        let keys: Vec<&str> = env.env_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["CODEX_HOME"]);
+        assert!(!keys.contains(&"CLAUDE_CONFIG_DIR"));
+        assert!(!keys.contains(&"TMPDIR"));
+
+        let codex_home = repo_root.join(".loom/codex-config/terminal-codex-1");
+        assert!(codex_home.is_dir(), "CODEX_HOME dir must be created");
+        assert_eq!(env.env_vars[0].1, codex_home.to_string_lossy());
+
+        // Repo-local config + prompts are wired into the isolated home.
+        assert!(codex_home.join("config.toml").exists());
+        assert!(codex_home.join("prompts").join("builder.md").is_file());
+
+        // CRITICAL: the Codex preparer must NOT perform Claude keychain /
+        // onboarding work — no Claude config dir, no .claude.json, no
+        // settings.json is created anywhere for this agent.
+        assert!(
+            !repo_root
+                .join(".loom/claude-config/terminal-codex-1")
+                .exists(),
+            "Codex preparer must not create a Claude config dir"
+        );
+        assert!(!codex_home.join(".claude.json").exists());
+        assert!(!codex_home.join("settings.json").exists());
+    }
+
+    #[test]
+    fn test_codex_preparer_ok_without_repo_codex_dir() {
+        // A repo with no .codex/ still gets a valid (empty) CODEX_HOME — no panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        let prepared = CodexPreparer
+            .prepare("terminal-codex-2", repo_root)
+            .unwrap();
+        let codex_home = repo_root.join(".loom/codex-config/terminal-codex-2");
+        assert!(codex_home.is_dir());
+        assert_eq!(prepared.env_vars[0].0, "CODEX_HOME");
+        // Nothing to link — the symlinks are absent, but that's fine.
+        assert!(!codex_home.join("config.toml").exists());
+        assert!(!codex_home.join("prompts").exists());
+    }
+
+    #[test]
+    fn test_codex_cleanup_removes_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        CodexPreparer
+            .prepare("terminal-codex-3", repo_root)
+            .unwrap();
+        assert!(repo_root
+            .join(".loom/codex-config/terminal-codex-3")
+            .is_dir());
+
+        assert!(codex_config::cleanup_agent_config_dir("terminal-codex-3", repo_root));
+        assert!(!repo_root
+            .join(".loom/codex-config/terminal-codex-3")
+            .exists());
+        // Second cleanup is a no-op.
+        assert!(!codex_config::cleanup_agent_config_dir("terminal-codex-3", repo_root));
     }
 }
