@@ -93,6 +93,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Run installer tests
         run: bash scripts/test-installer.sh
+      - name: Run reinstall-safety regression tests (issue #49)
+        run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
 
   codex-tests:
     name: Codex Test Suites
