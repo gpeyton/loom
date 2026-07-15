@@ -13,8 +13,7 @@
 #
 # Supported runners today:
 #   claude  -> spawn-claude.sh (this directory)
-#   (codex  -> spawn-codex.sh is reserved for Phase 2 of epic #1 (issue #2's
-#    parent) and is NOT implemented by this script.)
+#   codex   -> spawn-codex.sh  (this directory; issue #10, Phase 2 of epic #1)
 #
 # Runner contract:
 #   Every runner script that implements a worker type for this dispatcher
@@ -43,6 +42,22 @@
 #     (e) skip-permissions flag shape: --dangerously-skip-permissions
 #         (passed through untouched -- spawn-claude.sh does not add or
 #         require it, callers supply it as part of the passthrough args)
+#
+#   spawn-codex.sh's contract (issue #10, Phase 2 of epic #1):
+#     (a) binary name: codex
+#     (b) auth env var: OPENAI_API_KEY (honored if pre-set; otherwise the
+#         Codex CLI's own ChatGPT login state is used -- the .loom/tokens/
+#         rotation pool is Claude-only until issue G lands)
+#     (c) prompt flag shape: -p "<prompt>" is translated to the positional
+#         argument of `codex exec "<prompt>"`; no -p falls through to the
+#         interactive `codex` TUI
+#     (d) model flag shape: -m <value> / --model <value> (also LOOM_MODEL env;
+#         see spawn-codex.sh's own header for the precedence chain)
+#     (e) skip-permissions flag shape: --dangerously-skip-permissions is
+#         consumed by spawn-codex.sh and mapped to a Codex permission flag
+#         (--full-auto by default; --dangerously-bypass-approvals-and-sandbox
+#         only behind LOOM_CODEX_UNSAFE=1) -- codex does not understand the
+#         Claude spelling, so it is not passed through verbatim
 #
 # Behavior on unknown worker type:
 #   Exits 78 (EX_CONFIG) with a clear message, matching the existing
@@ -125,10 +140,17 @@ case "$WORKER_TYPE" in
         fi
         exec "$_runner" ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
+    codex)
+        _runner="${_script_dir}/spawn-codex.sh"
+        if [[ ! -x "$_runner" ]]; then
+            log_error "Cannot find executable spawn-codex.sh at $_runner"
+            exit 1
+        fi
+        exec "$_runner" ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
+        ;;
     *)
         log_error "Unknown worker type: '$WORKER_TYPE'"
-        log_error "Supported worker types: claude"
-        log_error "(codex support is reserved for a future phase of epic #1 -- see issue #2)"
+        log_error "Supported worker types: claude, codex"
         exit 78  # EX_CONFIG
         ;;
 esac
