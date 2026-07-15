@@ -23,6 +23,15 @@ This comprehensive guide walks you through installing and setting up Loom, wheth
 
 Loom transforms your repository into an AI-orchestrated workspace where agents coordinate through GitHub issues, PRs, and labels. Each terminal can embody a specialized role (Worker, Curator, Architect, Reviewer) working autonomously or on-demand.
 
+### Supported worker runtimes: Claude Code and OpenAI Codex CLI
+
+Loom supports **two co-equal worker runtimes** — [Claude Code](https://claude.com/claude-code) and the [OpenAI Codex CLI](https://developers.openai.com/codex). Neither is "primary": the coordination layer Loom depends on (GitHub/Gitea labels, git worktrees, the sweep lifecycle, the merge scripts) is runtime-neutral and behaves identically regardless of which runtime a worker uses. What differs is the per-runtime *setup* and a small set of runtime-specific dispatch surfaces:
+
+- **Claude Code** discovers Loom roles as slash commands under `.claude/commands/loom/` and reads repository context from `CLAUDE.md`.
+- **OpenAI Codex CLI** discovers repository context from `AGENTS.md` (via AGENTS.md ancestor traversal) and Loom role prompts from a project-scoped `.codex/` config plus prompt shims. See [Using Codex with Loom](#using-codex-with-loom) below for the full setup.
+
+Both runtimes participate in the same label-driven workflow. Where a runtime has a gap relative to the other — most notably Claude Code's guardrail hooks vs. Codex's sandbox/approval model — the safety mapping and residual gaps are captured in the guardrail-parity doc (forthcoming — issue #20) and summarized under [Using Codex with Loom](#using-codex-with-loom).
+
 ### What Gets Installed
 
 Running `loom-daemon init` creates these files in your repository:
@@ -69,13 +78,30 @@ Minimal requirements to use Loom:
    # Install if needed (macOS)
    brew install tmux
    ```
-4. **Claude Code** (optional, for AI agents)
+4. **A worker runtime** (optional, for AI agents) — either is a supported, co-equal choice:
+
+   **Claude Code:**
    ```bash
    # Verify Claude Code is installed
    claude --version
 
    # See https://claude.com/claude-code for installation
    ```
+
+   **OpenAI Codex CLI** (equal alternative):
+   ```bash
+   # Verify the Codex CLI is installed
+   codex --version
+
+   # Install via npm: npm install -g @openai/codex
+   # See https://developers.openai.com/codex for installation
+   ```
+
+   You do not need both — pick the runtime you prefer. Codex setup (project trust,
+   `.codex/config.toml`, prompt shims, MCP config) is covered in
+   [Using Codex with Loom](#using-codex-with-loom). The Claude-vs-Codex safety-model
+   mapping (hooks vs. sandbox/approval) lives in the guardrail-parity doc
+   (forthcoming — issue #20).
 
 That's all you need to use Loom!
 

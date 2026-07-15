@@ -1,5 +1,13 @@
 # Claude Code Tool Use Concurrency Errors
 
+> **CLAUDE-RUNTIME-ONLY.** This document is specific to the **Claude Code**
+> runtime and the Anthropic Messages API `tool_use`/`tool_result` protocol. It
+> does **not** apply to the OpenAI Codex CLI runtime — Codex uses a different
+> tool-call protocol and does not produce this "400 tool use concurrency" error.
+> If you are operating a Codex worker, skip this page; see
+> [`troubleshooting.md`](./troubleshooting.md) for Codex-specific troubleshooting
+> (sandbox/approval, MCP config resolution, prompt discovery).
+
 This document explains the "API Error: 400 due to tool use concurrency issues" error that may occur when using Claude Code, including its causes, impact on Loom workflows, and mitigation strategies.
 
 ## Overview
