@@ -520,6 +520,37 @@ is_loom_source_repo() {
   return 1
 }
 
+# Detect the common v0.9.x installation shape whose source checkout still
+# points at rjwalters/loom. Legacy consumers often carry project-owned hooks
+# and scripts inside Loom-managed directories, so an uninstall-first upgrade
+# deserves a much louder warning than an ordinary reinstall.
+is_legacy_rjwalters_install() {
+  local target="$1"
+  local marker source_path source_remote
+
+  for marker in \
+    "$target/.loom/CLAUDE.md" \
+    "$target/.loom/AGENTS.md" \
+    "$target/.loom/install-metadata.json" \
+    "$target/CLAUDE.md"; do
+    if [[ -f "$marker" ]] && grep -q 'rjwalters/loom' "$marker" 2>/dev/null; then
+      return 0
+    fi
+  done
+
+  if [[ -f "$target/.loom/loom-source-path" ]]; then
+    source_path="$(<"$target/.loom/loom-source-path")"
+    if [[ -d "$source_path" ]]; then
+      source_remote="$(git -C "$source_path" remote get-url origin 2>/dev/null || true)"
+      if [[ "$source_remote" == *"rjwalters/loom"* ]]; then
+        return 0
+      fi
+    fi
+  fi
+
+  return 1
+}
+
 if is_loom_source_repo "$TARGET_PATH"; then
   echo ""
   header "╔═══════════════════════════════════════════════════════════╗"
@@ -543,6 +574,14 @@ if is_loom_source_repo "$TARGET_PATH"; then
 elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
+  if is_legacy_rjwalters_install "$TARGET_PATH"; then
+    warning "Legacy rjwalters/loom installation detected"
+    warning "Do not continue until project-owned Loom hooks, scripts, and agent"
+    warning "configuration have been inventoried and backed up. This reinstall"
+    warning "removes the existing Loom payload before writing the new version."
+    info "Migration guide: docs/migration/from-rjwalters-v0.9.md"
+    echo ""
+  fi
   if [[ "$INSTALL_TYPE" == "1" ]]; then
     info "Reinstall will uninstall the existing installation first, then perform"
     info "a fresh Quick Install."

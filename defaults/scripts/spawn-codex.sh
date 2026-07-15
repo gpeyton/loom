@@ -354,13 +354,26 @@ PYTHON="${LOOM_PYTHON:-python3}"
 PACKAGE_PATH=""
 
 # Resolve the loom_tools package source once (mirrors spawn-claude.sh's
-# search order: env override > script-relative > workspace-relative). Shared
-# by tiers 3 and 4 below, both of which shell out to loom_tools modules.
+# search order: env override > script-relative > recorded Loom source >
+# workspace-relative). Shared by tiers 3 and 4 below, both of which shell out
+# to loom_tools modules.
 _resolve_package_path() {
-    local _script_dir _script_relative_pkg
+    local _script_dir _script_relative_pkg _consumer_root
+    local _recorded_source_file _recorded_source
     _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     _script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
     PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
+    if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
+        _consumer_root="$(cd "$_script_dir/../.." && pwd)"
+        for _recorded_source_file in \
+            "${_consumer_root}/.loom/loom-source-path" \
+            "${WORKSPACE}/.loom/loom-source-path"; do
+            [[ -f "$_recorded_source_file" ]] || continue
+            _recorded_source="$(<"$_recorded_source_file")"
+            PACKAGE_PATH="${_recorded_source}/loom-tools/src"
+            [[ -d "$PACKAGE_PATH/loom_tools/tokens" ]] && break
+        done
+    fi
     if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
         PACKAGE_PATH="${WORKSPACE}/loom-tools/src"
     fi

@@ -133,6 +133,11 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 
 ### Install Options
 
+> **Upgrading from `rjwalters/loom` v0.9.x?** Do not run an uninstall-first
+> quick reinstall until you have inventoried and backed up project-owned Loom
+> hooks, scripts, and agent configuration. Follow the
+> [legacy migration guide](docs/migration/from-rjwalters-v0.9.md).
+
 **Interactive installer:**
 ```bash
 ./install.sh /path/to/your/repo

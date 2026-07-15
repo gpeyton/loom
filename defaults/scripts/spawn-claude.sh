@@ -164,10 +164,22 @@ fi
 #   1. $LOOM_PACKAGE_PATH (env override).
 #   2. Script-relative: .loom/scripts/spawn-claude.sh -> ../../loom-tools/src
 #      (matches the loom repo layout regardless of WORKSPACE override).
-#   3. $WORKSPACE/loom-tools/src.
+#   3. Source checkout recorded in .loom/loom-source-path (consumer installs).
+#   4. $WORKSPACE/loom-tools/src.
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
 PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
+if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
+    _consumer_root="$(cd "$_script_dir/../.." && pwd)"
+    for _recorded_source_file in \
+        "${_consumer_root}/.loom/loom-source-path" \
+        "${WORKSPACE}/.loom/loom-source-path"; do
+        [[ -f "$_recorded_source_file" ]] || continue
+        _recorded_source="$(<"$_recorded_source_file")"
+        PACKAGE_PATH="${_recorded_source}/loom-tools/src"
+        [[ -d "$PACKAGE_PATH/loom_tools/tokens" ]] && break
+    done
+fi
 if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
     PACKAGE_PATH="${WORKSPACE}/loom-tools/src"
 fi
