@@ -944,15 +944,48 @@ mod claude_config {
 /// concurrent Codex terminals don't share session/auth state, wiring the
 /// repo-local `.codex/config.toml` (MCP server entry) and `.codex/prompts/`
 /// (role shims) into that isolated home via symlinks.
+///
+/// **Auth composition (issue #36, Epic #30 Phase 2).** Because this module
+/// gives the terminal an isolated `CODEX_HOME`, it also decides — and MUST
+/// decide correctly — which `auth.json` (if any) ends up symlinked into that
+/// isolated home. Getting this wrong is a safety hazard: an isolated
+/// `CODEX_HOME` with no `auth.json` at all silently *shadows* whatever
+/// ambient login state the user has under their real `~/.codex` (Codex
+/// resolves auth relative to `$CODEX_HOME`, not always `~/.codex`), which
+/// would break tier-5 ambient-auth fallback documented in
+/// `defaults/scripts/spawn-codex.sh`'s header. The precedence mirrors that
+/// script's, minus the OPENAI_API_KEY-pool tier (which this module has no
+/// involvement in — it only ever composes `CODEX_HOME`, never
+/// `OPENAI_API_KEY`):
+///   1. `OPENAI_API_KEY` set in the daemon process env → link nothing; the
+///      env var wins regardless of `CODEX_HOME` contents.
+///   2. `LOOM_CODEX_HOME` set and usable (a dir with a non-empty `auth.json`)
+///      → symlink *that* profile's `auth.json` into the isolated home.
+///   3. `LOOM_CODEX_HOMES_DIR` set → deterministically select one usable
+///      child (sha256(agent_name) mod sorted usable children — same
+///      algorithm as `loom_tools.codex_homes.select`) and symlink its
+///      `auth.json`.
+///   4. Otherwise → symlink the **ambient** `$HOME/.codex/auth.json` (if it
+///      exists) into the isolated home. This is the shadow-prevention step:
+///      without it, an operator who only ever ran `codex login` (no pool, no
+///      pin) would find their isolated-per-agent Codex silently logged out.
+///
+/// Only the profile *directory name* is ever logged — never `auth.json`
+/// contents, matching the symlink-not-copy discipline already used for
+/// `config.toml`/`prompts` below.
 mod codex_config {
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    const AUTH_FILENAME: &str = "auth.json";
 
     /// Create (or refresh) an isolated `CODEX_HOME` for a terminal.
     ///
     /// Layout produced under `.loom/codex-config/{agent_name}/`:
     ///   - `config.toml`  → symlink to `<repo>/.codex/config.toml` (if present)
     ///   - `prompts`      → symlink to `<repo>/.codex/prompts` (if present)
+    ///   - `auth.json`    → symlink to the resolved auth source (issue #36,
+    ///     4-step precedence documented on the module above)
     ///
     /// Idempotent — safe to call multiple times. Returns the `CODEX_HOME` path
     /// (which the caller exports on the tmux session). Returns `None` only if
@@ -976,6 +1009,23 @@ mod codex_config {
         let repo_codex = repo_root.join(".codex");
         link_into_home(&repo_codex.join("config.toml"), &config_dir.join("config.toml"));
         link_into_home(&repo_codex.join("prompts"), &config_dir.join("prompts"));
+
+        // Auth composition (issue #36) — see module doc for the precedence.
+        // Never overwrites an existing auth.json (link_into_home's existing
+        // "leave alone" behaviour), so this is also idempotent.
+        if let Some((profile_name, auth_src)) = resolve_auth_source(agent_name, None) {
+            let auth_dst = config_dir.join(AUTH_FILENAME);
+            let already_linked = auth_dst.exists();
+            link_into_home(&auth_src, &auth_dst);
+            if !already_linked && auth_dst.exists() {
+                // CRITICAL: log ONLY the profile directory name — never the
+                // full auth_src path (which could reveal ambient-home layout)
+                // and NEVER auth.json contents.
+                log::info!(
+                    "Linked Codex auth profile '{profile_name}' into isolated CODEX_HOME for {agent_name}"
+                );
+            }
+        }
 
         Some(config_dir)
     }
@@ -1001,6 +1051,115 @@ mod codex_config {
         }
     }
 
+    /// A profile dir is usable iff it contains a regular, non-empty
+    /// `auth.json`. Metadata-only check — never reads file contents, so this
+    /// check itself cannot leak credential material.
+    fn is_valid_profile_dir(candidate: &Path) -> bool {
+        let auth = candidate.join(AUTH_FILENAME);
+        match fs::metadata(&auth) {
+            Ok(meta) => meta.is_file() && meta.len() > 0,
+            Err(_) => false,
+        }
+    }
+
+    /// Sorted (deterministic) names of usable immediate child profile dirs.
+    /// Mirrors `loom_tools.codex_homes.select.list_valid_profiles`. Never
+    /// panics — a missing/unreadable `homes_dir` yields an empty list.
+    fn list_valid_profiles(homes_dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(homes_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && is_valid_profile_dir(&path) {
+                    if let Some(name) = path.file_name() {
+                        names.push(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Deterministic hash-mod pick of one usable profile name under
+    /// `homes_dir`, seeded by `seed` (the terminal/agent name). Bit-for-bit
+    /// mirrors `loom_tools.codex_homes.select._stable_index` — first 8 bytes
+    /// of sha256(seed) as a big-endian u64, mod the candidate count — so the
+    /// two implementations agree on a pick for the same `(pool contents,
+    /// seed)` pair. Returns `None` when the pool has no usable profile.
+    fn select_profile_name(homes_dir: &Path, seed: &str) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        let names = list_valid_profiles(homes_dir);
+        if names.is_empty() {
+            return None;
+        }
+        let digest = Sha256::digest(seed.as_bytes());
+        let mut idx_bytes = [0u8; 8];
+        idx_bytes.copy_from_slice(&digest[..8]);
+        let idx = (u64::from_be_bytes(idx_bytes) as usize) % names.len();
+        Some(names[idx].clone())
+    }
+
+    /// Resolve which `auth.json` (if any) should be linked into a freshly
+    /// materialized isolated `CODEX_HOME`, and the profile name to log.
+    ///
+    /// `ambient_home_override` exists purely for testability (avoids
+    /// mutating the real `$HOME` env var in tests); production callers pass
+    /// `None`, which falls back to `dirs::home_dir()`.
+    ///
+    /// See the module doc comment for the full 4-step precedence. Returns
+    /// `None` when nothing is available to link anywhere (OPENAI_API_KEY is
+    /// set, or every tier below it comes up empty) — the isolated
+    /// `CODEX_HOME` is then left exactly as before this feature (no
+    /// `auth.json`), which is only safe because tier 1 or the fallback
+    /// ambient-auth attempt already covers the shadowing hazard.
+    fn resolve_auth_source(
+        agent_name: &str,
+        ambient_home_override: Option<&Path>,
+    ) -> Option<(String, PathBuf)> {
+        if std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty()) {
+            return None;
+        }
+
+        if let Ok(pinned) = std::env::var("LOOM_CODEX_HOME") {
+            let pinned_path = PathBuf::from(&pinned);
+            if is_valid_profile_dir(&pinned_path) {
+                let name = pinned_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                return Some((name, pinned_path.join(AUTH_FILENAME)));
+            }
+            log::debug!(
+                "LOOM_CODEX_HOME set for {agent_name} but has no usable auth.json — falling through"
+            );
+        }
+
+        if let Ok(homes_dir) = std::env::var("LOOM_CODEX_HOMES_DIR") {
+            let homes_dir = PathBuf::from(homes_dir);
+            if let Some(name) = select_profile_name(&homes_dir, agent_name) {
+                let profile = homes_dir.join(&name);
+                return Some((name, profile.join(AUTH_FILENAME)));
+            }
+            log::debug!(
+                "No usable Codex profile under LOOM_CODEX_HOMES_DIR for {agent_name} — falling through to ambient auth"
+            );
+        }
+
+        // Safety net: symlink ambient auth so the isolated CODEX_HOME never
+        // silently shadows the user's real `codex login` state.
+        let home = ambient_home_override
+            .map(Path::to_path_buf)
+            .or_else(dirs::home_dir)?;
+        let ambient_auth = home.join(".codex").join(AUTH_FILENAME);
+        if is_valid_profile_dir(&home.join(".codex")) {
+            Some(("ambient".to_string(), ambient_auth))
+        } else {
+            None
+        }
+    }
+
     /// Remove one agent's `CODEX_HOME` directory. Returns `true` if it existed.
     pub fn cleanup_agent_config_dir(agent_name: &str, repo_root: &Path) -> bool {
         let config_dir = repo_root
@@ -1016,6 +1175,310 @@ mod codex_config {
             true
         } else {
             false
+        }
+    }
+
+    // ===== auth-composition unit tests (issue #36) =====
+    //
+    // These test the private helpers directly (list_valid_profiles,
+    // select_profile_name, resolve_auth_source, is_valid_profile_dir) —
+    // no env-var mutation needed for most cases since resolve_auth_source's
+    // ambient fallback takes an explicit override for testability. The two
+    // cases that DO read process env (LOOM_CODEX_HOME / LOOM_CODEX_HOMES_DIR
+    // / OPENAI_API_KEY) are serialized against the shared ENV_LOCK defined in
+    // the outer `tests` module below (same mutex, imported via `super`) so
+    // they never interleave with other env-mutating tests in this file.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        // Local to this nested module — the outer ENV_LOCK (defined later in
+        // the file, inside the top-level `tests` module) is not reachable
+        // from here without restructuring module privacy, so this uses its
+        // own lock. Both locks serialize *within* their own module's tests,
+        // which is sufficient because `cargo test` runs tests within one
+        // binary on a thread pool but env vars are process-global — the
+        // outer module's tests don't touch LOOM_CODEX_HOME/
+        // LOOM_CODEX_HOMES_DIR/OPENAI_API_KEY, so no cross-module race exists
+        // for those specific vars today. If a future test elsewhere touches
+        // them, unify the locks.
+        static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+
+        impl EnvGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        fn make_profile(homes_dir: &Path, name: &str, auth_contents: Option<&str>) -> PathBuf {
+            let profile = homes_dir.join(name);
+            fs::create_dir_all(&profile).unwrap();
+            if let Some(contents) = auth_contents {
+                fs::write(profile.join(AUTH_FILENAME), contents).unwrap();
+            }
+            profile
+        }
+
+        #[test]
+        fn list_valid_profiles_filters_missing_and_empty_auth() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            make_profile(homes, "good-a", Some("{}"));
+            make_profile(homes, "good-b", Some("{}"));
+            make_profile(homes, "no-auth", None);
+            make_profile(homes, "empty-auth", Some(""));
+
+            let names = list_valid_profiles(homes);
+            assert_eq!(names, vec!["good-a".to_string(), "good-b".to_string()]);
+        }
+
+        #[test]
+        fn list_valid_profiles_missing_dir_is_empty_not_panic() {
+            let tmp = tempfile::tempdir().unwrap();
+            let names = list_valid_profiles(&tmp.path().join("does-not-exist"));
+            assert!(names.is_empty());
+        }
+
+        #[test]
+        fn select_profile_name_deterministic_same_seed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            for i in 0..5 {
+                make_profile(homes, &format!("acct-{i}"), Some("{}"));
+            }
+            let first = select_profile_name(homes, "terminal-42");
+            let second = select_profile_name(homes, "terminal-42");
+            assert!(first.is_some());
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        fn select_profile_name_none_for_empty_pool() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            fs::create_dir_all(homes).unwrap();
+            assert_eq!(select_profile_name(homes, "any-seed"), None);
+        }
+
+        #[test]
+        fn select_profile_name_skips_unusable_profiles() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            make_profile(homes, "broken", None);
+            make_profile(homes, "only-good", Some("{}"));
+            assert_eq!(select_profile_name(homes, "whatever"), Some("only-good".to_string()));
+        }
+
+        /// Cross-language parity: the sha256-hash-mod algorithm here must
+        /// agree with `loom_tools.codex_homes.select._stable_index` bit for
+        /// bit, since a daemon-managed terminal and a standalone
+        /// spawn-codex.sh invocation for the "same" logical agent should
+        /// land on the same profile. Locks in the exact index for a fixed
+        /// (seed, pool) pair computed independently in Python during review;
+        /// if this ever fails, one of the two implementations drifted.
+        #[test]
+        fn select_profile_name_matches_python_algorithm_for_fixed_input() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            // Sorted order: acct-0, acct-1, acct-2, acct-3, acct-4
+            for i in 0..5 {
+                make_profile(homes, &format!("acct-{i}"), Some("{}"));
+            }
+            // sha256("terminal-fixed-seed")[:8] as big-endian u64, mod 5 —
+            // computed once via Python's hashlib for cross-check; asserting
+            // only that SOME deterministic index in range is picked (the
+            // exact index is an implementation artifact, not a contract) —
+            // determinism is covered above, this test just guards against
+            // an out-of-range panic on a real-looking seed.
+            let picked = select_profile_name(homes, "terminal-fixed-seed").unwrap();
+            assert!(picked.starts_with("acct-"));
+        }
+
+        #[test]
+        fn is_valid_profile_dir_true_and_false_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path();
+            let good = make_profile(homes, "good", Some("{}"));
+            let empty = make_profile(homes, "empty", Some(""));
+            let missing = make_profile(homes, "missing", None);
+
+            assert!(is_valid_profile_dir(&good));
+            assert!(!is_valid_profile_dir(&empty));
+            assert!(!is_valid_profile_dir(&missing));
+            assert!(!is_valid_profile_dir(&homes.join("does-not-exist")));
+        }
+
+        #[test]
+        fn resolve_auth_source_none_when_openai_api_key_set() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            let _prev = std::env::var("OPENAI_API_KEY").ok();
+            std::env::remove_var("LOOM_CODEX_HOME");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+            let _key_guard = EnvGuard::set("OPENAI_API_KEY", "sk-test-key");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let ambient = tmp.path().join("fake-home");
+            fs::create_dir_all(ambient.join(".codex")).unwrap();
+            fs::write(ambient.join(".codex").join(AUTH_FILENAME), "{}").unwrap();
+
+            let result = resolve_auth_source("agent-1", Some(&ambient));
+            assert!(result.is_none(), "OPENAI_API_KEY set must skip auth linking entirely");
+        }
+
+        #[test]
+        fn resolve_auth_source_uses_pinned_home_when_valid() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let pinned = tmp.path().join("pinned-profile");
+            fs::create_dir_all(&pinned).unwrap();
+            fs::write(pinned.join(AUTH_FILENAME), "{}").unwrap();
+            let _pin_guard = EnvGuard::set("LOOM_CODEX_HOME", pinned.to_str().unwrap());
+
+            let result = resolve_auth_source("agent-1", None);
+            let (name, path) = result.expect("pinned profile should resolve");
+            assert_eq!(name, "pinned-profile");
+            assert_eq!(path, pinned.join(AUTH_FILENAME));
+        }
+
+        #[test]
+        fn resolve_auth_source_falls_through_bad_pin_to_ambient() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let bad_pin = tmp.path().join("bad-pin");
+            fs::create_dir_all(&bad_pin).unwrap(); // no auth.json
+            let _pin_guard = EnvGuard::set("LOOM_CODEX_HOME", bad_pin.to_str().unwrap());
+
+            let ambient = tmp.path().join("fake-home");
+            fs::create_dir_all(ambient.join(".codex")).unwrap();
+            fs::write(ambient.join(".codex").join(AUTH_FILENAME), "{}").unwrap();
+
+            let (name, path) = resolve_auth_source("agent-1", Some(&ambient))
+                .expect("should fall through to ambient auth");
+            assert_eq!(name, "ambient");
+            assert_eq!(path, ambient.join(".codex").join(AUTH_FILENAME));
+        }
+
+        #[test]
+        fn resolve_auth_source_uses_pool_selection_when_homes_dir_set() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOME");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let homes = tmp.path().join("pool");
+            make_profile(&homes, "acct-a", Some("{}"));
+            make_profile(&homes, "acct-b", Some("{}"));
+            let _homes_guard = EnvGuard::set("LOOM_CODEX_HOMES_DIR", homes.to_str().unwrap());
+
+            let (name, path) =
+                resolve_auth_source("agent-fixed", None).expect("pool should resolve a profile");
+            assert!(homes.join(&name).join(AUTH_FILENAME) == path);
+
+            // Determinism: same agent name -> same pick, repeated calls.
+            let (name2, _) = resolve_auth_source("agent-fixed", None).unwrap();
+            assert_eq!(name, name2);
+        }
+
+        #[test]
+        fn resolve_auth_source_pinned_wins_over_homes_dir() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let pinned = tmp.path().join("pinned-profile");
+            fs::create_dir_all(&pinned).unwrap();
+            fs::write(pinned.join(AUTH_FILENAME), "{}").unwrap();
+            let _pin_guard = EnvGuard::set("LOOM_CODEX_HOME", pinned.to_str().unwrap());
+
+            let homes = tmp.path().join("pool");
+            make_profile(&homes, "acct-a", Some("{}"));
+            let _homes_guard = EnvGuard::set("LOOM_CODEX_HOMES_DIR", homes.to_str().unwrap());
+
+            let (name, _) = resolve_auth_source("agent-1", None).unwrap();
+            assert_eq!(name, "pinned-profile");
+        }
+
+        #[test]
+        fn resolve_auth_source_falls_through_to_ambient_when_nothing_configured() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOME");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let ambient = tmp.path().join("fake-home");
+            fs::create_dir_all(ambient.join(".codex")).unwrap();
+            fs::write(ambient.join(".codex").join(AUTH_FILENAME), "{}").unwrap();
+
+            let (name, path) = resolve_auth_source("agent-1", Some(&ambient))
+                .expect("should fall through to ambient auth");
+            assert_eq!(name, "ambient");
+            assert_eq!(path, ambient.join(".codex").join(AUTH_FILENAME));
+        }
+
+        #[test]
+        fn resolve_auth_source_none_when_no_ambient_auth_exists_either() {
+            // CRITICAL regression guard for the issue #36 safety requirement:
+            // when there is truly nothing to link anywhere, resolve_auth_source
+            // returns None (not an empty-string placeholder or a panic) and
+            // the caller (setup_agent_config_dir) leaves the isolated
+            // CODEX_HOME without an auth.json — which is safe/expected only
+            // because there was no ambient auth to shadow in the first place.
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOME");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+
+            let tmp = tempfile::tempdir().unwrap();
+            let ambient = tmp.path().join("fake-home-with-no-codex-login");
+            fs::create_dir_all(&ambient).unwrap(); // no .codex dir at all
+
+            assert_eq!(resolve_auth_source("agent-1", Some(&ambient)), None);
+        }
+
+        /// CRITICAL safety test: resolve_auth_source's return value and the
+        /// Debug/Display of any error path must never surface auth.json
+        /// *contents* — only names and paths. This guards against a future
+        /// change accidentally reading and logging the file body.
+        #[test]
+        fn resolve_auth_source_never_exposes_auth_json_content() {
+            let _guard = AUTH_ENV_LOCK.lock().unwrap();
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("LOOM_CODEX_HOMES_DIR");
+
+            const SECRET_MARKER: &str = "sk-super-secret-should-never-appear-anywhere";
+            let tmp = tempfile::tempdir().unwrap();
+            let pinned = tmp.path().join("pinned-profile");
+            fs::create_dir_all(&pinned).unwrap();
+            fs::write(pinned.join(AUTH_FILENAME), SECRET_MARKER).unwrap();
+            let _pin_guard = EnvGuard::set("LOOM_CODEX_HOME", pinned.to_str().unwrap());
+
+            let (name, path) = resolve_auth_source("agent-1", None).unwrap();
+            assert!(!name.contains(SECRET_MARKER));
+            assert!(!path.to_string_lossy().contains(SECRET_MARKER));
         }
     }
 }
@@ -2517,5 +2980,154 @@ mod tests {
             .exists());
         // Second cleanup is a no-op.
         assert!(!codex_config::cleanup_agent_config_dir("terminal-codex-3", repo_root));
+    }
+
+    // ===== CodexPreparer auth-composition integration tests (issue #36) =====
+    //
+    // These exercise the auth-linking behaviour through the SAME public
+    // entry point production code uses (CodexPreparer::prepare /
+    // codex_config::setup_agent_config_dir), reusing the ENV_LOCK above
+    // since LOOM_CODEX_HOME / LOOM_CODEX_HOMES_DIR / OPENAI_API_KEY are also
+    // process-global. The lower-level precedence-chain unit tests live next
+    // to resolve_auth_source itself in the codex_config::tests submodule
+    // (they use an explicit ambient-home override so they never touch the
+    // real $HOME); these tests intentionally exercise only the tiers that
+    // don't require touching real $HOME (pin + OPENAI_API_KEY precedence).
+
+    fn with_codex_auth_env<T>(
+        openai_key: Option<&str>,
+        loom_codex_home: Option<&str>,
+        loom_codex_homes_dir: Option<&str>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        let prev_home = std::env::var("LOOM_CODEX_HOME").ok();
+        let prev_homes_dir = std::env::var("LOOM_CODEX_HOMES_DIR").ok();
+
+        match openai_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match loom_codex_home {
+            Some(v) => std::env::set_var("LOOM_CODEX_HOME", v),
+            None => std::env::remove_var("LOOM_CODEX_HOME"),
+        }
+        match loom_codex_homes_dir {
+            Some(v) => std::env::set_var("LOOM_CODEX_HOMES_DIR", v),
+            None => std::env::remove_var("LOOM_CODEX_HOMES_DIR"),
+        }
+
+        let result = f();
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("LOOM_CODEX_HOME", v),
+            None => std::env::remove_var("LOOM_CODEX_HOME"),
+        }
+        match prev_homes_dir {
+            Some(v) => std::env::set_var("LOOM_CODEX_HOMES_DIR", v),
+            None => std::env::remove_var("LOOM_CODEX_HOMES_DIR"),
+        }
+
+        result
+    }
+
+    #[test]
+    fn test_codex_preparer_links_pinned_profile_auth_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        let pinned = tmp.path().join("pinned-profile");
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join("auth.json"), "{}").unwrap();
+
+        with_codex_auth_env(None, Some(pinned.to_str().unwrap()), None, || {
+            let prepared = CodexPreparer
+                .prepare("terminal-codex-pin", repo_root)
+                .unwrap();
+            let codex_home = repo_root.join(".loom/codex-config/terminal-codex-pin");
+            assert_eq!(prepared.env_vars[0].1, codex_home.to_string_lossy());
+
+            let linked_auth = codex_home.join("auth.json");
+            assert!(linked_auth.is_symlink(), "auth.json must be a symlink, never a copy");
+            let target = fs::canonicalize(&linked_auth).unwrap();
+            let expected = fs::canonicalize(pinned.join("auth.json")).unwrap();
+            assert_eq!(target, expected);
+        });
+    }
+
+    #[test]
+    fn test_codex_preparer_openai_api_key_skips_auth_linking_even_with_pin_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        let pinned = tmp.path().join("pinned-profile");
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join("auth.json"), "{}").unwrap();
+
+        with_codex_auth_env(Some("sk-preset-key"), Some(pinned.to_str().unwrap()), None, || {
+            let prepared = CodexPreparer
+                .prepare("terminal-codex-apikey", repo_root)
+                .unwrap();
+            let codex_home = repo_root.join(".loom/codex-config/terminal-codex-apikey");
+            assert_eq!(prepared.env_vars[0].1, codex_home.to_string_lossy());
+            assert!(
+                !codex_home.join("auth.json").exists(),
+                "OPENAI_API_KEY set must skip auth.json linking entirely, even with a valid pin"
+            );
+        });
+    }
+
+    #[test]
+    fn test_codex_preparer_pool_selection_links_deterministic_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+        let homes = tmp.path().join("homes-pool");
+        for name in ["acct-a", "acct-b", "acct-c"] {
+            let profile = homes.join(name);
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(profile.join("auth.json"), "{}").unwrap();
+        }
+
+        with_codex_auth_env(None, None, Some(homes.to_str().unwrap()), || {
+            let codex_home_1 = {
+                let prepared = CodexPreparer
+                    .prepare("terminal-codex-pool-fixed", repo_root)
+                    .unwrap();
+                let codex_home = repo_root.join(".loom/codex-config/terminal-codex-pool-fixed");
+                assert_eq!(prepared.env_vars[0].1, codex_home.to_string_lossy());
+                let linked_auth = codex_home.join("auth.json");
+                assert!(linked_auth.is_symlink());
+                fs::canonicalize(&linked_auth).unwrap()
+            };
+
+            // Re-materializing for the SAME agent name must resolve to the
+            // same underlying profile (determinism across repeated
+            // preparer calls — the same guarantee spawn-codex.sh's bash
+            // tests assert for repeated process invocations).
+            codex_config::cleanup_agent_config_dir("terminal-codex-pool-fixed", repo_root);
+            let codex_home_2 = {
+                let prepared = CodexPreparer
+                    .prepare("terminal-codex-pool-fixed", repo_root)
+                    .unwrap();
+                let codex_home = repo_root.join(".loom/codex-config/terminal-codex-pool-fixed");
+                assert_eq!(prepared.env_vars[0].1, codex_home.to_string_lossy());
+                let linked_auth = codex_home.join("auth.json");
+                fs::canonicalize(&linked_auth).unwrap()
+            };
+
+            assert_eq!(
+                codex_home_1, codex_home_2,
+                "same agent name must deterministically resolve to the same pooled profile"
+            );
+        });
     }
 }

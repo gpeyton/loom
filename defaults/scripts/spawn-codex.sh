@@ -37,25 +37,63 @@
 #       NOT understood by codex, so it is consumed here and translated to a
 #       Codex permission flag (see "Permissions mapping" below).
 #
-# Auth (provider-aware pool selection, issue #12):
+# Auth (5-tier precedence chain, issue #12 + issue #36 / Epic #30 Phase 2):
+#   Two COMPLEMENTARY mechanisms coexist here, selected by strict precedence:
+#     - An OPENAI_API_KEY (env var or the `.loom/tokens/` provider-aware pool,
+#       issue #12/#18) — for API-key-authenticated Codex.
+#     - A ChatGPT-authenticated `CODEX_HOME` profile (issue #36) — for
+#       accounts logged in via `codex login` (no API key at all), ported from
+#       `mattcproctor/loom`'s account-profile rotation.
 #   Precedence, highest first:
 #     1. Pre-set OPENAI_API_KEY in the environment (always honored, never
-#        overwritten; selection is skipped entirely).
-#     2. `.loom/tokens/` pool: `python3 -m loom_tools.tokens.select
-#        --provider openai` picks an openai account (per-account provider is
-#        recorded in index.json by `loom-tokens bootstrap`). The selected key
-#        is exported as OPENAI_API_KEY.
-#     3. Ambient auth: whatever ChatGPT login state the Codex CLI already
-#        holds (`codex login`).
+#        overwritten; ALL of tiers 2-5 below are skipped entirely).
+#     2. LOOM_CODEX_HOME: pins one authenticated CODEX_HOME profile directory
+#        explicitly. Used as CODEX_HOME verbatim iff it contains a usable
+#        (regular, non-empty, readable) auth.json; otherwise falls through to
+#        tier 3 with a warning (a bad pin never fails the spawn).
+#     3. LOOM_CODEX_HOMES_DIR: a parent directory whose immediate children are
+#        candidate CODEX_HOME profile dirs (each containing an auth.json).
+#        `python3 -m loom_tools.codex_homes.select` deterministically picks
+#        one usable child — a sha256 hash of the seed (LOOM_TERMINAL_ID, or
+#        LOOM_SWEEP_ID as a fallback) modulo the sorted list of usable child
+#        names — so concurrent spawns distribute predictably across the pool
+#        instead of randomly colliding on one profile. The selected dir is
+#        used as CODEX_HOME verbatim (never copied — see "Never copy
+#        auth.json" below). No usable profile (missing dir, empty pool, no
+#        seed available) falls through to tier 4 with a log line, never a
+#        hard failure.
+#     4. `.loom/tokens/` pool (issue #12/#18): `python3 -m
+#        loom_tools.tokens.select --provider openai` picks an openai account
+#        (per-account provider is recorded in index.json by `loom-tokens
+#        bootstrap`). The selected key is exported as OPENAI_API_KEY.
+#     5. Ambient auth: whatever ChatGPT/API-key login state the Codex CLI
+#        already holds under its default CODEX_HOME (`codex login`). This
+#        tier is simply "do nothing" — spawn-codex.sh never sets CODEX_HOME
+#        itself when tiers 2-4 don't apply, so Codex's own default resolution
+#        is untouched.
 #
-#   ASYMMETRY vs spawn-claude.sh (intentional, do not "fix"): when the pool
-#   is absent, has no openai accounts, or every openai account is bad,
-#   spawn-codex.sh falls through to ambient auth (tier 3) instead of
+#   Never copy auth.json: tiers 2 and 3 both use the selected profile
+#   directory AS CODEX_HOME directly (an assignment, not a copy) — Codex
+#   reads `$CODEX_HOME/auth.json` from that directory in place. This mirrors
+#   the symlink-not-copy discipline `loom-daemon/src/terminal.rs`'s
+#   CodexPreparer already applies when composing an isolated CODEX_HOME
+#   (config.toml/prompts symlinks, and — since issue #36 — the resolved
+#   auth.json symlink). Nothing under `.loom/` ever contains a copy of
+#   auth.json.
+#
+#   Logging discipline: only ever log the selected profile *directory name*
+#   (e.g. `spawn-codex: using pinned Codex profile 'agent-3'`) — never the
+#   full LOOM_CODEX_HOME/LOOM_CODEX_HOMES_DIR path contents, never
+#   auth.json's contents. `loom_tools.codex_homes.select`'s CLI is
+#   safety-audited the same way (see loom-tools/tests/codex_homes/).
+#
+#   ASYMMETRY vs spawn-claude.sh (intentional, do not "fix"): when neither a
+#   CODEX_HOME profile (tiers 2-3) nor the openai pool (tier 4) resolves,
+#   spawn-codex.sh falls through to ambient auth (tier 5) instead of
 #   hard-failing. spawn-claude.sh exits 78 (EX_CONFIG) in the equivalent
 #   situation because Claude rotation is the documented load-bearing auth
-#   path; for Codex the pool is OPTIONAL — API-key accounts only (there is
-#   no public multi-account token-file mechanism for ChatGPT-plan OAuth),
-#   with `codex login` as the expected fallback.
+#   path; for Codex every tier below OPENAI_API_KEY is OPTIONAL, with
+#   `codex login` as the expected fallback.
 #
 #   Bad-token reporting: when a pool-selected key is in use in
 #   non-interactive (-p) mode, codex output is captured and classified via
@@ -63,6 +101,8 @@
 #   account bad with reason `auth` (persists until `loom-tokens unblock`);
 #   TOKEN_EXHAUSTED marks it with reason `exhausted` (TTL-expires). This
 #   mirrors the reason strings the Claude flow's bad-token tracking uses.
+#   This reporting path is specific to tier 4 (the openai key pool) — tiers
+#   2/3's CODEX_HOME profiles have no equivalent "mark bad" mechanism today.
 #
 # Permissions mapping (SAFETY-CRITICAL — do not weaken; inverted in #31,
 # epic #30 Phase 1 — full autonomy is now the default):
@@ -121,10 +161,27 @@
 #                       wins. Off by default. Kept for one transition
 #                       release.
 #   OPENAI_API_KEY      Honored if pre-set (exported to the codex child);
-#                       pool selection is skipped when set.
-#   LOOM_WORKSPACE      Override repo root detection (pool lookup).
-#   LOOM_SPAWN_NO_EXPORT If set, skip pool selection entirely (matches
-#                       spawn-claude.sh's contract).
+#                       ALL auth resolution below (tiers 2-5) is skipped
+#                       when set (tier 1).
+#   LOOM_CODEX_HOME     Pins one authenticated CODEX_HOME profile directory
+#                       (tier 2, issue #36). Must contain a usable auth.json
+#                       (regular, non-empty, readable) or this tier is
+#                       skipped with a warning — never fails the spawn.
+#   LOOM_CODEX_HOMES_DIR Parent directory of candidate CODEX_HOME profile
+#                       dirs for deterministic pool selection (tier 3, issue
+#                       #36). Selection is seeded by LOOM_TERMINAL_ID (or
+#                       LOOM_SWEEP_ID as a fallback) — set one of these for
+#                       deterministic, evenly-distributed selection across
+#                       concurrent spawns. Without a seed this tier is
+#                       skipped with a warning.
+#   LOOM_TERMINAL_ID    Stable per-terminal id; used (highest priority) as the
+#                       deterministic seed for LOOM_CODEX_HOMES_DIR selection.
+#   LOOM_SWEEP_ID       Fallback seed for LOOM_CODEX_HOMES_DIR selection when
+#                       LOOM_TERMINAL_ID is unset (e.g. a bare sweep/issue id).
+#   LOOM_WORKSPACE      Override repo root detection (pool + profile lookup).
+#   LOOM_SPAWN_NO_EXPORT If set, skip ALL auth resolution below tier 1
+#                       entirely — no CODEX_HOME profile selection, no pool
+#                       selection (matches spawn-claude.sh's contract).
 #   LOOM_PYTHON         Override the python interpreter (default: python3).
 #   LOOM_PACKAGE_PATH   Override the loom_tools package source path.
 #   LOOM_CODEX_NO_EXEC  Test/CI hook: when set, print the resolved argv the
@@ -283,68 +340,141 @@ _resolve_workspace() {
     cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 }
 
-# --- Auth (provider-aware pool selection, issue #12; see header) ---
+# --- Auth (5-tier precedence chain, issue #12 + issue #36; see header) ---
 # Selected-account bookkeeping for bad-token reporting below. Empty when no
-# pool token is in play (pre-set key or ambient auth).
+# pool token is in play (pre-set key, CODEX_HOME profile, or ambient auth).
 POOL_ACCOUNT_NAME=""
+# Selected CODEX_HOME profile directory name (tier 2/3). Empty when no
+# profile was selected (pre-set key, pool account, or ambient auth in play).
+# Logged/exposed ONLY as a directory name — never path contents or
+# credential bytes (issue #36 safety requirement).
+CODEX_PROFILE_NAME=""
 WORKSPACE=""
 PYTHON="${LOOM_PYTHON:-python3}"
 PACKAGE_PATH=""
 
-if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-    log_info "spawn-codex: using pre-set OPENAI_API_KEY"
-elif [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
-    log_info "spawn-codex: LOOM_SPAWN_NO_EXPORT set — skipping pool selection"
-else
-    WORKSPACE="$(_resolve_workspace)"
-
-    # Locate loom_tools package source (mirrors spawn-claude.sh's search
-    # order: env override > script-relative > workspace-relative).
+# Resolve the loom_tools package source once (mirrors spawn-claude.sh's
+# search order: env override > script-relative > workspace-relative). Shared
+# by tiers 3 and 4 below, both of which shell out to loom_tools modules.
+_resolve_package_path() {
+    local _script_dir _script_relative_pkg
     _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     _script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
     PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
     if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
         PACKAGE_PATH="${WORKSPACE}/loom-tools/src"
     fi
+}
 
-    # Try the openai side of the pool. Unlike spawn-claude.sh this NEVER
-    # hard-fails (no EX_CONFIG): the pool is optional for Codex, and any
-    # selection failure (no pool, no openai accounts, all bad, python
-    # missing) falls through to ambient auth. See the header for why this
-    # asymmetry is intentional.
-    _selection_json=""
-    if _selection_json="$(
-        PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
-        "$PYTHON" -m loom_tools.tokens.select \
-            --workspace "$WORKSPACE" --provider openai --json \
-        2>/dev/null
-    )"; then
-        _token="$(
-            printf '%s' "$_selection_json" \
-            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["key"])' \
-            2>/dev/null || echo ""
-        )"
-        _name="$(
-            printf '%s' "$_selection_json" \
-            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["name"])' \
-            2>/dev/null || echo ""
-        )"
-        _mode="$(
-            printf '%s' "$_selection_json" \
-            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["mode"])' \
-            2>/dev/null || echo ""
-        )"
-        if [[ -n "$_token" ]]; then
-            export OPENAI_API_KEY="$_token"
-            POOL_ACCOUNT_NAME="$_name"
-            log_info "spawn-codex: using openai pool account '$_name' (mode=$_mode)"
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    # Tier 1: explicit OPENAI_API_KEY always wins outright — tiers 2-5 below
+    # (CODEX_HOME profile selection AND the openai key pool) are skipped
+    # entirely.
+    log_info "spawn-codex: using pre-set OPENAI_API_KEY"
+elif [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
+    log_info "spawn-codex: LOOM_SPAWN_NO_EXPORT set — skipping auth resolution (CODEX_HOME profile + pool)"
+else
+    WORKSPACE="$(_resolve_workspace)"
+    _resolve_package_path
+
+    # Tier 2: explicit LOOM_CODEX_HOME pin. Used verbatim as CODEX_HOME (an
+    # assignment, never a copy) iff it has a usable auth.json. A bad pin
+    # never fails the spawn — it falls through to tier 3 with a warning.
+    if [[ -n "${LOOM_CODEX_HOME:-}" ]]; then
+        _auth_candidate="${LOOM_CODEX_HOME%/}/auth.json"
+        if [[ -f "$_auth_candidate" && -r "$_auth_candidate" && -s "$_auth_candidate" ]]; then
+            export CODEX_HOME="$LOOM_CODEX_HOME"
+            CODEX_PROFILE_NAME="$(basename "$LOOM_CODEX_HOME")"
+            log_info "spawn-codex: using pinned Codex profile '$CODEX_PROFILE_NAME' (source=LOOM_CODEX_HOME)"
         else
-            log_warn "spawn-codex: pool selection returned empty key — falling back to ambient Codex auth"
+            log_warn "spawn-codex: LOOM_CODEX_HOME is set but has no usable auth.json — falling through to LOOM_CODEX_HOMES_DIR / pool / ambient auth"
         fi
-    else
-        log_info "spawn-codex: no usable openai account in .loom/tokens/ — relying on Codex CLI ChatGPT login state"
+    fi
+
+    # Tier 3: deterministic pool selection from LOOM_CODEX_HOMES_DIR. Only
+    # attempted when tier 2 did not already resolve a profile.
+    if [[ -z "$CODEX_PROFILE_NAME" && -n "${LOOM_CODEX_HOMES_DIR:-}" ]]; then
+        _codex_home_seed="${LOOM_TERMINAL_ID:-${LOOM_SWEEP_ID:-}}"
+        if [[ -z "$_codex_home_seed" ]]; then
+            log_warn "spawn-codex: LOOM_CODEX_HOMES_DIR is set but neither LOOM_TERMINAL_ID nor LOOM_SWEEP_ID is set — cannot select deterministically, falling through to pool / ambient auth"
+        else
+            _profile_json=""
+            if _profile_json="$(
+                PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
+                "$PYTHON" -m loom_tools.codex_homes.select \
+                    --homes-dir "$LOOM_CODEX_HOMES_DIR" --seed "$_codex_home_seed" --json \
+                2>/dev/null
+            )"; then
+                _profile_name="$(
+                    printf '%s' "$_profile_json" \
+                    | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["name"])' \
+                    2>/dev/null || echo ""
+                )"
+                _profile_path="$(
+                    printf '%s' "$_profile_json" \
+                    | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["path"])' \
+                    2>/dev/null || echo ""
+                )"
+                if [[ -n "$_profile_name" && -n "$_profile_path" ]]; then
+                    export CODEX_HOME="$_profile_path"
+                    CODEX_PROFILE_NAME="$_profile_name"
+                    log_info "spawn-codex: using pool profile '$CODEX_PROFILE_NAME' from LOOM_CODEX_HOMES_DIR (source=pool, seed=$_codex_home_seed)"
+                fi
+            fi
+            if [[ -z "$CODEX_PROFILE_NAME" ]]; then
+                log_info "spawn-codex: no usable Codex profile under LOOM_CODEX_HOMES_DIR — falling through to openai pool / ambient auth"
+            fi
+        fi
+    fi
+
+    # Tier 4: provider-aware .loom/tokens openai pool (existing, issue
+    # #12/#18). Skipped when tier 2/3 already selected a CODEX_HOME profile —
+    # an authenticated ChatGPT profile and an OPENAI_API_KEY are alternative,
+    # not additive, auth mechanisms; running both would be ambiguous about
+    # which one Codex actually uses.
+    if [[ -z "$CODEX_PROFILE_NAME" ]]; then
+        # Try the openai side of the pool. Unlike spawn-claude.sh this NEVER
+        # hard-fails (no EX_CONFIG): the pool is optional for Codex, and any
+        # selection failure (no pool, no openai accounts, all bad, python
+        # missing) falls through to ambient auth (tier 5). See the header for
+        # why this asymmetry is intentional.
+        _selection_json=""
+        if _selection_json="$(
+            PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
+            "$PYTHON" -m loom_tools.tokens.select \
+                --workspace "$WORKSPACE" --provider openai --json \
+            2>/dev/null
+        )"; then
+            _token="$(
+                printf '%s' "$_selection_json" \
+                | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["key"])' \
+                2>/dev/null || echo ""
+            )"
+            _name="$(
+                printf '%s' "$_selection_json" \
+                | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["name"])' \
+                2>/dev/null || echo ""
+            )"
+            _mode="$(
+                printf '%s' "$_selection_json" \
+                | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["mode"])' \
+                2>/dev/null || echo ""
+            )"
+            if [[ -n "$_token" ]]; then
+                export OPENAI_API_KEY="$_token"
+                POOL_ACCOUNT_NAME="$_name"
+                log_info "spawn-codex: using openai pool account '$_name' (mode=$_mode)"
+            else
+                log_warn "spawn-codex: pool selection returned empty key — falling back to ambient Codex auth"
+            fi
+        else
+            log_info "spawn-codex: no usable openai account in .loom/tokens/ — relying on Codex CLI ChatGPT login state"
+        fi
     fi
 fi
+# Tier 5 (ambient auth) requires no code here: when none of tiers 1-4
+# resolved anything, CODEX_HOME/OPENAI_API_KEY are simply left unset and
+# the codex CLI falls back to its own default (~/.codex) login state.
 
 # --- Binary check ---
 if ! command -v codex >/dev/null 2>&1; then

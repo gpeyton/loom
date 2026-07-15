@@ -95,6 +95,7 @@ cat > "$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash
 echo "stub-codex args=$*"
 echo "stub-codex openai_key=${OPENAI_API_KEY:-<unset>}"
+echo "stub-codex codex_home=${CODEX_HOME:-<unset>}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/codex"
@@ -431,6 +432,193 @@ STUB
         "anthropic-only pool (no index provider match) leaves OPENAI_API_KEY unset"
 else
     echo "  SKIP: python3 or loom-tools source unavailable; pool wiring tests skipped"
+fi
+
+# ============================================================
+# Section 8: CODEX_HOME profile-pool precedence chain (issue #36)
+# ============================================================
+
+echo ""
+echo "Testing CODEX_HOME profile precedence chain (issue #36)..."
+
+SECRET_MARKER="sk-super-secret-should-never-appear-in-logs"
+
+if [[ -n "$PKG_PATH" && -d "$PKG_PATH/loom_tools/codex_homes" ]] \
+    && command -v python3 >/dev/null 2>&1; then
+
+    HOMES_WS="$(mktemp -d)"
+    trap 'rm -rf "$STUB_DIR" "$POOL_WS" "$HOMES_WS"' EXIT
+
+    # --- Tier 2: LOOM_CODEX_HOME explicit pin ---
+
+    PIN_DIR="$HOMES_WS/pinned-profile"
+    mkdir -p "$PIN_DIR"
+    printf '{"token":"%s"}' "$SECRET_MARKER" > "$PIN_DIR/auth.json"
+
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOME="$PIN_DIR" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex codex_home=$PIN_DIR" "$output" \
+        "LOOM_CODEX_HOME pins CODEX_HOME to the given directory verbatim"
+    assert_contains "using pinned Codex profile 'pinned-profile'" "$output" \
+        "tier-2 log line names only the profile directory name"
+    assert_contains "stub-codex openai_key=<unset>" "$output" \
+        "tier-2 selection does not touch OPENAI_API_KEY"
+    assert_not_contains "$SECRET_MARKER" "$output" \
+        "auth.json contents never appear in spawn-codex output (tier 2)"
+
+    # Missing/unusable LOOM_CODEX_HOME falls through (no LOOM_CODEX_HOMES_DIR
+    # or pool configured here) to ambient auth — never fails the spawn.
+    BROKEN_PIN_DIR="$HOMES_WS/broken-pinned-profile"
+    mkdir -p "$BROKEN_PIN_DIR"  # no auth.json at all
+    set +e
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOME="$BROKEN_PIN_DIR" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1)
+    exit_code=$?
+    set -e
+    assert_eq "0" "$exit_code" \
+        "a LOOM_CODEX_HOME with no usable auth.json does not fail the spawn"
+    assert_contains "has no usable auth.json" "$output" \
+        "unusable LOOM_CODEX_HOME pin is logged as a fall-through, not an error"
+    assert_contains "stub-codex codex_home=<unset>" "$output" \
+        "unusable LOOM_CODEX_HOME leaves CODEX_HOME unset (falls through to ambient)"
+
+    # --- Tier 3: LOOM_CODEX_HOMES_DIR deterministic pool selection ---
+
+    POOL_HOMES_DIR="$HOMES_WS/homes-pool"
+    mkdir -p "$POOL_HOMES_DIR/agent-alpha" "$POOL_HOMES_DIR/agent-beta" "$POOL_HOMES_DIR/agent-gamma"
+    printf '{"token":"%s"}' "$SECRET_MARKER" > "$POOL_HOMES_DIR/agent-alpha/auth.json"
+    printf '{"token":"another-secret"}' > "$POOL_HOMES_DIR/agent-beta/auth.json"
+    printf '{"token":"third-secret"}' > "$POOL_HOMES_DIR/agent-gamma/auth.json"
+
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "using pool profile" "$output" \
+        "tier-3 pool selection is logged"
+    assert_contains "source=pool, seed=terminal-fixed-seed" "$output" \
+        "tier-3 log line records the seed used for selection"
+    assert_not_contains "$SECRET_MARKER" "$output" \
+        "auth.json contents never appear in spawn-codex output (tier 3)"
+
+    # Determinism: same LOOM_TERMINAL_ID + same pool contents -> same pick,
+    # across repeated invocations (separate processes each time).
+    first_pick=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 \
+        | grep -o "stub-codex codex_home=.*" || true)
+    second_pick=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 \
+        | grep -o "stub-codex codex_home=.*" || true)
+    assert_eq "$first_pick" "$second_pick" \
+        "same LOOM_TERMINAL_ID + same pool contents selects the same profile across repeated runs"
+
+    # A different seed is not guaranteed to differ (pool of 3 is small), but
+    # exercise it to prove the seed is actually consulted (mode=pool, no crash).
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="a-totally-different-terminal-id" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "using pool profile" "$output" \
+        "a different LOOM_TERMINAL_ID still resolves a profile from the same pool"
+
+    # LOOM_SWEEP_ID fallback seed when LOOM_TERMINAL_ID is unset.
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_SWEEP_ID="sweep-issue-36" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "source=pool, seed=sweep-issue-36" "$output" \
+        "LOOM_SWEEP_ID is used as the selection seed when LOOM_TERMINAL_ID is unset"
+
+    # No seed available at all (neither LOOM_TERMINAL_ID nor LOOM_SWEEP_ID) ->
+    # tier 3 is skipped with a warning, falls through (no pool here -> ambient).
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "cannot select deterministically" "$output" \
+        "LOOM_CODEX_HOMES_DIR without any seed falls through with a warning"
+    assert_contains "stub-codex codex_home=<unset>" "$output" \
+        "no-seed case leaves CODEX_HOME unset (ambient fallback)"
+
+    # Empty / all-unusable pool falls through, never fails the spawn.
+    EMPTY_HOMES_DIR="$HOMES_WS/empty-homes-pool"
+    mkdir -p "$EMPTY_HOMES_DIR"
+    set +e
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOMES_DIR="$EMPTY_HOMES_DIR" LOOM_TERMINAL_ID="terminal-x" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1)
+    exit_code=$?
+    set -e
+    assert_eq "0" "$exit_code" \
+        "an empty LOOM_CODEX_HOMES_DIR pool does not fail the spawn"
+    assert_contains "no usable Codex profile under LOOM_CODEX_HOMES_DIR" "$output" \
+        "empty pool fall-through is logged"
+    assert_contains "stub-codex codex_home=<unset>" "$output" \
+        "empty pool leaves CODEX_HOME unset (falls through to next tier)"
+
+    # --- Precedence ordering ---
+
+    # Tier 1 (OPENAI_API_KEY) wins outright over tiers 2/3 — CODEX_HOME is
+    # never touched at all.
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        OPENAI_API_KEY="sk-preset-wins" \
+        LOOM_CODEX_HOME="$PIN_DIR" LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex openai_key=sk-preset-wins" "$output" \
+        "tier 1 (pre-set OPENAI_API_KEY) wins over LOOM_CODEX_HOME/LOOM_CODEX_HOMES_DIR"
+    assert_contains "stub-codex codex_home=<unset>" "$output" \
+        "tier 1 winning means CODEX_HOME is never touched"
+
+    # Tier 2 (LOOM_CODEX_HOME) wins over tier 3 (LOOM_CODEX_HOMES_DIR) when
+    # both are set and the pin is usable.
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_CODEX_HOME="$PIN_DIR" LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex codex_home=$PIN_DIR" "$output" \
+        "tier 2 (LOOM_CODEX_HOME) wins over tier 3 (LOOM_CODEX_HOMES_DIR) when both are set"
+    assert_contains "using pinned Codex profile" "$output" \
+        "tier-2 log line present when both LOOM_CODEX_HOME and LOOM_CODEX_HOMES_DIR are set"
+
+    # Tier 3 (CODEX_HOME profile) wins over tier 4 (openai pool) — the pool
+    # account is never touched when a profile was already selected.
+    if [[ -n "$POOL_WS" && -d "$POOL_WS/.loom/tokens" ]]; then
+        output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+            LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+            LOOM_WORKSPACE="$POOL_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+            "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+        assert_contains "using pool profile" "$output" \
+            "tier 3 resolves even though the openai pool (tier 4) also has an account available"
+        assert_contains "stub-codex openai_key=<unset>" "$output" \
+            "tier 3 winning means the openai pool (tier 4) is never consulted for OPENAI_API_KEY"
+        assert_not_contains "using openai pool account" "$output" \
+            "tier-4 pool-selection log line does not appear when tier 3 already resolved"
+    fi
+
+    # --- LOOM_SPAWN_NO_EXPORT skips the whole chain (tiers 2-4) ---
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_SPAWN_NO_EXPORT=1 \
+        LOOM_CODEX_HOME="$PIN_DIR" LOOM_CODEX_HOMES_DIR="$POOL_HOMES_DIR" LOOM_TERMINAL_ID="terminal-fixed-seed" \
+        LOOM_WORKSPACE="$HOMES_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex codex_home=<unset>" "$output" \
+        "LOOM_SPAWN_NO_EXPORT skips CODEX_HOME profile resolution too"
+    assert_contains "stub-codex openai_key=<unset>" "$output" \
+        "LOOM_SPAWN_NO_EXPORT skips OPENAI_API_KEY pool resolution"
+
+    rm -rf "$HOMES_WS"
+else
+    echo "  SKIP: python3 or loom_tools.codex_homes unavailable; CODEX_HOME precedence tests skipped"
 fi
 
 # ============================================================
