@@ -302,6 +302,105 @@ result=$(LOOM_WORKER="codex" classify_error "invalid_api_key" 1)
 assert_eq "TOKEN_EXPIRED" "$result" "LOOM_WORKER=codex env selects the codex table"
 
 # ============================================================
+# Section 7: openai pool wiring (issue #12)
+# ============================================================
+
+echo ""
+echo "Testing openai pool selection..."
+
+# Build a fake workspace with a mixed-provider pool. The provider map lives
+# in index.json (as written by `loom-tokens bootstrap`).
+POOL_WS="$(mktemp -d)"
+trap 'rm -rf "$STUB_DIR" "$POOL_WS"' EXIT
+mkdir -p "$POOL_WS/.loom/tokens"
+printf 'sk-ant-oat01-aaa' > "$POOL_WS/.loom/tokens/claude-1.token"
+printf 'sk-openai-bbb' > "$POOL_WS/.loom/tokens/codex-1.token"
+cat > "$POOL_WS/.loom/tokens/index.json" <<'JSON'
+{
+  "version": 1,
+  "accounts": [
+    {"name": "claude-1", "file": "claude-1.token", "provider": "anthropic"},
+    {"name": "codex-1", "file": "codex-1.token", "provider": "openai"}
+  ]
+}
+JSON
+
+# Point the selector at this repo's loom_tools source explicitly so the test
+# does not depend on an installed package.
+PKG_PATH="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
+if [[ -n "$PKG_PATH" && -d "$PKG_PATH/loom_tools/tokens" ]] \
+    && command -v python3 >/dev/null 2>&1; then
+
+    # Pool openai account is selected and exported
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_WORKSPACE="$POOL_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex openai_key=sk-openai-bbb" "$output" \
+        "openai pool account key is exported as OPENAI_API_KEY"
+    assert_contains "using openai pool account 'codex-1'" "$output" \
+        "pool selection log line names the selected account"
+
+    # Pre-set OPENAI_API_KEY wins over the pool (selection skipped)
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        OPENAI_API_KEY="sk-preset" \
+        LOOM_WORKSPACE="$POOL_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    assert_contains "stub-codex openai_key=sk-preset" "$output" \
+        "pre-set OPENAI_API_KEY wins over pool selection"
+
+    # 401 from codex marks the pool account bad with reason `auth`,
+    # and the child's exit code is propagated.
+    FAIL_STUB_DIR="$(mktemp -d)"
+    cat > "$FAIL_STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "stream error: exceeded retry limit, last status: 401 Unauthorized" >&2
+exit 1
+STUB
+    chmod +x "$FAIL_STUB_DIR/codex"
+    set +e
+    output=$(PATH="$FAIL_STUB_DIR:$NOCODEX_PATH" \
+        LOOM_WORKSPACE="$POOL_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1)
+    exit_code=$?
+    set -e
+    rm -rf "$FAIL_STUB_DIR"
+    assert_eq "1" "$exit_code" "codex child exit code is propagated on failure"
+    assert_contains "marking bad (reason=auth)" "$output" \
+        "401 failure marks the pool account bad with reason auth"
+    bad_contents="$(cat "$POOL_WS/.loom/tokens/.bad_tokens" 2>/dev/null || echo "")"
+    assert_contains "codex-1 auth" "$bad_contents" \
+        ".bad_tokens records 'codex-1 auth'"
+
+    # With codex-1 now bad, the pool has no usable openai account:
+    # fall through to ambient auth — NO hard-fail (asymmetry vs spawn-claude)
+    set +e
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_WORKSPACE="$POOL_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1)
+    exit_code=$?
+    set -e
+    assert_eq "0" "$exit_code" \
+        "no usable openai account does NOT hard-fail (falls through to ambient auth)"
+    assert_contains "stub-codex openai_key=<unset>" "$output" \
+        "ambient fallback leaves OPENAI_API_KEY unset"
+    assert_contains "relying on Codex CLI ChatGPT login state" "$output" \
+        "ambient fallback is logged"
+
+    # Anthropic-only pool: openai selection yields nothing -> ambient fallback
+    ANTH_WS="$(mktemp -d)"
+    mkdir -p "$ANTH_WS/.loom/tokens"
+    printf 'sk-ant-oat01-aaa' > "$ANTH_WS/.loom/tokens/claude-1.token"
+    output=$(PATH="$STUB_DIR:$NOCODEX_PATH" \
+        LOOM_WORKSPACE="$ANTH_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1 || true)
+    rm -rf "$ANTH_WS"
+    assert_contains "stub-codex openai_key=<unset>" "$output" \
+        "anthropic-only pool (no index provider match) leaves OPENAI_API_KEY unset"
+else
+    echo "  SKIP: python3 or loom-tools source unavailable; pool wiring tests skipped"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 

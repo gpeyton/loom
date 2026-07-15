@@ -37,12 +37,32 @@
 #       NOT understood by codex, so it is consumed here and translated to a
 #       Codex permission flag (see "Permissions mapping" below).
 #
-# Auth (rotation is Claude-only for now):
-#   This runner does NOT consult the `.loom/tokens/` pool. Provider-aware pool
-#   selection is issue G's scope (a separate Phase 2 issue; another agent is
-#   wiring it). Until that lands, token rotation is Claude-only: spawn-codex.sh
-#   honors a pre-set OPENAI_API_KEY in the environment, and otherwise relies on
-#   whatever ChatGPT login state the Codex CLI already holds (`codex login`).
+# Auth (provider-aware pool selection, issue #12):
+#   Precedence, highest first:
+#     1. Pre-set OPENAI_API_KEY in the environment (always honored, never
+#        overwritten; selection is skipped entirely).
+#     2. `.loom/tokens/` pool: `python3 -m loom_tools.tokens.select
+#        --provider openai` picks an openai account (per-account provider is
+#        recorded in index.json by `loom-tokens bootstrap`). The selected key
+#        is exported as OPENAI_API_KEY.
+#     3. Ambient auth: whatever ChatGPT login state the Codex CLI already
+#        holds (`codex login`).
+#
+#   ASYMMETRY vs spawn-claude.sh (intentional, do not "fix"): when the pool
+#   is absent, has no openai accounts, or every openai account is bad,
+#   spawn-codex.sh falls through to ambient auth (tier 3) instead of
+#   hard-failing. spawn-claude.sh exits 78 (EX_CONFIG) in the equivalent
+#   situation because Claude rotation is the documented load-bearing auth
+#   path; for Codex the pool is OPTIONAL — API-key accounts only (there is
+#   no public multi-account token-file mechanism for ChatGPT-plan OAuth),
+#   with `codex login` as the expected fallback.
+#
+#   Bad-token reporting: when a pool-selected key is in use in
+#   non-interactive (-p) mode, codex output is captured and classified via
+#   lib/classify-error.sh (provider table: codex). TOKEN_EXPIRED marks the
+#   account bad with reason `auth` (persists until `loom-tokens unblock`);
+#   TOKEN_EXHAUSTED marks it with reason `exhausted` (TTL-expires). This
+#   mirrors the reason strings the Claude flow's bad-token tracking uses.
 #
 # Permissions mapping (SAFETY-CRITICAL — do not weaken):
 #   Loom automation always spawns agents with the skip-permissions convention
@@ -78,7 +98,13 @@
 #   LOOM_CODEX_UNSAFE   When set to 1, the skip-permissions convention maps to
 #                       `--dangerously-bypass-approvals-and-sandbox` instead of
 #                       `--full-auto`. Off by default.
-#   OPENAI_API_KEY      Honored if pre-set (exported to the codex child).
+#   OPENAI_API_KEY      Honored if pre-set (exported to the codex child);
+#                       pool selection is skipped when set.
+#   LOOM_WORKSPACE      Override repo root detection (pool lookup).
+#   LOOM_SPAWN_NO_EXPORT If set, skip pool selection entirely (matches
+#                       spawn-claude.sh's contract).
+#   LOOM_PYTHON         Override the python interpreter (default: python3).
+#   LOOM_PACKAGE_PATH   Override the loom_tools package source path.
 #   LOOM_CODEX_NO_EXEC  Test/CI hook: when set, print the resolved argv the
 #                       script WOULD exec (prefixed `spawn-codex would-exec:`)
 #                       and exit 0 instead of exec'ing codex. Does not change
@@ -204,11 +230,87 @@ elif [[ "${LOOM_CODEX_UNSAFE:-}" == "1" ]]; then
     log_warn "spawn-codex: LOOM_CODEX_UNSAFE=1 set but no --dangerously-skip-permissions passed; no permission flag injected"
 fi
 
-# --- Auth (rotation is Claude-only for now; see header) ---
+# --- Repo root resolution (handles worktrees; mirrors spawn-claude.sh) ---
+_resolve_workspace() {
+    if [[ -n "${LOOM_WORKSPACE:-}" ]]; then
+        printf '%s\n' "$LOOM_WORKSPACE"
+        return
+    fi
+
+    local git_common_dir
+    if git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null)"; then
+        if [[ ! "$git_common_dir" = /* ]]; then
+            git_common_dir="$(cd "$git_common_dir" && pwd)"
+        fi
+        printf '%s\n' "$(dirname "$git_common_dir")"
+        return
+    fi
+
+    # Fallback: relative to this script
+    cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
+}
+
+# --- Auth (provider-aware pool selection, issue #12; see header) ---
+# Selected-account bookkeeping for bad-token reporting below. Empty when no
+# pool token is in play (pre-set key or ambient auth).
+POOL_ACCOUNT_NAME=""
+WORKSPACE=""
+PYTHON="${LOOM_PYTHON:-python3}"
+PACKAGE_PATH=""
+
 if [[ -n "${OPENAI_API_KEY:-}" ]]; then
     log_info "spawn-codex: using pre-set OPENAI_API_KEY"
+elif [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
+    log_info "spawn-codex: LOOM_SPAWN_NO_EXPORT set — skipping pool selection"
 else
-    log_info "spawn-codex: no OPENAI_API_KEY set — relying on Codex CLI ChatGPT login state"
+    WORKSPACE="$(_resolve_workspace)"
+
+    # Locate loom_tools package source (mirrors spawn-claude.sh's search
+    # order: env override > script-relative > workspace-relative).
+    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
+    PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
+    if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
+        PACKAGE_PATH="${WORKSPACE}/loom-tools/src"
+    fi
+
+    # Try the openai side of the pool. Unlike spawn-claude.sh this NEVER
+    # hard-fails (no EX_CONFIG): the pool is optional for Codex, and any
+    # selection failure (no pool, no openai accounts, all bad, python
+    # missing) falls through to ambient auth. See the header for why this
+    # asymmetry is intentional.
+    _selection_json=""
+    if _selection_json="$(
+        PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" -m loom_tools.tokens.select \
+            --workspace "$WORKSPACE" --provider openai --json \
+        2>/dev/null
+    )"; then
+        _token="$(
+            printf '%s' "$_selection_json" \
+            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["key"])' \
+            2>/dev/null || echo ""
+        )"
+        _name="$(
+            printf '%s' "$_selection_json" \
+            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["name"])' \
+            2>/dev/null || echo ""
+        )"
+        _mode="$(
+            printf '%s' "$_selection_json" \
+            | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["mode"])' \
+            2>/dev/null || echo ""
+        )"
+        if [[ -n "$_token" ]]; then
+            export OPENAI_API_KEY="$_token"
+            POOL_ACCOUNT_NAME="$_name"
+            log_info "spawn-codex: using openai pool account '$_name' (mode=$_mode)"
+        else
+            log_warn "spawn-codex: pool selection returned empty key — falling back to ambient Codex auth"
+        fi
+    else
+        log_info "spawn-codex: no usable openai account in .loom/tokens/ — relying on Codex CLI ChatGPT login state"
+    fi
 fi
 
 # --- Binary check ---
@@ -240,6 +342,50 @@ if [[ -n "${LOOM_CODEX_NO_EXEC:-}" ]]; then
     # Test/CI hook: surface the resolved argv without exec'ing codex.
     echo "spawn-codex would-exec: codex ${CODEX_ARGS[*]}"
     exit 0
+fi
+
+# Bad-token reporting path (issue #12): when a pool-selected account is in
+# use for a non-interactive run, do NOT exec — run codex as a child with
+# output tee'd (same technique as claude-wrapper.sh's no-TTY path), classify
+# the failure via lib/classify-error.sh's codex table, and mark the account
+# bad with the existing reason strings:
+#     TOKEN_EXPIRED   -> reason `auth`      (persists until loom-tokens unblock)
+#     TOKEN_EXHAUSTED -> reason `exhausted` (TTL-expires)
+# Interactive runs (an operator at the keyboard) keep the plain exec.
+if [[ -n "$POOL_ACCOUNT_NAME" && "$HAS_PROMPT" == "true" ]]; then
+    _classify_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/classify-error.sh"
+    _temp_output="$(mktemp)"
+    set +e
+    codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} 2>&1 | tee "$_temp_output"
+    _exit_code=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$_exit_code" -ne 0 && -f "$_classify_lib" ]]; then
+        # shellcheck source=lib/classify-error.sh
+        source "$_classify_lib"
+        _out_tail="$(tail -c 20000 "$_temp_output" 2>/dev/null || echo "")"
+        _category="$(classify_error "$_out_tail" "$_exit_code" codex)"
+        _reason=""
+        case "$_category" in
+            TOKEN_EXPIRED) _reason="auth" ;;
+            TOKEN_EXHAUSTED) _reason="exhausted" ;;
+        esac
+        if [[ -n "$_reason" ]]; then
+            log_warn "spawn-codex: $_category on account '$POOL_ACCOUNT_NAME' — marking bad (reason=$_reason)"
+            PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
+                "$PYTHON" - "$WORKSPACE" "$POOL_ACCOUNT_NAME" "$_reason" <<'PY' || true
+import sys
+from pathlib import Path
+try:
+    from loom_tools.tokens.bad_tokens import mark_bad
+    mark_bad(Path(sys.argv[1]), sys.argv[2], sys.argv[3])
+except Exception as exc:  # noqa: BLE001 — reporting must never mask the exit
+    print(f"[spawn-codex] mark_bad failed: {exc!r}", file=sys.stderr)
+PY
+        fi
+    fi
+    rm -f "$_temp_output"
+    exit "$_exit_code"
 fi
 
 exec codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}

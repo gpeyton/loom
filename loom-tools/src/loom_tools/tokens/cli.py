@@ -37,6 +37,7 @@ from loom_tools.tokens.check import (
     format_table,
     run_check,
 )
+from loom_tools.tokens.providers import load_provider_map, provider_of
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -76,8 +77,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cp = sub.add_parser(
         "check",
         help=(
-            "Probe each bootstrapped account for rate-limit headers and "
-            "rank by available quota."
+            "Probe each bootstrapped account (all providers) and rank by "
+            "available quota."
         ),
     )
     cp.add_argument(
@@ -85,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Write .loom/tokens/.ranking atomically (consumed by the spawn "
-            "wrapper, #3235)."
+            "wrapper, #3235). Includes accounts from every provider."
         ),
     )
     cp.add_argument(
@@ -380,7 +381,7 @@ def _cmd_pin(args: argparse.Namespace) -> int:
 
 
 def _pin_status(workspace: Path, *, emit_json: bool) -> int:
-    """Print the current allowlist and account roster."""
+    """Print the current allowlist and account roster (with provider)."""
     try:
         all_accounts = allowlist_mod.list_accounts(workspace)
         active = allowlist_mod.read_allowlist(workspace)
@@ -388,11 +389,16 @@ def _pin_status(workspace: Path, *, emit_json: bool) -> int:
         log_error(str(exc))
         return 1
 
+    pmap = load_provider_map(workspace / ".loom" / "tokens")
+
     if emit_json:
         payload = {
             "allowlist_active": bool(active),
             "allowlist": active,
             "accounts": all_accounts,
+            "providers": {
+                name: provider_of(name, pmap) for name in all_accounts
+            },
         }
         print(json.dumps(payload, indent=2))
         return 0
@@ -400,17 +406,18 @@ def _pin_status(workspace: Path, *, emit_json: bool) -> int:
     if active:
         print(f"Allowlist active ({len(active)} account(s)):")
         for name in active:
-            print(f"  * {name}")
+            print(f"  * {name:<28} {provider_of(name, pmap)}")
     else:
         print("No allowlist active — all accounts are eligible.")
 
     if all_accounts:
         print()
         print(f"Available accounts ({len(all_accounts)}):")
+        print(f"    {'Account':<28} Provider")
         active_set = set(active)
         for name in all_accounts:
             mark = "*" if name in active_set else " "
-            print(f"  {mark} {name}")
+            print(f"  {mark} {name:<28} {provider_of(name, pmap)}")
     else:
         print()
         log_warning(
