@@ -37,13 +37,15 @@
 #   Supported providers:
 #     claude  — default. Patterns extracted verbatim from the pre-refactor
 #               implementation; behavior is bit-identical to before.
-#     codex   — STUB for Phase 2 (OpenAI Codex CLI runner, epic #1). No real
-#               patterns yet — see the TODO markers in
-#               `_classify_error_set_patterns()` for the category mappings
-#               Phase 2 must fill in (401/invalid_api_key -> TOKEN_EXPIRED,
-#               rate_limit_exceeded/429 -> TOKEN_EXHAUSTED or RECOVERABLE,
-#               etc.). Until then, `codex` behaves like any unknown
-#               provider: falls through to the generic HTTP/network checks.
+#     codex   — OpenAI Codex CLI runner (epic #1, Phase 2, issue #10).
+#               TOKEN_EXPIRED (401/invalid_api_key/Unauthorized) and
+#               TOKEN_EXHAUSTED (rate_limit_exceeded/insufficient_quota/usage
+#               limit) patterns are populated from OpenAI's documented API
+#               error surface; see `_classify_error_set_patterns()`.
+#               CWD_DELETED and NO_MESSAGES have no reliable Codex signature
+#               yet and are intentionally left empty (documented, not
+#               guessed). A bare 429 throttle and 5xx/network errors are
+#               caught by the generic provider-agnostic RECOVERABLE patterns.
 #     <other> — Unknown-provider fallback. No provider-specific patterns are
 #               applied (CWD_DELETED/TOKEN_EXPIRED/TOKEN_EXHAUSTED are never
 #               matched); only the generic HTTP/network RECOVERABLE patterns
@@ -75,25 +77,41 @@ _classify_error_set_patterns() {
             _CE_PAT_NO_MESSAGES="No messages returned"
             ;;
         codex)
-            # STUB — OpenAI Codex CLI runner (epic #1, Phase 2). Real Codex
-            # CLI output strings are not yet available; do not guess at
-            # them here (issue #3 explicitly scopes actual Codex pattern
-            # content out — see "Out of scope"). Documented expected
-            # category mappings for Phase 2 to fill in:
-            #   TODO(#1 Phase 2): 401 / invalid_api_key error type
-            #                     -> TOKEN_EXPIRED
-            #   TODO(#1 Phase 2): rate_limit_exceeded / 429 response
-            #                     -> TOKEN_EXHAUSTED (quota) or RECOVERABLE
-            #                        (transient — depends on Codex's error
-            #                        body distinguishing quota vs. throttle)
-            #   TODO(#1 Phase 2): workspace/sandbox removed mid-run
-            #                     -> CWD_DELETED
-            # Until populated, codex falls through to the generic
-            # HTTP/network RECOVERABLE patterns below (same as any unknown
-            # provider).
+            # OpenAI Codex CLI runner (epic #1, Phase 2, issue #10). Patterns
+            # derived from OpenAI's documented API error surface (error `type`
+            # / `code` strings and HTTP statuses the Codex CLI relays verbatim
+            # from the Responses API) plus observed `codex exec` failure output
+            # (e.g. `stream error: exceeded retry limit, last status: 401
+            # Unauthorized`, openai/codex#2896). Where a category has no
+            # reliable Codex signature yet, the pattern is left empty rather
+            # than guessed (issue #10: "leave it documented rather than
+            # guessing") — an empty pattern is skipped by classify_error()
+            # below, so the category simply never matches for codex.
+            #
+            #   TOKEN_EXPIRED   401 / invalid_api_key / "Incorrect API key" /
+            #                   Unauthorized auth failures. This token is bad;
+            #                   the caller should skip/rotate it.
+            #   TOKEN_EXHAUSTED rate_limit_exceeded / insufficient_quota /
+            #                   "usage limit" (weekly/plan quota used up).
+            #                   NOTE: a bare `429` with no quota wording is a
+            #                   transient throttle and is intentionally left to
+            #                   the generic RECOVERABLE `429` pattern below —
+            #                   only explicit quota-exhaustion phrasing maps to
+            #                   TOKEN_EXHAUSTED (issue #10 mapping).
+            #   CWD_DELETED     No reliable Codex-specific signature for a
+            #                   workspace/sandbox removed mid-run is documented
+            #                   yet; left empty (Claude's "current working
+            #                   directory was deleted" phrasing is NOT reused —
+            #                   it is Claude-CLI-specific). Populate when a real
+            #                   Codex signature is observed.
+            #   NO_MESSAGES     Claude-CLI-specific concept; no Codex analogue.
+            #                   Left empty.
+            # Transient 429/5xx/network failures are caught by the generic
+            # provider-agnostic patterns in classify_error() (they always
+            # apply), so codex gets RECOVERABLE for those without a table entry.
             _CE_PAT_CWD_DELETED=""
-            _CE_PAT_TOKEN_EXPIRED=""
-            _CE_PAT_TOKEN_EXHAUSTED=""
+            _CE_PAT_TOKEN_EXPIRED="401[^a-z]*unauthorized|invalid_api_key|invalid api key|incorrect api key"
+            _CE_PAT_TOKEN_EXHAUSTED="rate_limit_exceeded|insufficient_quota|exceeded your current quota|usage limit|quota exceeded"
             _CE_PAT_NO_MESSAGES=""
             ;;
         *)
