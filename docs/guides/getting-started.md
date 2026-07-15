@@ -32,11 +32,14 @@ Running `loom-daemon init` creates these files in your repository:
 
 **Documentation (Commit these)**:
 - `CLAUDE.md` - AI context document for Claude Code (11KB template)
+- `AGENTS.md` - AI context document for OpenAI Codex and other AGENTS.md-aware runtimes
 
 **Tooling (Commit these)**:
 - `.claude/commands/loom/` - Claude Code slash commands for each role
-- `.codex/` - Codex configuration (if available)
 - `.github/labels.yml` - Workflow label definitions
+
+`.codex/` (Codex-specific configuration) is planned but not yet shipped — see
+dual-runtime epic #1. It will be documented here once Phase 2 lands.
 
 **Gitignored (Local only)**:
 - `.loom/state.json` - Runtime terminal state
@@ -304,11 +307,12 @@ After installing Loom (via GUI or CLI), you'll find the following files in your 
 
 ```
 CLAUDE.md             # Technical context for Claude Code agents
+AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-aware agents
 ```
 
 **What to do:**
-1. Review `CLAUDE.md` to understand the codebase structure and patterns
-2. Update `CLAUDE.md` with project-specific context as you build
+1. Review `CLAUDE.md` (Claude Code) and/or `AGENTS.md` (Codex) to understand the codebase structure and patterns
+2. Update both files with project-specific context as you build — they cover the same runtime-neutral coordination mechanics (labels, worktrees, sweep lifecycle), so keep them in sync
 
 ### Claude Code Configuration
 
@@ -352,7 +356,8 @@ Loom automatically updates `.gitignore` with ephemeral patterns:
 **What to commit:**
 - ✅ `.loom/config.json` - Share terminal roles across team
 - ✅ `.loom/roles/` - Custom role definitions
-- ✅ `CLAUDE.md` - AI context documentation
+- ✅ `CLAUDE.md` - AI context documentation (Claude Code)
+- ✅ `AGENTS.md` - AI context documentation (OpenAI Codex)
 - ✅ `.claude/` - Slash commands and config
 - ✅ `.github/` - Labels and workflows
 

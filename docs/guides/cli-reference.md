@@ -44,10 +44,13 @@ The `init` subcommand sets up a Loom workspace by:
 1. **Validating** the target directory is a git repository
 2. **Copying** `.loom/` configuration from defaults
 3. **Installing** repository scaffolding:
-   - `CLAUDE.md` - AI context documentation
+   - `CLAUDE.md` - AI context documentation (Claude Code)
+   - `AGENTS.md` - AI context documentation (OpenAI Codex)
    - `.claude/` - Claude Code configuration
-   - `.codex/` - Codex configuration (if available)
    - `.github/` - GitHub workflow templates and labels
+
+   `.codex/` (Codex-specific configuration) is planned for dual-runtime
+   Phase 2 (epic #1) and is not currently installed.
 4. **Updating** `.gitignore` with Loom ephemeral patterns
 
 The initialization process is **idempotent** - it only creates files that don't already exist (unless `--force` is used).
@@ -120,6 +123,7 @@ Preview what would be changed without making any modifications.
   [DRY RUN] Would create: .loom/config.json
   [DRY RUN] Would create: .loom/roles/
   [DRY RUN] Would create: CLAUDE.md
+  [DRY RUN] Would create: AGENTS.md
   [DRY RUN] Would update: .gitignore
   [DRY RUN] Workspace validation: ✓ Valid git repository
   ```
@@ -151,7 +155,7 @@ The defaults directory must contain:
 ```
 defaults/
 ├── config.json           # Default config template
-├── CLAUDE.md             # AI context template
+├── CLAUDE.md             # AI context template (Claude Code)
 ├── .loom-README.md       # .loom/ directory documentation
 ├── roles/                # Role definitions
 │   ├── architect.md
@@ -162,8 +166,10 @@ defaults/
 │   ├── doctor.md
 │   ├── hermit.md
 │   └── judge.md
+├── .loom/
+│   ├── CLAUDE.md         # Full guide installed to <target>/.loom/CLAUDE.md
+│   └── AGENTS.md         # Full guide installed to <target>/.loom/AGENTS.md (OpenAI Codex)
 ├── .claude/              # Claude Code config
-├── .codex/               # Codex config (optional)
 └── .github/              # GitHub templates
     ├── labels.yml
     └── workflows/
