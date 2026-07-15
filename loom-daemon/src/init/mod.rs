@@ -9,7 +9,7 @@
 //! 1. Validates the target is a git repository
 //! 2. Detects self-installation (Loom source repo) and runs validation-only mode
 //! 3. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
-//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/)
+//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/, .agents/)
 //! 5. Updates .gitignore with Loom ephemeral patterns
 //! 6. Reports which files were preserved vs added
 //!
@@ -388,7 +388,7 @@ fn verify_all_copied_files(
     };
     let ctx = Some(&template_ctx);
 
-    for dir_name in &[".claude", ".codex", ".github"] {
+    for dir_name in &[".claude", ".codex", ".agents", ".github"] {
         let src = defaults.join(dir_name);
         let dst = workspace.join(dir_name);
         verify_copied_files(&src, &dst, dir_name, report, ctx);

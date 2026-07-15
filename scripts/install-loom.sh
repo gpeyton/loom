@@ -581,7 +581,7 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     # Also clean any untracked files left by the uninstall process
     # Only clean Loom-owned directories — NOT .claude/ which is a shared directory
     # that may contain custom project-specific commands not installed by Loom
-    git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .github/labels.yml 2>/dev/null || true
+    git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .agents/ .github/labels.yml 2>/dev/null || true
 
     # Verify the working tree is clean
     if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \

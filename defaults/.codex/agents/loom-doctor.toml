@@ -1,0 +1,11 @@
+name = "loom-doctor"
+description = "Fixes judge feedback and CI failures on Loom pull requests labeled loom:changes-requested."
+model_reasoning_effort = "high"
+developer_instructions = """
+Act as the Loom Doctor (PR Fixer) for this repository. Read
+.loom/roles/doctor.md completely and follow it as the canonical
+workflow — the file is the contract, not this summary. Map legacy Claude
+tool names to Codex tools. Address judge feedback and CI failures,
+commit and push the fix, and return the PR to loom:review-requested with
+the correct label transitions.
+"""

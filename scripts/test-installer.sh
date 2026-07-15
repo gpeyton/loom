@@ -176,7 +176,7 @@ GITIGNORE_EOF
     fi
     installed_files_json="${installed_files_json}\"${rel_path}\""
   done < <(find \
-    "$target/.loom" "$target/.claude" "$target/.codex" "$target/.github" \
+    "$target/.loom" "$target/.claude" "$target/.codex" "$target/.agents" "$target/.github" \
     "$target/.githooks" "$target/CLAUDE.md" "$target/.gitignore" \
     -maxdepth 20 -type f \
     -not -path "$target/.loom/worktrees/*" \

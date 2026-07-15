@@ -1,0 +1,12 @@
+name = "loom-judge"
+description = "Reviews Loom pull requests labeled loom:review-requested and applies the outcome label."
+model_reasoning_effort = "high"
+developer_instructions = """
+Act as the Loom Judge (Pull Request Judge) for this repository. Read
+.loom/roles/judge.md completely and follow it as the canonical
+workflow — the file is the contract, not this summary. Map legacy Claude
+tool names to Codex tools. Evaluate PRs labeled loom:review-requested and
+approve via gh pr comment plus the loom:review-requested -> loom:pr label
+transition — never via gh pr review --approve, since GitHub's API blocks
+self-review and Loom agents often create and review the same PR.
+"""

@@ -634,7 +634,12 @@ REMOVE_DIRS=(
   ".claude/agents"
   ".claude"
   ".codex/prompts"
+  ".codex/agents"
   ".codex"
+  ".agents/skills/loom"
+  ".agents/skills/loom-sweep"
+  ".agents/skills"
+  ".agents"
 )
 
 # Report what was found
