@@ -1,19 +1,29 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400">
 <rect width="800" height="400" fill="white"/>
 <defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#4A90D9" stop-opacity="0.3"/><stop offset="100%" stop-color="#4A90D9" stop-opacity="0.05"/></linearGradient></defs>
-<line x1="80" y1="332.2" x2="760" y2="332.2" stroke="#E5E5E5" stroke-width="1"/>
-<text x="72" y="336.2" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">126k</text>
-<line x1="80" y1="273.3" x2="760" y2="273.3" stroke="#E5E5E5" stroke-width="1"/>
-<text x="72" y="277.3" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">126k</text>
-<line x1="80" y1="214.3" x2="760" y2="214.3" stroke="#E5E5E5" stroke-width="1"/>
-<text x="72" y="218.3" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">127k</text>
-<line x1="80" y1="155.3" x2="760" y2="155.3" stroke="#E5E5E5" stroke-width="1"/>
-<text x="72" y="159.3" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">128k</text>
-<line x1="80" y1="96.4" x2="760" y2="96.4" stroke="#E5E5E5" stroke-width="1"/>
-<text x="72" y="100.4" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">128k</text>
+<line x1="80" y1="318.0" x2="760" y2="318.0" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="322.0" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">127k</text>
+<line x1="80" y1="268.6" x2="760" y2="268.6" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="272.6" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">127k</text>
+<line x1="80" y1="219.3" x2="760" y2="219.3" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="223.3" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">127k</text>
+<line x1="80" y1="170.0" x2="760" y2="170.0" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="174.0" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">128k</text>
+<line x1="80" y1="120.7" x2="760" y2="120.7" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="124.7" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">128k</text>
+<line x1="80" y1="71.4" x2="760" y2="71.4" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="75.4" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">128k</text>
 <text x="80.0" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
-<path d="M80.0,190.0" fill="none" stroke="#4A90D9" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="80.0" cy="190.0" r="3.5" fill="white" stroke="#4A90D9" stroke-width="2"/>
+<text x="193.3" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<text x="306.7" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<text x="420.0" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<text x="533.3" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<text x="646.7" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<text x="760.0" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Jul 2026</text>
+<path d="M80.0,340.0 L80.0,315.0 L760.0,65.0 L760.0,340.0Z" fill="url(#areaGrad)"/>
+<path d="M80.0,315.0 L760.0,65.0" fill="none" stroke="#4A90D9" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="80.0" cy="315.0" r="3.5" fill="white" stroke="#4A90D9" stroke-width="2"/>
+<circle cx="760.0" cy="65.0" r="3.5" fill="white" stroke="#4A90D9" stroke-width="2"/>
 <text x="80" y="24" font-family="system-ui, sans-serif" font-size="16" font-weight="600" fill="#333">Lines of Code</text>
 <line x1="80" y1="40" x2="80" y2="340" stroke="#CCC" stroke-width="1"/><line x1="80" y1="340" x2="760" y2="340" stroke="#CCC" stroke-width="1"/>
 </svg>
