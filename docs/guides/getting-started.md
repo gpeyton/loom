@@ -183,6 +183,12 @@ gh --version
 
 ## Installation Options
 
+> **Existing `rjwalters/loom` v0.9.x installation:** use the
+> [legacy migration guide](../migration/from-rjwalters-v0.9.md) before running
+> the interactive installer. The normal reinstall path removes the existing
+> payload first and can erase consumer-owned customizations that were stored
+> under Loom-managed directories.
+
 Choose the installation method that best fits your needs:
 
 ### Option 1: Download Binary (Easiest)

@@ -33,6 +33,8 @@ EXPECTED_CLI_COMMANDS = [
     "loom-clean",
     "loom-worktree",
     "loom-cleanup",
+    "loom-orphan-recovery",
+    "loom-recover-orphans",
 ]
 
 # Wrapper scripts that should route to Python implementations

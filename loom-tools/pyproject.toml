@@ -29,6 +29,10 @@ loom-check-completions = "loom_tools.completions:main"
 loom-clean = "loom_tools.clean:main"
 # loom-milestone removed in Phase 3.3 (#3400) — milestones.py deleted with shepherd brain
 loom-worktree = "loom_tools.worktree:main"
+# Canonical operator spelling used throughout the migration docs and
+# validate-toolchain.sh. Keep the older reversed spelling as a compatibility
+# alias for v0.10.6 installations that already exposed it.
+loom-orphan-recovery = "loom_tools.orphan_recovery:main"
 loom-recover-orphans = "loom_tools.orphan_recovery:main"
 # loom-validate-state removed in Phase 3.2 (#3399) — validate_state.py deleted
 # loom-validate-state = "loom_tools.validate_state:main"
