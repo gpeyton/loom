@@ -642,8 +642,18 @@ This writes an absolute-path `[mcp_servers.loom]` entry (idempotent,
 marker-delimited) generated from the same variables as the Claude Code
 `.mcp.json`.
 
-For a **consumer repository**, configure the built server from the persistent
-Loom checkout but set `LOOM_WORKSPACE` to the consumer repository:
+For a **consumer repository**, run `setup-mcp.sh` from the Loom source
+checkout with `--target`/`--workspace` pointed at the consumer repo:
+
+```bash
+./scripts/setup-mcp.sh --codex --target /path/to/consumer-repository
+```
+
+This writes `.mcp.json` / `.codex/config.toml` into the *consumer* repository
+(not the Loom checkout) with `LOOM_WORKSPACE` set to the consumer path, while
+`args` still points at `mcp-loom/dist/index.js` inside the Loom source
+checkout (`mcp-loom` is never installed into consumer repos). The generated
+entry looks like:
 
 ```toml
 [mcp_servers.loom]
@@ -654,11 +664,11 @@ args = ["/home/you/.loom-engine-gpeyton/mcp-loom/dist/index.js"]
 LOOM_WORKSPACE = "/path/to/consumer-repository"
 ```
 
-Do not assume `setup-mcp.sh --codex` targets the consumer: without a
-target-aware option it writes into the Loom source checkout. Keep these
-machine-specific absolute paths local, trust the consumer project in Codex,
-and restart Codex after changing the config. See the legacy migration guide's
-MCP section for the matching Claude `.mcp.json` entry.
+If you'd rather not run the script against the consumer repo, hand-author the
+same block instead. Either way, keep these machine-specific absolute paths
+local, trust the consumer project in Codex, and restart Codex after changing
+the config. See the legacy migration guide's MCP section for the matching
+Claude `.mcp.json` entry.
 
 ### Skill invocation (primary entry point)
 

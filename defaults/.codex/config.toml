@@ -91,9 +91,15 @@ network_access = false
 #
 # Because mcp-loom lives inside the Loom source checkout (not inside this
 # consumer repository), the absolute paths are machine-specific and cannot
-# ship pre-filled. `scripts/setup-mcp.sh --codex` configures the Loom source
-# repository itself; it does not currently accept a consumer target. For a
-# consumer install, uncomment the template below and substitute both paths:
+# ship pre-filled. From the Loom source checkout, run:
+#
+#     ./scripts/setup-mcp.sh --codex --target /path/to/this/repository
+#
+# which writes a concrete, absolute-path [mcp_servers.loom] entry here (and
+# into .mcp.json for Claude Code) with LOOM_WORKSPACE set to this repository.
+# Omitting --target instead configures the Loom source checkout itself. If
+# you'd rather not run the script, uncomment the template below and
+# substitute both paths by hand:
 #
 # [mcp_servers.loom]
 # command = "node"
