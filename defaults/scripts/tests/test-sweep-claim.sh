@@ -110,7 +110,7 @@ assert_eq "1" "$live_code" "is-live reports false after release (resumable is no
 echo ""
 echo "Testing acquire refuses live claims but reclaims orphaned ones..."
 
-run_id2=$("$SWEEP_CLAIM" acquire 1002 --pid "$ALIVE_PID" --runtime codex)
+"$SWEEP_CLAIM" acquire 1002 --pid "$ALIVE_PID" --runtime codex >/dev/null
 set +e
 "$SWEEP_CLAIM" acquire 1002 --pid "$ALIVE_PID" --runtime codex >/tmp/sweep-claim-test-refuse.$$ 2>&1
 refuse_code=$?
@@ -163,7 +163,7 @@ set +e
 noop_code=$?
 assert_eq "0" "$noop_code" "release on an issue with no claim at all is a no-op success"
 
-run_id5=$("$SWEEP_CLAIM" acquire 1005 --pid "$ALIVE_PID" --runtime manual)
+"$SWEEP_CLAIM" acquire 1005 --pid "$ALIVE_PID" --runtime manual >/dev/null
 set +e
 "$SWEEP_CLAIM" release 1005 --run-id "some-other-run-id" --status resumable
 wrong_release_code=$?

@@ -118,11 +118,15 @@ _iso_to_epoch() {
 
 _hours_since() {
     local iso="$1"
-    local then now
-    then="$(_iso_to_epoch "$iso")"
-    now="$(_now_epoch)"
-    [[ "$then" -eq 0 ]] && { echo 0; return; }
-    echo $(( (now - then) / 3600 ))
+    # NOTE: deliberately not named `then`/`now` -- `then` is a bash reserved
+    # word and using it as a plain variable name confuses shellcheck's
+    # parser (SC1010, "use semicolon or linefeed before 'then'") even though
+    # bash itself accepts it. Use unambiguous names instead.
+    local then_epoch now_epoch
+    then_epoch="$(_iso_to_epoch "$iso")"
+    now_epoch="$(_now_epoch)"
+    [[ "$then_epoch" -eq 0 ]] && { echo 0; return; }
+    echo $(( (now_epoch - then_epoch) / 3600 ))
 }
 
 if ! command -v gh &>/dev/null; then
