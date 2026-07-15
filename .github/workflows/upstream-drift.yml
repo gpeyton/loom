@@ -1,0 +1,145 @@
+name: Upstream Drift Monitor
+
+# Daily check comparing this fork's `main` against rjwalters/loom's `main`
+# (ahead/behind commit counts). On detecting that upstream has advanced,
+# opens (or updates) a single deduplicated operator-facing issue describing
+# the drift and pointing at the manual sync procedure in
+# docs/guides/upstream-sync.md.
+#
+# Also runs the Codex parity suite (`npm run test:codex`, issue #34) in the
+# same job so drift-driven merges that might touch the runtime abstraction
+# get an automatic parity signal alongside the ahead/behind counts. Both
+# results are reported in the GitHub Actions job summary.
+#
+# Disabled by default (cron commented out) -- follows the existing
+# "don't burn Actions minutes on forks" convention used by the
+# .github/workflows/loom-*.yml support-role workflows. workflow_dispatch is
+# always available for manual smoke testing.
+#
+# Ported from mattcproctor/loom's upstream-drift workflow and adapted for
+# this repo, which (unlike some forks) has Issues enabled -- drift is
+# reported as a real operator-facing issue rather than only a job summary.
+#
+# Part of Epic #30 ("Codex full-autonomy default"), Phase 3 (#38).
+
+on:
+  # schedule:
+  #   # Uncomment to enable daily drift checks. Pick a low-traffic UTC hour.
+  #   - cron: "17 6 * * *"
+  workflow_dispatch: # Allow manual runs for smoke testing.
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  UPSTREAM_REPO: rjwalters/loom
+  DRIFT_ISSUE_TITLE: "chore: sync upstream Loom updates"
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Measure upstream drift
+        id: drift
+        shell: bash
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --quiet upstream main
+          behind="$(git rev-list --count HEAD..upstream/main)"
+          ahead="$(git rev-list --count upstream/main..HEAD)"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex parity suite
+        id: parity
+        shell: bash
+        # Pure-bash test suite (defaults/scripts/tests/test-*.sh) -- no
+        # `npm ci` / node_modules dependency. continue-on-error so the job
+        # summary and drift issue still get written even on failure; the
+        # final step below fails the job explicitly once reporting is done.
+        continue-on-error: true
+        run: |
+          if npm run test:codex; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          PARITY: ${{ steps.parity.outputs.result }}
+        run: |
+          {
+            echo "## Upstream Drift Report"
+            echo
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Behind \`${UPSTREAM_REPO}:main\` | ${BEHIND} commit(s) |"
+            echo "| Ahead of \`${UPSTREAM_REPO}:main\` | ${AHEAD} commit(s) |"
+            echo "| \`npm run test:codex\` | ${PARITY:-unknown} |"
+            echo
+            if [[ "${BEHIND}" != "0" ]]; then
+              echo "Upstream has advanced. See the deduplicated sync issue and [docs/guides/upstream-sync.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/docs/guides/upstream-sync.md) for the manual sync procedure."
+            else
+              echo "No upstream drift detected."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update upstream-sync issue
+        if: steps.drift.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          PARITY: ${{ steps.parity.outputs.result }}
+          TITLE: ${{ env.DRIFT_ISSUE_TITLE }}
+        shell: bash
+        run: |
+          # Dedup: look for an existing OPEN issue with the exact marker
+          # title before creating a new one. If found, add a comment with
+          # the refreshed counts instead of opening a duplicate (verified by
+          # re-running this workflow with drift still present -- see AC in
+          # issue #38).
+          existing_number="$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+
+          sync_doc_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/docs/guides/upstream-sync.md"
+
+          body=$(cat <<EOF
+          Upstream drift check found **${BEHIND}** new commit(s) on \`${UPSTREAM_REPO}:main\` not yet merged into this fork. This fork currently has **${AHEAD}** fork-only commit(s) ahead of upstream.
+
+          Codex parity suite (\`npm run test:codex\`): **${PARITY:-unknown}**
+
+          Follow [\`docs/guides/upstream-sync.md\`](${sync_doc_url}) to fetch upstream, review the diff, cherry-pick or merge, and re-run \`npm run test:codex\` + \`cargo test --workspace\` before merging drift back in.
+
+          _Last checked: $(date -u +"%Y-%m-%dT%H:%M:%SZ") (workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})_
+          EOF
+          )
+
+          if [[ -n "$existing_number" ]]; then
+            gh issue comment "$existing_number" --body "$body"
+            echo "Updated existing upstream-sync issue #$existing_number"
+          else
+            label_args=()
+            if gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq 'loom:operator-only'; then
+              label_args=(--label "loom:operator-only")
+            fi
+            gh issue create --title "$TITLE" "${label_args[@]}" --body "$body"
+          fi
+
+      - name: Fail job if parity suite failed
+        if: steps.parity.outputs.result == 'fail'
+        run: |
+          echo "npm run test:codex failed -- see the 'Run Codex parity suite' step log and job summary above." >&2
+          exit 1
