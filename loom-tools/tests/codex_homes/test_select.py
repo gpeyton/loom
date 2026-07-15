@@ -21,11 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from loom_tools.codex_homes.select import (
     EX_CONFIG,
-    SelectedProfile,
     is_valid_profile_dir,
     list_valid_profiles,
     select_profile,

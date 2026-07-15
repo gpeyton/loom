@@ -1301,14 +1301,14 @@ mod codex_config {
             for i in 0..5 {
                 make_profile(homes, &format!("acct-{i}"), Some("{}"));
             }
-            // sha256("terminal-fixed-seed")[:8] as big-endian u64, mod 5 —
-            // computed once via Python's hashlib for cross-check; asserting
-            // only that SOME deterministic index in range is picked (the
-            // exact index is an implementation artifact, not a contract) —
-            // determinism is covered above, this test just guards against
-            // an out-of-range panic on a real-looking seed.
+            // Independently verified via Python:
+            //   digest = hashlib.sha256(b"terminal-fixed-seed").digest()
+            //   idx = int.from_bytes(digest[:8], "big") % 5   # == 3
+            // i.e. loom_tools.codex_homes.select.select_profile() picks
+            // "acct-3" for this exact (seed, pool) pair. Locks in
+            // cross-language parity bit-for-bit, not just "some index".
             let picked = select_profile_name(homes, "terminal-fixed-seed").unwrap();
-            assert!(picked.starts_with("acct-"));
+            assert_eq!(picked, "acct-3");
         }
 
         #[test]
