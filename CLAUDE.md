@@ -117,21 +117,23 @@ For full surface documentation — IPC request/response variants, event-bus inte
 
 ### 4. Scheduled Support Roles (opt-in)
 
-GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process.
+GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). The five per-role workflows are **thin callers** of one reusable workflow, `.github/workflows/loom-role.yml` (`on: workflow_call`), which holds the shared checkout → install → run logic and the 10-minute timeout. Each caller supplies its role slug and pinned model; the reusable workflow does one tick of work — no Loom-side state file, no long-running process.
 
-| Workflow | Role | Schedule (commented) |
-|----------|------|----------------------|
-| `loom-champion.yml` | `/champion` | `*/10 * * * *` |
-| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`  |
-| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`  |
-| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *` |
-| `loom-guide.yml`    | `/guide`    | `*/15 * * * *` |
+| Workflow | Role | Schedule (commented) | Claude model |
+|----------|------|----------------------|--------------|
+| `loom-champion.yml` | `/champion` | `*/10 * * * *` | `claude-sonnet-4-6` |
+| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`  | `claude-sonnet-4-6` |
+| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`  | `claude-opus-4-8`   |
+| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *` | `claude-sonnet-4-6` |
+| `loom-guide.yml`    | `/guide`    | `*/15 * * * *` | `claude-sonnet-4-6` |
+
+**Runtime choice (claude | codex, #13).** Each role can run on either runtime. The default is `claude` (byte-equivalent to the historical behavior): installs `@anthropic-ai/claude-code` and runs `claude -p "/<role>" --model <pinned> --dangerously-skip-permissions` with `CLAUDE_API_KEY` mapped to `ANTHROPIC_API_KEY`. Selecting `codex` (via the `workflow_dispatch` runtime input) installs `@openai/codex` and runs `codex exec "<role prompt>" --sandbox workspace-write -m <codex-model>`, authenticating with `OPENAI_API_KEY`. Codex cannot resolve Claude slash commands, so the role prompt is inlined from `.loom/roles/<role>.md`. The default Codex model is centralized in the reusable workflow's `codex-model` input default — bump it there in one place.
 
 **Disabled by default.** Every shipped workflow has its `schedule:` block commented out so forks don't burn Actions minutes accidentally. To opt in on a fork:
 
-1. Add a `CLAUDE_API_KEY` repository secret (Settings -> Secrets and variables -> Actions). Workflows run on a single API key — token rotation is for per-task spawns only; scheduled support roles are predictable load that doesn't benefit from rotation.
+1. Add the repository secret required for your runtime (Settings -> Secrets and variables -> Actions): `CLAUDE_API_KEY` for the `claude` runtime (default), or `OPENAI_API_KEY` for the `codex` runtime. If the selected runtime's secret is missing, the workflow fails fast with an error naming the required secret. Workflows run on a single API key — token rotation is for per-task spawns only; scheduled support roles are predictable load that doesn't benefit from rotation.
 2. Uncomment the `schedule:` / `- cron:` lines in each `.github/workflows/loom-*.yml` you want to enable.
-3. Optionally trigger a run via `workflow_dispatch` (the Actions UI's "Run workflow" button) to smoke-test before the next scheduled tick.
+3. Optionally trigger a run via `workflow_dispatch` (the Actions UI's "Run workflow" button) — the dispatch form offers a `runtime` choice (claude/codex) — to smoke-test before the next scheduled tick. Scheduled (cron) runs always use the `claude` default.
 
 Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381 (Phase 2d).
 
