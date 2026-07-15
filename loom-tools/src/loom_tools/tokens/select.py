@@ -1,8 +1,12 @@
 """Token selection algorithm — 3-tier priority.
 
 Selection order:
-    1. Ranking file (.ranking, <10 min old): pick first non-exhausted
-       account, skipping bad tokens.
+    1. Ranking file (.ranking, <10 min old): a JSON document written by
+       ``loom_tools.tokens.check.write_ranking_atomic`` shaped as
+       ``{"ranked_at": ..., "accounts": [{"name", "status", ...}, ...]}``.
+       Pick the first non-exhausted/non-blocked account in the
+       ``accounts`` list order (the writer already sorts by rank),
+       skipping bad tokens.
     2. Allowlist file (.allowlist): random pick from allowed accounts.
     3. Random pick from all .token files.
 
@@ -91,23 +95,51 @@ def _strip_comment(line: str) -> str:
 
 
 def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
-    """Yield (name, status) pairs from the ranking file.
+    """Yield (name, status) pairs from the ranking file, in ranked order.
 
-    Format: ``name|status`` per line. Lines starting with ``#`` are skipped.
-    Malformed lines are skipped. ``status`` defaults to empty string.
+    The ranking file is the JSON document written by
+    ``loom_tools.tokens.check.write_ranking_atomic``:
+
+    .. code-block:: json
+
+        {
+          "ranked_at": "2026-...Z",
+          "accounts": [
+            {"name": "...", "status": "available|exhausted|...", ...},
+            ...
+          ]
+        }
+
+    ``accounts`` is already sorted by rank (best account first) by the
+    writer, so this simply walks the list in order and yields
+    ``(name, status)`` for each entry, skipping entries missing a
+    ``name``. Missing files, invalid JSON, or an unexpected top-level
+    shape (not a dict, or no ``accounts`` list) are treated as "no
+    ranking data" — this degrades gracefully to tier-2/tier-3 selection
+    rather than raising, since a corrupt or stale-format ``.ranking``
+    file should never crash the CLI.
     """
     try:
-        for raw in ranking_file.read_text(encoding="utf-8").splitlines():
-            stripped = _strip_comment(raw)
-            if not stripped:
-                continue
-            parts = stripped.split("|", 1)
-            name = parts[0].strip()
-            status = parts[1].strip() if len(parts) > 1 else ""
-            if name:
-                yield name, status
+        raw = ranking_file.read_text(encoding="utf-8")
     except OSError:
         return
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, list):
+        return
+    for entry in accounts:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        status = entry.get("status") or ""
+        yield name, status
 
 
 def _read_allowlist(allowlist_file: Path) -> list[str]:

@@ -333,7 +333,14 @@ class TestSelectProviderFilter:
             providers={"claude-1": "anthropic", "codex-1": "openai"},
         )
         rfile = ws / ".loom" / "tokens" / ".ranking"
-        rfile.write_text("codex-1|\nclaude-1|\n", encoding="utf-8")
+        payload = {
+            "ranked_at": "2026-01-01T00:00:00Z",
+            "accounts": [
+                {"name": "codex-1", "status": "", "provider": "openai"},
+                {"name": "claude-1", "status": "", "provider": "anthropic"},
+            ],
+        }
+        rfile.write_text(json.dumps(payload), encoding="utf-8")
         sel = select_token(ws)
         assert sel.name == "claude-1"
         assert sel.mode == "ranked"

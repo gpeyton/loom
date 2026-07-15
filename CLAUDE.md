@@ -450,7 +450,7 @@ For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tok
 
 Three tiers, falling through to the next when the current tier yields nothing:
 
-1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status`, refreshed every <10 min). Picks the first non-`exhausted`/non-`blocked` token.
+1. **Ranking** — `.loom/tokens/.ranking` (JSON written by `check.py`'s `write_ranking_atomic()`: `{"ranked_at": ..., "accounts": [{"name", "status", ...}, ...]}`, already sorted best-first; refreshed every <10 min). Picks the first non-`exhausted`/non-`blocked` account in `accounts` order.
 2. **Allowlist** — `.loom/tokens/.allowlist` (one name per line). Random pick from allowed accounts.
 3. **Random** — uniform pick from all `*.token` files.
 
