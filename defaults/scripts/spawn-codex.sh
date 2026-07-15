@@ -92,6 +92,9 @@
 #   and Codex uses its own default (sandboxed, approval-gated) mode — this
 #   part is unchanged.
 #
+#   Full trust-boundary rationale (why full autonomy is the default, and
+#   what LOOM_CODEX_SAFE=1 restores): see `.codex/GUARDRAIL-PARITY.md`.
+#
 # Behavior on missing binary:
 #   When `codex` is not on PATH, exits 78 (EX_CONFIG) with an install hint,
 #   matching spawn-worker.sh's / spawn-claude.sh's EX_CONFIG convention for

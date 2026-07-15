@@ -1,91 +1,133 @@
-# Codex Guardrail Parity
+# Codex Autonomy and Trust Boundary
 
-**Epic #1 (dual-runtime worker support), Phase 3 (#20).**
+**Epic #30 (Codex full-autonomy default), Phase 1 (#33).** Supersedes the
+original hook-parity framing shipped in Epic #1, Phase 3 (#20) — see
+"History" at the bottom for what changed and why.
 
-Loom's safety guardrails under Claude Code are **PreToolUse / UserPromptSubmit
-hooks** wired in [`.claude/settings.json`](../../.claude/settings.json) to
-scripts under [`.loom/hooks/`](../../.loom/hooks/). Those hooks speak the Claude
-Code hooks wire protocol (JSON on stdin → a decision JSON on stdout) and depend
-on Claude Code's hook-firing semantics. **Codex has no hooks system**, so those
-guards *silently do not fire* under a Codex worker — a correctness/safety
-problem, not a cosmetic one.
+## The short version
 
-This document is the honest, hook-by-hook map of each Claude guardrail to its
-Codex status: **covered**, **partial**, or **no-equivalent**. Honesty over
-false parity — a documented gap is acceptable; a silent one is not.
+Loom-spawned Codex workers run with **full, unattended authority** by
+default: no filesystem sandbox, no outbound-network restriction, no
+approval prompts (`sandbox_mode = "danger-full-access"`,
+`approval_policy = "never"` in [`config.toml`](./config.toml);
+`--dangerously-bypass-approvals-and-sandbox` in
+[`spawn-codex.sh`](../scripts/spawn-codex.sh)).
 
-Out of scope: building a Codex hooks system (Codex does not support one; it is
-not Loom's job to invent it) and the Codex sweep orchestration itself.
+**This is not a new risk class.** Loom's Claude Code path has run this way
+since before Codex support existed — the Loom default for Claude workers is
+`--dangerously-skip-permissions`, which runs Claude non-interactively with
+full tool access (Claude's PreToolUse hooks still fire under that flag, but
+they are advisory guardrails layered on top of an already-unattended agent,
+not a sandbox boundary the agent cannot cross). Epic #30 makes Codex match
+that same posture instead of defaulting to a narrower one. **Parity, not a
+new exposure.**
+
+**The trust decision was already made when you installed Loom and enabled
+autonomous workers.** Only install Loom, and only enable Codex workers, in
+repositories and execution environments you trust with unattended write
+access — the same bar that already applies to enabling autonomous Claude
+workers. Codex's sandbox is not, and was never meant to be, a substitute for
+that trust decision. Treat a Loom-managed Codex worker the same way you'd
+treat a Loom-managed Claude worker: it can read, write, execute, and push
+anything the host process can.
+
+Out of scope: building a Codex hooks system (Codex does not support one; it
+is not Loom's job to invent one) and the Codex sweep orchestration itself.
 
 ---
 
-## How Codex enforces safety instead
+## Opting into the old sandboxed posture: `LOOM_CODEX_SAFE=1`
 
-Codex has no per-tool-call hook interception. Its safety model is two native,
+Operators who want the pre-#30 behavior — Codex confined to
+`workspace-write`, no outbound network, `on-request` approvals — can restore
+it per-invocation by setting `LOOM_CODEX_SAFE=1` in the environment before
+spawning a Codex worker. That flips `spawn-codex.sh`'s mapping of Loom's
+skip-permissions convention from the bypass-everything flag to `--full-auto`,
+and correspondingly makes Codex honor `config.toml`'s
+`[sandbox_workspace_write]` table (see the comment on that table — Codex
+only reads it when `sandbox_mode = "workspace-write"`, so it is otherwise
+inert).
+
+`LOOM_CODEX_UNSAFE=1` is kept as a deprecated no-op alias for the *new*
+default (full access) for one transition release; it warns and points here.
+`LOOM_CODEX_SAFE=1` always wins if both are set.
+
+The rest of this document describes what `LOOM_CODEX_SAFE=1` restores —
+i.e., the guardrail posture that used to be the unconditional default before
+#33.
+
+---
+
+## What `LOOM_CODEX_SAFE=1` restores
+
+With `LOOM_CODEX_SAFE=1` set, Codex runs under `--full-auto`
+(`workspace-write` + `network_access = false` + `on-request`). Codex has no
+per-tool-call hook interception the way Claude Code does — Loom's Claude
+guardrails are **PreToolUse / UserPromptSubmit hooks** wired in
+[`.claude/settings.json`](../../.claude/settings.json) to scripts under
+[`.loom/hooks/`](../../.loom/hooks/), and those hooks simply do not exist as
+a concept under Codex. Safe mode's protection instead comes from two native,
 OS-level layers configured in [`config.toml`](./config.toml) (or via CLI
-flags), plus the AGENTS.md context it reads natively:
+flags), plus the `AGENTS.md` context Codex reads natively:
 
-| Codex mechanism | What it does | Loom default |
+| Codex mechanism | What it does | `LOOM_CODEX_SAFE=1` value |
 |-----------------|--------------|--------------|
-| `sandbox_mode` | Filesystem/network confinement. Values: `read-only`, `workspace-write`, `danger-full-access`. | `workspace-write` |
-| `[sandbox_workspace_write] network_access` | Outbound network from inside the sandbox. Default off. | `false` |
-| `approval_policy` | When Codex pauses to ask a human before escalating. Values: `untrusted`, `on-request`, `never` (`on-failure` is deprecated). | `on-request` |
-| `AGENTS.md` | Repository instructions discovered by ancestor traversal (runtime-neutral). | [`.loom/AGENTS.md`](../.loom/AGENTS.md) |
-
-Loom's dispatch surfaces set this posture consistently:
-
-- **[`config.toml`](./config.toml)** (this directory, shipped by #16) sets the
-  safest-functional default: `workspace-write` + `network_access = false` +
-  `on-request`.
-- **[`spawn-codex.sh`](../scripts/spawn-codex.sh)** (#15) maps Loom's
-  `--dangerously-skip-permissions` convention to `--full-auto`
-  (== `workspace-write` + `on-request`), never to fewer guards. The
-  bypass-everything flag (`--dangerously-bypass-approvals-and-sandbox` ==
-  `danger-full-access` + `never`) is gated behind **both** the skip-permissions
-  convention **and** an explicit `LOOM_CODEX_UNSAFE=1` opt-in.
-- **CI** ([`.github/workflows/loom-role.yml`](../../.github/workflows/loom-role.yml),
-  #14) pins `codex exec … --sandbox workspace-write` with no bypass flag.
-
-**No Loom dispatch path silently drops below the Claude guarantee.** The only
-sub-Claude posture is reached by explicitly setting `LOOM_CODEX_UNSAFE=1`.
+| `sandbox_mode` | Filesystem/network confinement. Values: `read-only`, `workspace-write`, `danger-full-access`. | `workspace-write` (via `--full-auto`) |
+| `[sandbox_workspace_write] network_access` | Outbound network from inside the sandbox. | `false` |
+| `approval_policy` | When Codex pauses to ask a human before escalating. Values: `untrusted`, `on-request`, `never` (`on-failure` is deprecated). | `on-request` (via `--full-auto`) |
+| `AGENTS.md` | Repository instructions discovered by ancestor traversal (runtime-neutral). | [`.loom/AGENTS.md`](../.loom/AGENTS.md) — always active, independent of sandbox mode |
 
 ### The load-bearing caveat: non-interactive approvals are a no-op
 
-`approval_policy` only guards when a **human** is present to answer the prompt.
-Loom automation runs `codex exec` (and `spawn-codex.sh -p …`) **non-interactively**
-— no human, so an `on-request` approval cannot be granted and effectively does
-not gate anything. Codex's own guidance is to use `never` for non-interactive
-runs. **Therefore, for Loom's automated Codex workers the SANDBOX is the
-load-bearing guard, not the approval policy.** `sandbox_mode = "workspace-write"`
-and `network_access = false` are what actually provide guardrail parity in
-automation; `approval_policy` matters chiefly for interactive `codex` sessions.
+`approval_policy` only guards when a **human** is present to answer the
+prompt. Loom automation runs `codex exec` (and `spawn-codex.sh -p …`)
+**non-interactively** — no human, so an `on-request` approval cannot be
+granted and effectively does not gate anything even in safe mode. Codex's
+own guidance is to use `never` for non-interactive runs. **Therefore, even
+under `LOOM_CODEX_SAFE=1`, the SANDBOX is the load-bearing guard for
+unattended Codex workers, not the approval policy.** `sandbox_mode =
+"workspace-write"` and `network_access = false` are what actually restrict
+an automated safe-mode worker; `approval_policy` only matters for
+interactive `codex` sessions.
 
 ---
 
-## Parity table
+## Hook-by-hook classification (what safe mode covers vs. doesn't)
 
-| Claude hook (`.loom/hooks/`) | Wired in `.claude/settings.json` | Protection it provides | Codex status | How Codex covers it (or why it can't) |
+This table is a reference for evaluating `LOOM_CODEX_SAFE=1`'s sandbox
+against the individual Claude PreToolUse/UserPromptSubmit hooks it has no
+literal equivalent for. It is **not** a description of the full-autonomy
+default — read it as "if I opt into safe mode, what do I get back?"
+
+| Claude hook (`.loom/hooks/`) | Wired in `.claude/settings.json` | Protection it provides | Safe-mode (`LOOM_CODEX_SAFE=1`) status | How safe mode covers it (or why it can't) |
 |------------------------------|----------------------------------|------------------------|--------------|----------------------------------------|
 | `guard-destructive.sh` | `PreToolUse` on `Bash` | Blocks catastrophic Bash (`rm -rf /`, force-push to main, `curl … \| sh`, cloud-CLI destruction, `DROP DATABASE`, `DELETE` w/o `WHERE`), asks on borderline commands, blocks `rm` outside repo, nudges `gh pr merge` → `merge-pr.sh`, blocks `pip install -e` in worktrees | **partial** | `workspace-write` blocks `rm`/writes outside the workspace; `network_access = false` blocks `curl \| sh` and cloud-CLI destruction (no network to reach). **Not covered:** command-pattern semantics (e.g. `DROP DATABASE` against a reachable DB), the `gh pr merge` → `merge-pr.sh` nudge, the `pip install -e` worktree guard, and the granular allow/ask/deny decisions. |
 | `guard-worktree-paths.sh` | `PreToolUse` on `Edit\|Write` | Confines `Edit`/`Write` to `LOOM_WORKTREE_PATH`; blocks a builder escaping its worktree into the main checkout (#2441) | **partial** | `workspace-write` confines writes to the **workspace root**, a coarser boundary. It blocks writes outside the repo, but does **not** enforce the per-worktree boundary — a Codex worker could still write elsewhere *within* the same workspace root (cross-worktree writes are not blocked). |
 | `skill-router.sh` | `UserPromptSubmit` | Injects an agent routing table + `AGENT_ROUTE` suggestion per prompt (opt-in; only when `.loom/config/skill-routes.json` exists) | **no-equivalent** | Context injection, not a safety boundary. Codex has no `UserPromptSubmit` hook. Partially mitigated by [`AGENTS.md`](../.loom/AGENTS.md) (static workflow) and the Codex prompt shims that name each role. Dynamic per-prompt routing has no Codex equivalent. Acceptable gap (informational only). |
 | `methodology-inject.sh` | *(present in `.loom/hooks/` but NOT wired in this repo's `.claude/settings.json`)* | Injects universal/role/topic context from `.loom/context/` per prompt (opt-in; only when `.loom/context/` exists) | **partial** | Static "universal" project context is achievable via `AGENTS.md`, which Codex reads natively. Dynamic role/topic keyword-matched injection has **no** Codex equivalent. Context enrichment, not a safety boundary — the gap is acceptable. |
-| `post-worktree.sh` | *(not a `settings.json` hook — invoked by `worktree.sh`)* | Copies the `loom-daemon` binary into a new worktree after creation | **covered** | Runtime-neutral: `worktree.sh` calls it regardless of which agent runtime is driving, so it fires identically for a Codex worker. Not a Claude-Code-specific hook. |
+| `post-worktree.sh` | *(not a `settings.json` hook — invoked by `worktree.sh`)* | Copies the `loom-daemon` binary into a new worktree after creation | **covered** | Runtime-neutral: `worktree.sh` calls it regardless of which agent runtime is driving, so it fires identically for a Codex worker, in safe mode or full-access mode alike. Not a Claude-Code-specific hook. |
 
-**Summary:** the two *safety* guardrails (`guard-destructive`,
-`guard-worktree-paths`) are **partial** under Codex — the sandbox covers the
-filesystem/network blast radius but not command-pattern semantics or the
-per-worktree boundary. The two *context-injection* hooks (`skill-router`,
-`methodology-inject`) are **no-equivalent / partial** — not safety boundaries,
-so the gaps are acceptable and partly mitigated by `AGENTS.md`. `post-worktree`
-is **covered** (runtime-neutral).
+**Summary:** even at its most restrictive (`LOOM_CODEX_SAFE=1`), the two
+*safety* guardrails (`guard-destructive`, `guard-worktree-paths`) are only
+**partial** under Codex — the sandbox covers the filesystem/network blast
+radius but not command-pattern semantics or the per-worktree boundary. The
+two *context-injection* hooks (`skill-router`, `methodology-inject`) are
+**no-equivalent / partial** — not safety boundaries, so the gaps are
+acceptable and partly mitigated by `AGENTS.md`. `post-worktree` is
+**covered** (runtime-neutral, unaffected by sandbox mode).
+
+Under the **default** (full-access) posture, none of the above applies:
+there is no sandbox, so every row's "partial" coverage is also absent. The
+default relies entirely on the trust-boundary decision described at the top
+of this document, not on any technical guard.
 
 ---
 
-## Residual gaps (known, documented, acceptable)
+## Residual gaps in safe mode (known, documented, acceptable)
 
-These are the deltas where Codex provides **less** than the Claude hooks. None
-is a silent gap; each is a conscious trade-off pending a richer Codex surface.
+These are the deltas where even `LOOM_CODEX_SAFE=1` provides less than the
+Claude hooks. None is a silent gap; each is a conscious trade-off pending a
+richer Codex surface.
 
 1. **Command-pattern blocking.** Codex cannot pattern-match a specific
    dangerous command (`DROP DATABASE`, `DELETE` without `WHERE`, service
@@ -106,8 +148,23 @@ is a silent gap; each is a conscious trade-off pending a richer Codex surface.
    dynamic routing and role/topic context have no Codex equivalent. Static
    equivalents live in `AGENTS.md`.
 5. **Approvals in automation.** As noted above, `approval_policy` does not gate
-   non-interactive `codex exec` runs. The sandbox is the only enforced guard in
-   automation.
+   non-interactive `codex exec` runs even in safe mode. The sandbox is the
+   only enforced guard in automation.
+
+---
+
+## History
+
+- **Epic #1, Phase 3 (#20)**: introduced Codex support with a
+  sandboxed-by-default posture (`workspace-write` + `network_access = false`
+  + `on-request`) and this document as a hook-by-hook parity table framed
+  around "what Codex covers of the Claude hooks by default."
+- **Epic #30, Phase 1 (#31, #33)**: inverted the default. `spawn-codex.sh`'s
+  skip-permissions mapping now targets full autonomy
+  (`--dangerously-bypass-approvals-and-sandbox`) unless `LOOM_CODEX_SAFE=1`
+  opts back into the old sandboxed behavior. This document was rewritten
+  (#33) from a parity table into the trust-boundary statement above, with
+  the original table preserved as "what safe mode restores."
 
 ---
 
@@ -116,7 +173,9 @@ is a silent gap; each is a conscious trade-off pending a richer Codex surface.
 - Codex config reference (sandbox/approval keys): <https://developers.openai.com/codex/config-reference>
 - Codex sandboxing concepts: <https://developers.openai.com/codex/concepts/sandboxing>
 - Loom Codex config: [`config.toml`](./config.toml)
-- Loom Codex spawn wrapper (#15): [`../scripts/spawn-codex.sh`](../scripts/spawn-codex.sh)
-- Loom Codex AGENTS.md (#8): [`../.loom/AGENTS.md`](../.loom/AGENTS.md)
-- CI support-role workflow (#14): [`../../.github/workflows/loom-role.yml`](../../.github/workflows/loom-role.yml)
+- Loom Codex spawn wrapper: [`../scripts/spawn-codex.sh`](../scripts/spawn-codex.sh)
+- Loom Codex AGENTS.md: [`../.loom/AGENTS.md`](../.loom/AGENTS.md)
+- CI support-role workflow: [`../../.github/workflows/loom-role.yml`](../../.github/workflows/loom-role.yml)
 - Claude hooks: [`../../.loom/hooks/`](../../.loom/hooks/), wired in [`.claude/settings.json`](../../.claude/settings.json)
+- Epic #30 (Codex full-autonomy default), Phase 1 issue: #33
+- Permissions-inversion PR (Phase 1 part A): #31 / PR #39
