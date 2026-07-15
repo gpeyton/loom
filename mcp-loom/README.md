@@ -1,6 +1,6 @@
 # @loom/mcp - Unified Loom MCP Server
 
-A unified Model Context Protocol (MCP) server that provides programmatic control over Loom for Claude Code integration.
+A unified Model Context Protocol (MCP) server that provides programmatic control over Loom. It is a **standard MCP server**, so any MCP-capable client can consume it — both the **Claude Code** and **OpenAI Codex CLI** worker runtimes are supported. The `.mcp.json` example below is the Claude Code form; Codex consumes the same server from a project-scoped `.codex/config.toml` entry (see [Codex configuration](#codex-configuration) below).
 
 ## Installation
 
@@ -34,6 +34,23 @@ Add to your MCP settings (`.mcp.json` or Claude Desktop config):
 |----------|-------------|---------|
 | `LOOM_WORKSPACE` | Path to the Loom workspace | `~/GitHub/loom` |
 | `LOOM_SOCKET_PATH` | Path to daemon socket | `~/.loom/loom-daemon.sock` |
+
+### Codex configuration
+
+The Codex CLI reads MCP servers from a project-scoped `.codex/config.toml`
+(loaded only for projects you have marked **trusted** in Codex). Rather than
+hand-writing the TOML, generate the `[mcp_servers.loom]` entry from the same
+source of truth as the Claude Code `.mcp.json`:
+
+```bash
+./scripts/setup-mcp.sh --codex
+```
+
+This writes an idempotent, absolute-path `[mcp_servers.loom]` block into
+`.codex/config.toml`. The underlying server is identical to the Claude Code
+configuration above — only the client-side config format differs. See
+[Using Codex with Loom](../docs/guides/getting-started.md#using-codex-with-loom)
+for the full Codex setup (project trust, prompt shims, and the safety model).
 
 ## Available Tools (19 total)
 

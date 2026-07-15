@@ -9,6 +9,8 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. Coordination itself — labels, worktrees, the sweep lifecycle, merge scripts — is runtime-neutral: it works the same whether the worker reading this file is Claude Code or another agent runtime (e.g. OpenAI Codex CLI) that discovers repository instructions via `AGENTS.md` ancestor traversal.
 
+**Supported worker runtimes: Claude Code and OpenAI Codex CLI.** These are Loom's two co-equal worker runtimes. This `AGENTS.md` is the Codex-facing counterpart of `CLAUDE.md` — both describe the same runtime-neutral coordination mechanics. For Codex setup (project trust, `.codex/config.toml`, prompt shims, `setup-mcp.sh --codex`), see the getting-started guide's "Using Codex with Loom" section; for the Claude-hooks vs. Codex-sandbox/approval safety mapping, see the guardrail-parity doc (forthcoming — issue #20).
+
 **Loom Repository**: https://github.com/rjwalters/loom
 
 **Dual-runtime status**: as of this Loom version, Claude Code is the only runtime with first-class dispatch support (slash commands, MCP tools, hooks — see "Claude Code only today" callouts below). This file exists so that any AGENTS.md-aware runtime can at least discover the label workflow, worktree rules, and merge conventions used by this repository. Runtime-specific dispatch surfaces will grow in future phases; treat everything under "Claude Code only today" as not-yet-portable rather than permanently Claude-exclusive.

@@ -9,6 +9,8 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It supports manual coordination (Manual Orchestration Mode), continuous autonomous orchestration via the Rust `loom-daemon` binary (MCP-level dispatch + pub/sub + monitoring), and GitHub Actions cron schedules for periodic support roles.
 
+**Supported worker runtimes: Claude Code and OpenAI Codex CLI.** Loom supports two co-equal worker runtimes — [Claude Code](https://claude.com/claude-code) and the [OpenAI Codex CLI](https://developers.openai.com/codex). The coordination layer (labels, worktrees, the sweep lifecycle, merge scripts) is runtime-neutral and behaves identically on either. Per-runtime setup differs: Claude Code reads this `CLAUDE.md` and discovers roles as slash commands under `.claude/commands/loom/`; Codex reads the companion `AGENTS.md` context file and loads roles from a project-scoped `.codex/` config. See the getting-started guide's "Using Codex with Loom" section for Codex setup (project trust, `.codex/config.toml`, prompt shims, MCP config) and the guardrail-parity doc (forthcoming — issue #20) for the Claude-hooks vs. Codex-sandbox safety mapping.
+
 **Loom Repository**: https://github.com/rjwalters/loom
 
 **Supported Forges**: GitHub (full support), Gitea (supported via forge abstraction layer). Forge type is auto-detected from your git remote URL. For Gitea, set `GITEA_TOKEN` or `FORGE_TOKEN` with an API token from your instance's `/user/settings/applications` page.
