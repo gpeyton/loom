@@ -1,11 +1,18 @@
 //! Repository scaffolding setup
 //!
-//! Sets up CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ directories.
+//! Sets up CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, and .github/
+//! directories.
 //!
 //! `defaults/.codex/` ships as of dual-runtime Phase 2 (epic #1, issue #11):
 //! a project-scoped OpenAI Codex CLI `config.toml` (MCP server entry) plus
 //! thin role prompt shims under `prompts/`. The copy call below remains a
 //! silent no-op for defaults trees without a `.codex/` directory.
+//!
+//! `defaults/.agents/` ships as of Epic #30 Phase 2 (issue #35): the `$loom`
+//! / `$loom-sweep` Codex skills plus `.codex/agents/loom-<role>.toml` custom
+//! agents, replacing `.codex/prompts/*` as the documented Codex onboarding
+//! path during a one-release transition. Same silent-no-op guard as
+//! `.codex/`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -896,6 +903,18 @@ pub fn setup_repository_scaffolding(
         &defaults_path.join(".codex"),
         &workspace_path.join(".codex"),
         ".codex",
+        report,
+    )?;
+
+    // Copy .agents/ directory (Codex skills — `$loom` / `$loom-sweep`,
+    // replacing `.codex/prompts/*` as the documented Codex onboarding path;
+    // Epic #30 Phase 2, issue #35). Mirrors the `.codex/` copy above — the
+    // `copy_directory` closure's `if src.exists()` guard keeps this a
+    // silent no-op for defaults trees without an `.agents/` directory.
+    copy_directory(
+        &defaults_path.join(".agents"),
+        &workspace_path.join(".agents"),
+        ".agents",
         report,
     )?;
 
@@ -2038,6 +2057,113 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         assert!(report2
             .preserved
             .contains(&".codex/config.toml".to_string()));
+    }
+
+    #[test]
+    fn test_agents_directory_copy_is_silent_noop_when_absent() {
+        // Issue #35 (Epic #30 Phase 2): mirrors
+        // test_codex_directory_copy_is_silent_noop_when_absent — scaffolding
+        // must stay a silent no-op for defaults trees WITHOUT an `.agents/`
+        // directory (older Loom versions, or a defaults tree that hasn't
+        // been upgraded yet).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(&defaults).unwrap();
+        // Deliberately do NOT create defaults/.agents/.
+        assert!(!defaults.join(".agents").exists());
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(workspace, &defaults, false, &mut report);
+        assert!(result.is_ok(), ".agents/ absence must not error: {result:?}");
+
+        assert!(
+            !workspace.join(".agents").exists(),
+            ".agents/ must not be created in the workspace when defaults/.agents/ is absent"
+        );
+        assert!(
+            !report
+                .added
+                .iter()
+                .chain(report.updated.iter())
+                .chain(report.preserved.iter())
+                .any(|p| p.contains(".agents")),
+            "no report entries should reference .agents when the source directory is absent"
+        );
+    }
+
+    #[test]
+    fn test_agents_directory_copied_when_present() {
+        // Issue #35 (Epic #30 Phase 2): the `$loom` / `$loom-sweep` Codex
+        // skills under `defaults/.agents/skills/` must be materialized in
+        // the workspace on install — complementing the absent-is-noop test
+        // above, mirroring test_codex_directory_copied_when_present.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".agents").join("skills").join("loom")).unwrap();
+        fs::write(
+            defaults
+                .join(".agents")
+                .join("skills")
+                .join("loom")
+                .join("SKILL.md"),
+            "loom skill",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // Fresh install: the skill file is copied verbatim and reported as added.
+        assert_eq!(
+            fs::read_to_string(
+                workspace
+                    .join(".agents")
+                    .join("skills")
+                    .join("loom")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            "loom skill"
+        );
+        assert!(report
+            .added
+            .contains(&".agents/skills/loom/SKILL.md".to_string()));
+
+        // Reinstall without force (merge mode): existing files preserved,
+        // so re-install is idempotent and never clobbers a user-customized
+        // skill.
+        fs::write(
+            workspace
+                .join(".agents")
+                .join("skills")
+                .join("loom")
+                .join("SKILL.md"),
+            "user-customized",
+        )
+        .unwrap();
+        let mut report2 = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report2).unwrap();
+        assert_eq!(
+            fs::read_to_string(
+                workspace
+                    .join(".agents")
+                    .join("skills")
+                    .join("loom")
+                    .join("SKILL.md")
+            )
+            .unwrap(),
+            "user-customized",
+            "merge-mode reinstall must preserve a user-customized .agents/skills/loom/SKILL.md"
+        );
+        assert!(report2
+            .preserved
+            .contains(&".agents/skills/loom/SKILL.md".to_string()));
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # Loom prompts for OpenAI Codex CLI
 
+> **Deprecated (issue #35) — use the `$loom` / `$loom-sweep` skills instead.**
+> OpenAI's current Codex guidance deprecates custom prompts in favor of
+> **skills**. Loom now ships `../agents/skills/loom/SKILL.md` and
+> `../agents/skills/loom-sweep/SKILL.md`, the documented replacement entry
+> points, alongside a matching custom agent per role under
+> `../agents/loom-<role>.toml`. The prompts below still work and will
+> continue to during a one-release transition, but new setups should start
+> with the skills, not this directory.
+
 Thin shim prompts that expose the core Loom role entry points as Codex
 slash commands. Each shim references the canonical role definition under
 `.loom/roles/` (or the sweep skill file) rather than duplicating its
@@ -41,7 +50,9 @@ Arguments flow into the shim via the `$ARGUMENTS` placeholder
   sequentially in one session instead of dispatching subagents
   (Epic #1 Phase 3).
 - **Prompts vs skills**: Codex marks custom prompts as deprecated in
-  favor of skills. The shims still work; a skills port is Phase 3 scope.
+  favor of skills. The shims still work during the transition window, but
+  the skills port (issue #35) has landed — see the deprecation notice at
+  the top of this file for the new entry points.
 
 The MCP server that these roles use for Loom coordination is configured
 in `.codex/config.toml` (see its header for setup).

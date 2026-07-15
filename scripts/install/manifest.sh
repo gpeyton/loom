@@ -70,6 +70,7 @@ _read_loom_internal_skip_list() {
 #   .loom/X               → .loom/X         (literal)
 #   .claude/X             → .claude/X       (literal)
 #   .codex/X              → .codex/X        (literal)
+#   .agents/X             → .agents/X       (literal)
 #   .github/X             → .github/X       (literal)
 #   CLAUDE.md             → CLAUDE.md
 #   AGENTS.md             → AGENTS.md
@@ -170,7 +171,7 @@ _emit_installed_files_manifest() {
       .loom/*)
         target_path="${rel_path}"
         ;;
-      .claude/*|.codex/*|.github/*)
+      .claude/*|.codex/*|.agents/*|.github/*)
         target_path="${rel_path}"
         ;;
       CLAUDE.md|AGENTS.md|loom.sh)
