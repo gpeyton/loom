@@ -721,6 +721,17 @@ or `/loom-sweep 42`. Each shim reads the same canonical
   [`defaults/.codex/GUARDRAIL-PARITY.md`](../../defaults/.codex/GUARDRAIL-PARITY.md),
   including the residual gaps that remain even when `LOOM_CODEX_SAFE=1` is
   set.
+- **Supervising a Codex wave requires patience, not polling** (issue #52):
+  log silence from a live child is never grounds for cancelling it — there
+  is no implicit inactivity timeout anywhere in Loom's Codex path. The
+  default operator loop is a blocking join (start the wave, wait for it to
+  return); `defaults/scripts/spawn-codex-wave.sh --status` gives a
+  non-destructive, structured read of in-flight children for situational
+  awareness without polling aggressively. A parent must never take over a
+  live Builder's worktree. See `.claude/commands/loom/sweep.md`'s "Codex
+  Child Supervision Contract" section for the full patience contract and
+  cancellation-outcome taxonomy (`cancelled_by_operator` /
+  `cancelled_by_parent` / `cancelled_by_deadline`, distinct from `failed`).
 
 See the [Epic #30](https://github.com/gpeyton/loom/issues/30) tracker for
 the dual-runtime full-autonomy work this section reflects.

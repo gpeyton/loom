@@ -153,6 +153,34 @@ richer Codex surface.
 
 ---
 
+## Supervision & cancellation guardrails (issue #52)
+
+Sandbox/approval posture (everything above) governs what a Codex worker is
+*permitted to touch*. This section covers a related but distinct guardrail:
+what a Codex **supervisor** (a root/parent session running `spawn-codex-wave.sh`
+or a sequential Codex sweep) is permitted to do to a **child it is watching**.
+Two real Loom 0.10.6 incidents (#51) showed a supervising Codex session
+mistake log silence for a stall, `SIGINT` a live Builder child, declare it
+"failed," and take over Builder work itself — none of which the sandbox
+posture above was ever meant to prevent, because it is a supervision-loop
+defect, not a permissions defect.
+
+The full contract lives in `.claude/commands/loom/sweep.md`'s "Codex Child
+Supervision Contract" section (issue #52) and is binding on every Codex
+supervision surface. The guardrail-relevant summary:
+
+| Guardrail | Statement | No-equivalent gap? |
+|---|---|---|
+| No silence-based cancellation | Log inactivity is never grounds for `kill` / interrupt / replacement. Cancellation requires an explicit user stop, a separately configured (never silence-inferred) hard deadline, or a confirmed unrecoverable failure. | **No native enforcement** — same class of gap as items 3–4 above (a documented convention, not an OS boundary). Codex has no supervisor-loop primitive to police this mechanically; the contract is enforced by documentation + `spawn-codex-wave.sh`'s own implementation (no inactivity timeout exists in its code at all). |
+| Non-destructive, backed-off status checks | The default operator loop is a blocking join; optional polling (`spawn-codex-wave.sh --status`) uses a bounded, increasing backoff and never mutates or cancels. | Same as above — a convention `spawn-codex-wave.sh --status` makes easy to follow correctly (it is read-only by construction), but nothing prevents a supervisor from ignoring it and polling aggressively anyway. |
+| Worktree non-interference | A parent/root must not enter or edit a Builder-owned worktree (`.loom/worktrees/issue-N`) while that Builder's child is alive. | **No native enforcement for Codex.** Claude's equivalent (`guard-worktree-paths.sh`) is a PreToolUse hook scoped to a *builder's own* worktree boundary from the inside; Codex has no hook system at all (see the hook-by-hook table above), so there is no mechanical guard preventing a Codex *supervisor* session from editing a *different* session's worktree. This is enforced entirely by the contract and by operator discipline — the same trust-boundary posture this whole document already asks you to accept for Codex's full-autonomy default. |
+| Cancellation ≠ failure | A parent-initiated stop is reported as `cancelled_by_operator` / `cancelled_by_parent` / `cancelled_by_deadline`, never as `failed`. | Implemented mechanically in `spawn-codex-wave.sh` (traps `INT`/`TERM`, tags the resulting outcome, never folds it into the generic failed-issues count) — this one **is** enforced in code, not just documented. |
+| Native-agent interrupt mapping | If/when Loom adopts native Codex collaboration agents (`spawn_agent` / `interrupt_agent`), `interrupt_agent` must map to a cancellation outcome, never `failed`, and must not replace/take over a still-alive target. | Forward-looking only — Loom does not reference these primitives today. Tracked in issue #54 (native-agent backend policy), which inherits this contract's outcome taxonomy rather than defining its own. |
+
+**Bottom line**: unlike the sandbox/approval rows above (which are enforced by Codex's own process boundary), the supervision guardrails in this section are enforced by (a) `spawn-codex-wave.sh`'s implementation for the mechanical parts it can own (no inactivity timeout, signal-provenance tagging, a `--status` read path that is read-only by construction), and (b) documentation + operator/agent discipline for the parts no current Codex primitive can mechanically block (worktree non-interference across sessions, refusing to poll aggressively). Treat this the same way you treat the rest of Codex's trust boundary: know where the enforced edge is, and don't rely on an unenforced convention as if it were a sandbox.
+
+---
+
 ## History
 
 - **Epic #1, Phase 3 (#20)**: introduced Codex support with a
