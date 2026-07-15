@@ -367,9 +367,6 @@ git -C "$T6" commit -m "Add app.js and README.md" --quiet
 echo "# My Project (locally modified, not staged)" >> "$T6/README.md"
 echo "another unrelated untracked file" > "$T6/scratch-notes.txt"
 
-STAGED_BEFORE=$(git -C "$T6" diff --cached --name-only)
-UNTRACKED_BEFORE=$(git -C "$T6" status --porcelain --untracked-files=all | awk '{print $2}')
-
 "$UNINSTALL_SH" --yes --local "$T6" > /tmp/loom-uninstall-scope-test.log 2>&1
 UNINSTALL_EXIT=$?
 
