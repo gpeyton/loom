@@ -399,6 +399,14 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                                 println!("  AGENTS.md       - Not present (optional)");
                             }
 
+                            // .codex/ is optional (dual-runtime Phase 2, issue #11) —
+                            // absence is informational only, never an issue.
+                            if validation.has_codex_dir {
+                                println!("  .codex/         - Present");
+                            } else {
+                                println!("  .codex/         - Not present (optional)");
+                            }
+
                             if validation.has_labels_yml {
                                 println!("  .github/labels.yml - Present");
                             } else {
@@ -434,6 +442,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  CLAUDE.md       - AI context documentation (Claude Code)");
                     println!("  AGENTS.md       - AI context documentation (OpenAI Codex)");
                     println!("  .claude/        - Claude Code configuration");
+                    println!("  .codex/         - OpenAI Codex CLI configuration (config.toml + prompt shims)");
                     println!("  .github/        - GitHub labels and issue templates");
                     println!("  .gitignore      - Updated with Loom patterns");
 

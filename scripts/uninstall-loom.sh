@@ -633,6 +633,7 @@ REMOVE_DIRS=(
   ".claude/commands"
   ".claude/agents"
   ".claude"
+  ".codex/prompts"
   ".codex"
 )
 

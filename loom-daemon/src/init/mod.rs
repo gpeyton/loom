@@ -65,6 +65,10 @@ pub struct InitReport {
 }
 
 /// Validation report for self-installation mode
+///
+/// The presence flags below are independent facts about the installed
+/// tree, not a state machine — a bool-per-file is the honest shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct ValidationReport {
     /// Role definitions found
@@ -82,6 +86,12 @@ pub struct ValidationReport {
     /// issue — it is not mandatory for pre-existing installs that predate
     /// the dual-runtime work.
     pub has_agents_md: bool,
+    /// Whether a `.codex/` directory exists (dual-runtime Phase 2, issue
+    /// #11). OPTIONAL like `has_agents_md`: absence is never recorded as a
+    /// validation issue. Only a *present* `.codex/` that is missing its
+    /// `config.toml` is flagged (present-and-valid or absent, never a hard
+    /// requirement).
+    pub has_codex_dir: bool,
     /// Whether .github/labels.yml exists
     pub has_labels_yml: bool,
     /// Issues found during validation

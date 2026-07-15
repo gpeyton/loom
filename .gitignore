@@ -17,6 +17,11 @@ coverage/
 # MCP configuration (generated locally by setup-mcp.sh)
 .mcp.json
 
+# Codex CLI MCP configuration at the repo root (generated locally by
+# setup-mcp.sh --codex). Rooted pattern on purpose: the shipped template
+# defaults/.codex/config.toml stays tracked.
+/.codex/config.toml
+
 # OS
 .DS_Store
 Thumbs.db
