@@ -22,6 +22,13 @@ pub enum Request {
         working_dir: Option<String>,
         role: Option<String>,
         instance_number: Option<u32>,
+        /// Worker runtime for this terminal (issue #21, epic #1). Selects the
+        /// per-worker-type environment preparer: `"codex"` uses the Codex
+        /// preparer (`CODEX_HOME`), anything else (including `None`, empty, or
+        /// absent on the wire) defaults to the Claude preparer. `#[serde(default)]`
+        /// keeps pre-#21 clients — which omit the field — compatible.
+        #[serde(default)]
+        worker_type: Option<String>,
     },
     ListTerminals,
     DestroyTerminal {

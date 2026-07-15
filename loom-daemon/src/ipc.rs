@@ -200,12 +200,19 @@ fn handle_request(
             working_dir,
             role,
             instance_number,
+            worker_type,
         } => {
             let mut tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.create_terminal(&config_id, name, working_dir, role.as_ref(), instance_number)
-            {
+            match tm.create_terminal(
+                &config_id,
+                name,
+                working_dir,
+                role.as_ref(),
+                instance_number,
+                worker_type.as_deref(),
+            ) {
                 Ok(id) => Response::TerminalCreated { id },
                 Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
