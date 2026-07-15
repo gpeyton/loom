@@ -144,6 +144,23 @@ Role definitions live in `.loom/roles/*.md` and describe each worker's responsib
 
 The `.loom/tokens/` pool, `loom-tokens` CLI, and `spawn-claude.sh` wrapper described in the root `CLAUDE.md` are Claude Code OAuth-specific (**Claude Code only today**) — they rotate Claude Code credentials, not credentials for other runtimes.
 
+## Safety Guardrails (Codex vs Claude Code)
+
+Loom's Claude Code safety guardrails are PreToolUse hooks (`.loom/hooks/`) wired
+in `.claude/settings.json`. **Codex has no hooks system**, so those guards do
+not fire for a Codex worker. Their intent is mapped instead to Codex's native
+sandbox + approval posture, set safe-by-default in `.codex/config.toml`
+(`sandbox_mode = "workspace-write"`, `network_access = false`,
+`approval_policy = "on-request"`). No Loom dispatch path drops below the Claude
+guarantee without an explicit `LOOM_CODEX_UNSAFE=1` opt-in.
+
+**Important:** in non-interactive automation (`codex exec`), approvals cannot be
+answered (no human), so the **sandbox is the load-bearing guard** — keep
+destructive tooling out of the workspace and leave `network_access = false`.
+
+For the honest hook-by-hook parity map (covered / partial / no-equivalent) and
+the documented residual gaps, see `.codex/GUARDRAIL-PARITY.md`.
+
 ## Forge Authentication
 
 ### GitHub
