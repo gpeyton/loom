@@ -18,11 +18,19 @@ name: Loom Role Runner
 #   codex - installs @openai/codex and runs `codex exec "<role prompt>"`.
 #     Codex cannot resolve Claude slash commands (`/curator`, ...), so the
 #     role prompt is inlined from `.loom/roles/<role>.md`. Auth uses
-#     OPENAI_API_KEY. The sandbox is pinned to `workspace-write` (never a
-#     bypass-everything / danger flag in CI).
+#     OPENAI_API_KEY. Runs with `--dangerously-bypass-approvals-and-sandbox`
+#     (full autonomy, no approval prompts) by default, matching the claude
+#     branch's `--dangerously-skip-permissions` posture and spawn-codex.sh's
+#     full-access default (#31, epic #30 Phase 1).
 #
 # Codex default model is centralized in the `codex-model` input default
 # below - bump it there in one place.
+#
+# GITHUB_TOKEN permissions are least-privilege per role, set on each caller's
+# `uses:` job (loom-champion.yml, loom-curator.yml, etc.), not here -- the
+# permissions block below is the union upper bound this reusable workflow
+# will ever need; the caller intersects it down to what that specific role
+# actually touches (#32, epic #30 Phase 1).
 #
 # Part of Epic #1 (dual-runtime worker support), Phase 2 (#13).
 
@@ -65,9 +73,18 @@ jobs:
     runs-on: ubuntu-latest
     # timeout-minutes must live here: it cannot be set on a `uses:` caller job.
     timeout-minutes: 10
+    # Union upper bound across all five roles (curator/auditor/guide need
+    # only `issues`; judge needs only `pull-requests`; champion needs all
+    # three, including `contents` since it's the only role that pushes
+    # content -- merging an approved PR via merge-pr.sh). Each caller
+    # workflow's `uses:` job declares its own tighter `permissions:` block
+    # that intersects down to what that specific role actually touches; see
+    # loom-champion.yml / loom-curator.yml / loom-judge.yml /
+    # loom-auditor.yml / loom-guide.yml (#32, epic #30 Phase 1).
     permissions:
       issues: write
       pull-requests: write
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -127,17 +144,17 @@ jobs:
           ROLE: ${{ inputs.role }}
           CODEX_MODEL: ${{ inputs.codex-model }}
         # Codex can't resolve Claude slash commands, so inline the role prompt
-        # from the repo. Sandbox is pinned to workspace-write (the equivalent of
-        # the deprecated --full-auto flag) - never a bypass-everything flag.
-        # This posture matches the documented Codex guardrail parity level
-        # (defaults/.codex/GUARDRAIL-PARITY.md, #20): workspace-write is the
-        # load-bearing guard in non-interactive runs. Do NOT add a
-        # --dangerously-bypass-approvals-and-sandbox / danger-full-access flag
-        # here — that would silently drop CI below the Claude guarantee.
+        # from the repo. Runs with --dangerously-bypass-approvals-and-sandbox
+        # (full autonomy, no approval prompts) by default, matching the claude
+        # branch's --dangerously-skip-permissions posture above and
+        # spawn-codex.sh's full-access default (#31, epic #30 Phase 1) --
+        # unrestricted CI Codex runs are no longer below the Claude guarantee.
+        # See defaults/.codex/GUARDRAIL-PARITY.md (#20) for the guardrail
+        # mapping this posture relies on.
         run: |
           role_file=".loom/roles/${ROLE}.md"
           if [ ! -f "$role_file" ]; then
             echo "::error::Role prompt file $role_file not found; cannot inline prompt for codex runtime."
             exit 1
           fi
-          codex exec "$(cat "$role_file")" --sandbox workspace-write -m "$CODEX_MODEL"
+          codex exec "$(cat "$role_file")" --dangerously-bypass-approvals-and-sandbox -m "$CODEX_MODEL"

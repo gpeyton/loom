@@ -55,9 +55,17 @@
 #         see spawn-codex.sh's own header for the precedence chain)
 #     (e) skip-permissions flag shape: --dangerously-skip-permissions is
 #         consumed by spawn-codex.sh and mapped to a Codex permission flag
-#         (--full-auto by default; --dangerously-bypass-approvals-and-sandbox
-#         only behind LOOM_CODEX_UNSAFE=1) -- codex does not understand the
-#         Claude spelling, so it is not passed through verbatim
+#         (--dangerously-bypass-approvals-and-sandbox by default -- full
+#         autonomy, inverted in #31/epic #30 Phase 1 to match Claude's
+#         --dangerously-skip-permissions posture; --full-auto (sandboxed)
+#         only behind the LOOM_CODEX_SAFE=1 opt-out) -- codex does not
+#         understand the Claude spelling, so it is not passed through
+#         verbatim. This dispatcher never reads LOOM_CODEX_SAFE or the
+#         deprecated LOOM_CODEX_UNSAFE alias itself -- both env vars flow to
+#         spawn-codex.sh through normal process env inheritance, same as
+#         every other passthrough arg/env var this script does not name
+#         above. Do not add codex-specific permission logic here; it
+#         belongs solely in spawn-codex.sh.
 #
 # Behavior on unknown worker type:
 #   Exits 78 (EX_CONFIG) with a clear message, matching the existing

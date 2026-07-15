@@ -39,9 +39,11 @@ on:
 jobs:
   curator:
     uses: ./.github/workflows/loom-role.yml
+    # Curator only edits issues (body + labels): loom:curating/loom:curated,
+    # comments. It never touches PRs, so `pull-requests` is dropped
+    # (#32, epic #30 Phase 1 -- least-privilege GITHUB_TOKEN per role).
     permissions:
       issues: write
-      pull-requests: write
     with:
       role: curator
       runtime: ${{ inputs.runtime || 'claude' }}

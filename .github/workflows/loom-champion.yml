@@ -38,9 +38,14 @@ on:
 jobs:
   champion:
     uses: ./.github/workflows/loom-role.yml
+    # Champion is the only support role that pushes content: it merges
+    # approved PRs via merge-pr.sh, which needs `contents: write` in addition
+    # to the `issues`/`pull-requests` label + comment work it also does
+    # (#32, epic #30 Phase 1 -- least-privilege GITHUB_TOKEN per role).
     permissions:
       issues: write
       pull-requests: write
+      contents: write
     with:
       role: champion
       runtime: ${{ inputs.runtime || 'claude' }}
