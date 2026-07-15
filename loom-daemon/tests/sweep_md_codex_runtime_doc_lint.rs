@@ -1,15 +1,19 @@
 //! Doc-lint test for the Codex runtime-aware orchestration section of
-//! `defaults/.claude/commands/loom/sweep.md` (Issue #19, Phase 3 of epic #1).
+//! `defaults/.claude/commands/loom/sweep.md` (Issue #19, Phase 3 of epic #1;
+//! multi-wave fan-out resolution in Issue #24).
 //!
 //! Issue #19 documents two orchestration strategies (Claude Task-tool waves
 //! vs process-level sequential Codex) and how the worker runtime is detected.
-//! This test grep-checks the markdown at compile time so that:
+//! Issue #24 then resolved the multi-wave scope note by adding true
+//! process-level fan-out (`defaults/scripts/spawn-codex-wave.sh`) behind an
+//! opt-in gate. This test grep-checks the markdown at compile time so that:
 //!
 //! - Removing or renaming the runtime-aware section flags a CI failure.
 //! - The AC ("`sweep.md` documents both orchestration strategies and how
 //!   runtime is detected") is verifiable programmatically.
-//! - The deliberate scope narrowing (multi-wave deferred to a follow-up) and
-//!   the guardrail-parity cross-reference stay present.
+//! - The multi-wave resolution (issue #24) documents the chosen coordination
+//!   substrate, the settling discipline, and the opt-in concurrency gate —
+//!   and the guardrail-parity cross-reference (issue #20) stays present.
 //!
 //! If the section is intentionally restructured, update this test together
 //! with the markdown so the doc-lint stays in sync with the contract.
@@ -88,15 +92,11 @@ fn sweep_md_documents_codex_model_single_source_of_truth() {
     );
 }
 
-/// AC #6 + guardrail-parity: the deliberate scope narrowing (multi-wave
-/// deferred) and the #20 guardrail-parity cross-reference are present.
+/// AC #6 + guardrail-parity: the multi-wave resolution (issue #24) and the
+/// #20 guardrail-parity cross-reference are present.
 #[test]
 fn sweep_md_documents_scope_narrowing_and_guardrail_parity() {
     let content = read_sweep_md();
-    assert!(
-        content.contains("multi-wave process-level Codex orchestration is deferred"),
-        "sweep.md must explicitly document the deferred multi-wave scope (AC #6)"
-    );
     assert!(
         content.contains("#24"),
         "sweep.md must reference the multi-wave follow-up issue #24 (AC #6)"
@@ -110,4 +110,30 @@ fn sweep_md_documents_scope_narrowing_and_guardrail_parity() {
         "sweep.md must document that autonomous Codex write access stays opt-in \
          behind LOOM_CODEX_UNSAFE"
     );
+}
+
+/// Issue #24: the multi-wave process-level Codex fan-out resolution is
+/// documented — no longer "deferred", but naming the chosen substrate, the
+/// settling discipline, the opt-in concurrency gate, and the fan-out script.
+/// The stale "is deferred" wording must NOT reappear once the feature ships.
+#[test]
+fn sweep_md_documents_multi_wave_codex_resolution() {
+    let content = read_sweep_md();
+    assert!(
+        !content.contains("multi-wave process-level Codex orchestration is deferred"),
+        "sweep.md must NOT claim multi-wave Codex orchestration is still deferred — \
+         issue #24 resolved it; update this test if the section is intentionally \
+         re-deferred for some other reason"
+    );
+    for needle in [
+        "Multi-wave process-level Codex orchestration (issue #24 — resolved)",
+        "spawn-codex-wave.sh",
+        "LOOM_CODEX_MULTI_WAVE",
+        "process-level fan-out",
+    ] {
+        assert!(
+            content.contains(needle),
+            "sweep.md must document the issue #24 multi-wave resolution: missing `{needle}`"
+        );
+    }
 }

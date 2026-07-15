@@ -36,6 +36,12 @@ Codex strategy, the model-tier mapping, and the guardrail-parity gate.
   write-access Codex sweep still stays opt-in (`spawn-codex.sh` keeps
   the sandbox on unless `LOOM_CODEX_UNSAFE=1` is explicitly set) — do
   not treat it as a default even with parity in place.
-- **Multi-wave process-level Codex orchestration** (fanning out multiple
-  `codex exec` children as the analogue of `--builders-per-wave`) is a
-  deferred follow-up: **#24**. Today, multiple issues run sequentially.
+- **Multi-wave process-level Codex orchestration (issue #24, resolved)**:
+  `defaults/scripts/spawn-codex-wave.sh` fans multiple `codex exec` children
+  out as the process-level analogue of `--builders-per-wave`, one child per
+  issue in a wave, and blocks until every child in the wave has settled
+  before returning. This is opt-in behind `LOOM_CODEX_MULTI_WAVE=1`
+  (orthogonal to the `LOOM_CODEX_UNSAFE` permissions gate above) — without
+  it, multiple issues still run sequentially, one at a time, as before. See
+  the sweep skill's "Multi-wave process-level Codex orchestration" section
+  for the full substrate decision and settling-discipline rationale.
