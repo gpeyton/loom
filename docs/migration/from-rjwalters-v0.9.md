@@ -86,7 +86,6 @@ v0.9 checkout from contaminating the new build.
 
 ```bash
 cd "$HOME/.loom-engine-gpeyton"
-corepack pnpm install --frozen-lockfile
 pnpm daemon:build
 
 cd mcp-loom
@@ -203,7 +202,10 @@ Claude's `.mcp.json` entry has this shape:
 ```
 
 Merge the `loom` key into an existing `.mcp.json`; do not discard unrelated
-servers. Approve the project-scoped server when Claude first prompts.
+servers. Approve the project-scoped server when Claude first prompts. Until
+that interactive approval is granted, `claude mcp get loom` reports the server
+as `Pending approval`; that state is expected and does not mean the generated
+configuration is malformed.
 
 Codex's project `.codex/config.toml` entry is equivalent:
 
@@ -218,6 +220,12 @@ LOOM_WORKSPACE = "/path/to/consumer-repository"
 
 Trust the consumer repository in Codex, then restart both clients so they
 reload project configuration.
+
+Do not run `scripts/setup-mcp.sh --codex` and assume it configured a consumer
+repository: without a target-aware option, that script writes into the Loom
+source checkout and uses the source checkout as `LOOM_WORKSPACE`. Consumer
+configuration must point at the built server in the source checkout while
+setting `LOOM_WORKSPACE` to the consumer repository, as shown above.
 
 ## 8. Start and validate the Rust daemon
 

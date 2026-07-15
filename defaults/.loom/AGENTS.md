@@ -9,11 +9,11 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. Coordination itself — labels, worktrees, the sweep lifecycle, merge scripts — is runtime-neutral: it works the same whether the worker reading this file is Claude Code or another agent runtime (e.g. OpenAI Codex CLI) that discovers repository instructions via `AGENTS.md` ancestor traversal.
 
-**Supported worker runtimes: Claude Code and OpenAI Codex CLI.** These are Loom's two co-equal worker runtimes. This `AGENTS.md` is the Codex-facing counterpart of `CLAUDE.md` — both describe the same runtime-neutral coordination mechanics. For Codex setup (project trust, `.codex/config.toml`, prompt shims, `setup-mcp.sh --codex`), see the getting-started guide's "Using Codex with Loom" section; for the Claude-hooks vs. Codex-sandbox/approval safety mapping, see the guardrail-parity doc (forthcoming — issue #20).
+**Supported worker runtimes: Claude Code and OpenAI Codex CLI.** These are Loom's two co-equal worker runtimes. This `AGENTS.md` is the Codex-facing counterpart of `CLAUDE.md` — both describe the same runtime-neutral coordination mechanics. For Codex setup (project trust, `.codex/config.toml`, project skills, custom agents, and MCP configuration), see the getting-started guide's "Using Codex with Loom" section; for the Claude-hooks vs. Codex permission-model mapping, see `.codex/GUARDRAIL-PARITY.md`.
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
-**Dual-runtime status**: as of this Loom version, Claude Code is the only runtime with first-class dispatch support (slash commands, MCP tools, hooks — see "Claude Code only today" callouts below). This file exists so that any AGENTS.md-aware runtime can at least discover the label workflow, worktree rules, and merge conventions used by this repository. Runtime-specific dispatch surfaces will grow in future phases; treat everything under "Claude Code only today" as not-yet-portable rather than permanently Claude-exclusive.
+**Dual-runtime status**: Claude Code and Codex have runtime-specific entry points over the same coordination layer. Claude Code uses slash commands under `.claude/commands/loom/`; Codex uses the `$loom` and `$loom-sweep` project skills under `.agents/skills/` plus custom agents under `.codex/agents/`. Both can participate in the complete sweep lifecycle and use the configured Loom MCP server.
 
 ## Orchestration Architecture
 
@@ -23,12 +23,12 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 |------|-------------|---------|------|
 | Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
 | Tier 2 | `loom-daemon` (MCP) + GH Actions cron | Multi-issue dispatch + scheduled support roles | Continuous / cron |
-| Tier 1 | `/loom:sweep <issue>` | Single-issue lifecycle (Curator → Merge) | Per-issue |
+| Tier 1 | `/loom:sweep <issue>` or `$loom-sweep <issue>` | Single-issue lifecycle (Curator → Merge) | Per-issue |
 | Tier 0 | Builder, Judge, Curator, Doctor, etc. | Task execution — single focused work units | Per-task |
 
-**Claude Code only today**: `/loom:sweep <issue>` and the other slash commands (`/builder`, `/judge`, `/curator`, etc.) are Claude Code slash commands defined under `.claude/commands/loom/`. A Codex worker cannot invoke them by name; it must be told to perform the equivalent steps directly (claim the issue, create the worktree, implement, open the PR) using the workflow described below.
+**Runtime entry points**: `/loom:sweep <issue>` and the individual role slash commands are Claude Code commands defined under `.claude/commands/loom/`. Codex uses `$loom-sweep <issue>` for the same lifecycle and loads role-specific behavior from project skills/custom agents. Do not ask Codex to invoke a Claude slash command by name.
 
-**Claude Code only today**: `mcp__loom__dispatch_sweep`, `mcp__loom__list_sweeps`, and the other `mcp__loom__*` tools are exposed through Claude Code's MCP integration. They are not currently reachable from a Codex session.
+**MCP configuration**: both runtimes can launch `mcp-loom` when their project configuration points to the built server and sets `LOOM_WORKSPACE` to the consumer repository. Runtime UIs may present the tool names differently, but the underlying server and workspace must match.
 
 ## Label-Based Workflow
 
@@ -136,29 +136,29 @@ gh pr create --label "loom:review-requested"
 
 ### Workspace Configuration
 
-Configuration is stored in `.loom/config.json` (committed to git for team sharing). This file is read by the daemon and by Claude Code's terminal manager; a Codex-based runtime does not currently consume it, but it is safe to leave in place.
+Configuration is stored in `.loom/config.json` (committed to git for team sharing). The daemon and terminal manager consume this file; Codex workers also share its repository-level coordination assumptions even when role loading comes from `.agents/skills/` and `.codex/agents/`.
 
 ### Custom Roles
 
-Role definitions live in `.loom/roles/*.md` and describe each worker's responsibilities (Builder, Judge, Curator, Doctor, Champion, Architect, Hermit, Guide, Driver, Auditor). These files are plain markdown and are runtime-neutral — any agent capable of following written instructions can use them as a role brief. **Claude Code only today**: the mechanism that automatically loads a role file into a terminal (via `.loom/config.json` → `roleConfig.roleFile`) is part of the Claude Code terminal manager.
+Role definitions live in `.loom/roles/*.md` and describe each worker's responsibilities (Builder, Judge, Curator, Doctor, Champion, Architect, Hermit, Guide, Driver, Auditor). These files are plain markdown and are runtime-neutral. Claude Code loads them through slash commands/terminal role configuration; Codex uses the installed project skills and custom-agent definitions that reference the same workflow contracts.
 
 ### Multi-Account Token Pool
 
-The `.loom/tokens/` pool, `loom-tokens` CLI, and `spawn-claude.sh` wrapper described in the root `CLAUDE.md` are Claude Code OAuth-specific (**Claude Code only today**) — they rotate Claude Code credentials, not credentials for other runtimes.
+The `.loom/tokens/` pool, `loom-tokens` CLI, and `spawn-claude.sh` wrapper described in the root `CLAUDE.md` are Claude Code OAuth-specific. Codex authentication and profile rotation use `OPENAI_API_KEY`, provider-aware key pools, or ChatGPT-authenticated `CODEX_HOME` profiles through `spawn-codex.sh`; the two credential pools are not interchangeable.
 
 ## Safety Guardrails (Codex vs Claude Code)
 
 Loom's Claude Code safety guardrails are PreToolUse hooks (`.loom/hooks/`) wired
 in `.claude/settings.json`. **Codex has no hooks system**, so those guards do
-not fire for a Codex worker. Their intent is mapped instead to Codex's native
-sandbox + approval posture, set safe-by-default in `.codex/config.toml`
-(`sandbox_mode = "workspace-write"`, `network_access = false`,
-`approval_policy = "on-request"`). No Loom dispatch path drops below the Claude
-guarantee without an explicit `LOOM_CODEX_UNSAFE=1` opt-in.
+not fire for a Codex worker. Loom currently gives unattended Codex workers full
+access by default (`sandbox_mode = "danger-full-access"`,
+`approval_policy = "never"`) to match Claude's
+`--dangerously-skip-permissions` automation posture.
 
-**Important:** in non-interactive automation (`codex exec`), approvals cannot be
-answered (no human), so the **sandbox is the load-bearing guard** — keep
-destructive tooling out of the workspace and leave `network_access = false`.
+Set `LOOM_CODEX_SAFE=1` before spawning Codex workers to opt back into the
+sandboxed `--full-auto` posture (`workspace-write`, no outbound network from
+the sandbox). In non-interactive `codex exec`, approvals cannot be answered, so
+the sandbox becomes the load-bearing guard whenever safe mode is selected.
 
 For the honest hook-by-hook parity map (covered / partial / no-equivalent) and
 the documented residual gaps, see `.codex/GUARDRAIL-PARITY.md`.

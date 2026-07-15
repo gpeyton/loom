@@ -80,32 +80,24 @@ approval_policy = "never"
 # opt-out reproduces the original Epic #1 Phase 3 (#20) guarantees exactly.
 network_access = false
 
-# MCP server entry — single source of truth
-# -----------------------------------------
-# The command/args/env for the `loom` MCP server below MUST match the
-# `loom` server entry that `scripts/setup-mcp.sh` (in the Loom source
-# checkout) writes into `.mcp.json` for Claude Code:
+# MCP server entry
+# ----------------
+# The command/args/env for the `loom` MCP server below must match the
+# `loom` server entry in Claude Code's `.mcp.json`:
 #
 #     command: node
 #     args:    <loom-checkout>/mcp-loom/dist/index.js
-#     env:     LOOM_WORKSPACE=<loom-checkout>
-#
-# That script is the single source of truth for the mcp-loom invocation —
-# do not hand-edit this file into a different invocation.
+#     env:     LOOM_WORKSPACE=<consumer-repository>
 #
 # Because mcp-loom lives inside the Loom source checkout (not inside this
-# repository), the absolute path is machine-specific and cannot ship
-# pre-filled. EITHER run, from your Loom checkout:
-#
-#     ./scripts/setup-mcp.sh --codex
-#
-# which builds mcp-loom (if needed) and writes a concrete, absolute-path
-# `[mcp_servers.loom]` entry (idempotent, marker-delimited), OR uncomment
-# the template below and substitute `/path/to/loom` yourself.
+# consumer repository), the absolute paths are machine-specific and cannot
+# ship pre-filled. `scripts/setup-mcp.sh --codex` configures the Loom source
+# repository itself; it does not currently accept a consumer target. For a
+# consumer install, uncomment the template below and substitute both paths:
 #
 # [mcp_servers.loom]
 # command = "node"
 # args = ["/path/to/loom/mcp-loom/dist/index.js"]
 #
 # [mcp_servers.loom.env]
-# LOOM_WORKSPACE = "/path/to/loom"
+# LOOM_WORKSPACE = "/path/to/consumer-repository"

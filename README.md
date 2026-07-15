@@ -15,11 +15,23 @@ Loom spawns AI agents that claim issues, implement features, review PRs, and mer
 ## Quick Start
 
 ```bash
-# Clone and install to your repository
-git clone https://github.com/gpeyton/loom
-cd loom
+# Keep the source checkout: consumer launchers record and reuse this path.
+git clone https://github.com/gpeyton/loom "$HOME/.loom-engine-gpeyton"
+cd "$HOME/.loom-engine-gpeyton"
+pnpm daemon:build
 ./install.sh /path/to/your/repo
 ```
+
+> **Existing installation?** Stop before using `--quick` or `--yes`. When the
+> target already contains `.loom/`, the installer treats the operation as a
+> reinstall and removes the existing managed payload before initialization.
+> Inventory and back up project-owned hooks, scripts, role configuration, and
+> root agent policy first. For older `rjwalters/loom` consumers, follow the
+> [legacy migration guide](docs/migration/from-rjwalters-v0.9.md).
+
+Keep the Loom source checkout at a stable path after installation. Consumer
+launchers use the installer-written `.loom/loom-source-path` pointer to find
+shared Python tooling and other source-owned resources.
 
 Then start autonomous development on a single issue from either runtime:
 
@@ -131,12 +143,25 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 - tmux (`brew install tmux`)
 - A worker runtime for AI agents — [Claude Code](https://claude.com/claude-code) or the [OpenAI Codex CLI](https://developers.openai.com/codex) (co-equal; pick one)
 
+Installation method requirements:
+
+| Method | Additional requirements |
+|--------|--------------------------|
+| Prebuilt `loom-daemon` | None beyond the runtime requirements above |
+| Source checkout / `install.sh` | Node.js, pnpm, and Rust/Cargo |
+| MCP integration | Node.js plus `npm ci && npm run build` in `mcp-loom/` |
+| Python validation and helper CLIs | Python 3.10+ and `scripts/install/setup-python-tools.sh` |
+
 ### Install Options
 
 > **Upgrading from `rjwalters/loom` v0.9.x?** Do not run an uninstall-first
 > quick reinstall until you have inventoried and backed up project-owned Loom
 > hooks, scripts, and agent configuration. Follow the
 > [legacy migration guide](docs/migration/from-rjwalters-v0.9.md).
+
+The same review-first rule applies to any customized existing `.loom/`
+installation. `--quick` is a direct-install mode, not a non-destructive update
+mode; on an existing target it performs an uninstall followed by initialization.
 
 **Interactive installer:**
 ```bash

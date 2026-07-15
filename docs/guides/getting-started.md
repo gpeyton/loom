@@ -104,6 +104,23 @@ Minimal requirements to use Loom:
 
 That's all you need to use Loom!
 
+### Requirements by Installation Method
+
+The minimal list above applies when using a prebuilt `loom-daemon`. Installing
+from a source checkout has additional build-time requirements:
+
+| Installation path | Additional requirements |
+|-------------------|--------------------------|
+| Prebuilt binary | None |
+| `install.sh` or source build | Node.js, pnpm, and Rust/Cargo |
+| MCP server | Node.js and npm |
+| Python helper/validation commands | Python 3.10+ |
+
+The Quick Install path checks for the source-build toolchain and intentionally
+does not install the Python helper environment. Run
+`scripts/install/setup-python-tools.sh` when commands such as
+`loom-orphan-recovery` and `loom-cleanup` are required.
+
 ### For Contributors (Developing Loom)
 
 Additional requirements to build and contribute to Loom:
@@ -216,12 +233,9 @@ chmod +x loom-daemon
 For contributors or users who want the latest development version.
 
 ```bash
-# Clone Loom repository
-git clone https://github.com/gpeyton/loom
-cd loom
-
-# Install dependencies
-pnpm install
+# Clone Loom to a persistent path used by consumer launchers
+git clone https://github.com/gpeyton/loom "$HOME/.loom-engine-gpeyton"
+cd "$HOME/.loom-engine-gpeyton"
 
 # Build daemon
 pnpm daemon:build
@@ -232,9 +246,17 @@ pnpm daemon:build
 
 **What this does:**
 - Clones the Loom source code
-- Installs Node.js dependencies via pnpm
 - Builds the Rust daemon from source
 - Initializes your repository
+
+Keep this checkout after initialization. The installer records its absolute
+path in the consumer's gitignored `.loom/loom-source-path`, and installed
+Claude/Codex launchers consult that pointer when resolving shared tooling.
+
+After pulling a newer Loom commit, rerun `pnpm daemon:build` before
+reinstalling. Quick Install only builds the daemon when the release binary is
+absent; an existing binary is not proof that it was built from the current
+source commit.
 
 **Next:** See [DEVELOPMENT.md](development.md) for development workflow.
 
@@ -244,8 +266,8 @@ Uses the interactive install script for guided installation with two workflows.
 
 ```bash
 # Clone Loom first (if you haven't)
-git clone https://github.com/gpeyton/loom
-cd loom
+git clone https://github.com/gpeyton/loom "$HOME/.loom-engine-gpeyton"
+cd "$HOME/.loom-engine-gpeyton"
 
 # Run interactive installer (will prompt for target repo if not provided)
 ./install.sh
@@ -253,6 +275,12 @@ cd loom
 # Or specify target repository directly
 ./install.sh /path/to/your/repo
 ```
+
+> **Existing `.loom/` directory:** the installer enters its reinstall path.
+> Quick/non-interactive flags do not make that path non-destructive. Inventory
+> and back up project-owned hooks, scripts, roles, `CLAUDE.md`, and `AGENTS.md`
+> policy before continuing; use the legacy migration guide for v0.9-shaped
+> consumers.
 
 **What this provides:**
 - Interactive prompts for repository path
@@ -345,6 +373,11 @@ AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-a
 **What to do:**
 1. Review `CLAUDE.md` (Claude Code) and/or `AGENTS.md` (Codex) to understand the codebase structure and patterns
 2. Update both files with project-specific context as you build — they cover the same runtime-neutral coordination mechanics (labels, worktrees, sweep lifecycle), so keep them in sync
+
+The installer can preserve marker-delimited content, but it cannot infer that a
+Claude-only policy block must be translated into an equivalent Codex policy.
+Mirror owner-mandated safety, deployment, concurrency, and production
+constraints in both root files so switching runtimes cannot weaken them.
 
 ### Claude Code Configuration
 
@@ -598,8 +631,8 @@ should avoid `CODEX_HOME=$(pwd)/.codex codex` (it drags auth and session
 state into the repo tree).
 
 The `loom` MCP server entry ships commented out because the `mcp-loom`
-server lives in the Loom source checkout at a machine-specific path. To
-materialize it, run from your Loom checkout:
+server lives in the Loom source checkout at a machine-specific path. For
+the Loom source repository itself, you can materialize it with:
 
 ```bash
 ./scripts/setup-mcp.sh --codex
@@ -607,7 +640,25 @@ materialize it, run from your Loom checkout:
 
 This writes an absolute-path `[mcp_servers.loom]` entry (idempotent,
 marker-delimited) generated from the same variables as the Claude Code
-`.mcp.json` — one source of truth for both runtimes.
+`.mcp.json`.
+
+For a **consumer repository**, configure the built server from the persistent
+Loom checkout but set `LOOM_WORKSPACE` to the consumer repository:
+
+```toml
+[mcp_servers.loom]
+command = "node"
+args = ["/home/you/.loom-engine-gpeyton/mcp-loom/dist/index.js"]
+
+[mcp_servers.loom.env]
+LOOM_WORKSPACE = "/path/to/consumer-repository"
+```
+
+Do not assume `setup-mcp.sh --codex` targets the consumer: without a
+target-aware option it writes into the Loom source checkout. Keep these
+machine-specific absolute paths local, trust the consumer project in Codex,
+and restart Codex after changing the config. See the legacy migration guide's
+MCP section for the matching Claude `.mcp.json` entry.
 
 ### Skill invocation (primary entry point)
 
