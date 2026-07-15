@@ -38,9 +38,11 @@ on:
 jobs:
   guide:
     uses: ./.github/workflows/loom-role.yml
+    # Guide only triages/prioritizes issues (labels + comments). It never
+    # touches PRs, so `pull-requests` is dropped (#32, epic #30 Phase 1 --
+    # least-privilege GITHUB_TOKEN per role).
     permissions:
       issues: write
-      pull-requests: write
     with:
       role: guide
       runtime: ${{ inputs.runtime || 'claude' }}

@@ -87,6 +87,16 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
 
+# Stub `codex` binary (mirrors test-spawn-codex.sh's fixture) so dispatch to
+# the codex runner via --worker codex can be exercised for real instead of
+# incidentally short-circuiting on a missing binary.
+cat > "$STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-codex args=$*"
+exit 0
+STUB
+chmod +x "$STUB_DIR/codex"
+
 # ============================================================
 # Section 1: zero-behavior-change — no worker type resolves
 # identically to invoking spawn-claude.sh directly.
@@ -160,13 +170,48 @@ assert_contains "Unknown worker type" "$output" \
 assert_contains "bogus" "$output" \
     "unknown worker type error message names the offending value"
 
-# Same check via --worker flag instead of env var.
+# --worker codex dispatches successfully (codex support has existed since
+# #10, Phase 2 of epic #1 -- this used to assert exit 78 "not yet
+# implemented", which was stale and only "passed" because the test PATH
+# lacked a `codex` binary, so the failure was spawn-codex.sh's own missing-
+# binary EX_CONFIG check, not an unimplemented-dispatch check. Assert real
+# successful dispatch instead, mirroring the equivalent case in
+# test-spawn-codex.sh (issue #32, epic #30 Phase 1).
 set +e
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-worker.sh" --worker codex -p "test" 2>&1)
 exit_code=$?
 set -e
-assert_eq "78" "$exit_code" "--worker codex (not yet implemented) exits 78 (EX_CONFIG)"
+assert_eq "0" "$exit_code" "--worker codex dispatches successfully (codex has been implemented since #10)"
+assert_contains "stub-codex args=exec test" "$output" \
+    "--worker codex forwards the prompt to 'codex exec' via spawn-codex.sh"
+
+# ============================================================
+# Section 3b: codex permission convention/env vars pass through
+# untouched (issue #32, epic #30 Phase 1 -- spawn-worker.sh must stay a
+# thin dispatcher and never duplicate spawn-codex.sh's permission mapping).
+# ============================================================
+
+echo ""
+echo "Testing codex permission flag/env var pass-through (no duplicated logic)..."
+
+# --dangerously-skip-permissions with no override env vars: spawn-worker.sh
+# does not touch it, and spawn-codex.sh's own default (full access, #31)
+# still applies via the dispatched child.
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-worker.sh" --worker codex -p "test" \
+    --dangerously-skip-permissions 2>&1)
+assert_contains "stub-codex args=exec --dangerously-bypass-approvals-and-sandbox test" "$output" \
+    "spawn-worker.sh forwards --dangerously-skip-permissions untouched; spawn-codex.sh's full-access default (#31) applies"
+
+# LOOM_CODEX_SAFE=1 (the opt-out) reaches spawn-codex.sh unmodified through
+# the dispatcher -- spawn-worker.sh does not read or interpret this var.
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_CODEX_SAFE=1 \
+    "$SCRIPTS_DIR/spawn-worker.sh" --worker codex -p "test" \
+    --dangerously-skip-permissions 2>&1)
+assert_contains "stub-codex args=exec --full-auto test" "$output" \
+    "LOOM_CODEX_SAFE=1 passes through spawn-worker.sh untouched and restores spawn-codex.sh's sandboxed --full-auto"
 
 # ============================================================
 # Section 4: --help shows dispatcher usage without erroring

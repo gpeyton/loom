@@ -47,10 +47,13 @@
 # in sweep.md.
 #
 # ---------------------------------------------------------------------------
-# Opt-in gating (CONCURRENCY — orthogonal to LOOM_CODEX_UNSAFE)
+# Opt-in gating (CONCURRENCY — orthogonal to spawn-codex.sh's permission env
+# vars)
 # ---------------------------------------------------------------------------
-# LOOM_CODEX_UNSAFE (spawn-codex.sh) gates PERMISSIONS posture (sandbox vs.
-# bypass-everything). LOOM_CODEX_MULTI_WAVE gates CONCURRENCY (how many
+# spawn-codex.sh's LOOM_CODEX_SAFE / (deprecated) LOOM_CODEX_UNSAFE gate
+# PERMISSIONS posture (sandboxed --full-auto vs. full-access
+# --dangerously-bypass-approvals-and-sandbox, which is the default as of
+# #31/epic #30 Phase 1). LOOM_CODEX_MULTI_WAVE gates CONCURRENCY (how many
 # children run at once) and is a completely separate concern:
 #
 #   - LOOM_CODEX_MULTI_WAVE=1  -> a wave with N > 1 issues fans out all N
@@ -81,9 +84,16 @@
 #
 # Env vars:
 #   LOOM_CODEX_MULTI_WAVE    Opt-in concurrency gate (see above). Default: off.
-#   LOOM_CODEX_UNSAFE        Forwarded to each spawn-codex.sh child unchanged
-#                            (permissions posture; see spawn-codex.sh header).
-#                            Not modified or interpreted by this script.
+#   LOOM_CODEX_SAFE          Forwarded to each spawn-codex.sh child unchanged
+#                            (permissions posture opt-out; see spawn-codex.sh
+#                            header). Not modified or interpreted by this
+#                            script -- spawn-codex.sh's own default (full
+#                            access, #31) applies to each wave child unless
+#                            this is set.
+#   LOOM_CODEX_UNSAFE        Deprecated no-op alias for full access, forwarded
+#                            to each spawn-codex.sh child unchanged (see
+#                            spawn-codex.sh header). Not modified or
+#                            interpreted by this script.
 #   LOOM_CODEX_WAVE_LOG_DIR  Directory for per-issue child logs. Default:
 #                            <repo-root>/.loom/logs (created if missing).
 #                            Each child's stdout+stderr is written to
@@ -186,8 +196,9 @@ _encode_prompt() {
 
 # --- Run one issue's Codex sweep child, logging to a per-issue file ---
 # Forwards --dangerously-skip-permissions so spawn-codex.sh's existing
-# LOOM_CODEX_UNSAFE-gated permissions mapping applies exactly as it does for
-# a single-issue sweep; this script does not touch that gate.
+# LOOM_CODEX_SAFE/LOOM_CODEX_UNSAFE-gated permissions mapping applies exactly
+# as it does for a single-issue sweep (full access by default as of #31;
+# this script does not touch that gate or duplicate its logic).
 _run_child() {
     local issue="$1"
     local log_file="$LOG_DIR/spawn-codex-wave-issue-${issue}.log"

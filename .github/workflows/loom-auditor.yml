@@ -38,9 +38,11 @@ on:
 jobs:
   auditor:
     uses: ./.github/workflows/loom-role.yml
+    # Auditor only files bug issues when it finds a regression. It never
+    # touches PRs, so `pull-requests` is dropped (#32, epic #30 Phase 1 --
+    # least-privilege GITHUB_TOKEN per role).
     permissions:
       issues: write
-      pull-requests: write
     with:
       role: auditor
       runtime: ${{ inputs.runtime || 'claude' }}
