@@ -1,0 +1,138 @@
+name: Loom Role Runner
+
+# Reusable workflow that runs a single Loom support role for one tick.
+#
+# This is the shared implementation behind the per-role caller workflows
+# (loom-curator.yml, loom-champion.yml, loom-judge.yml, loom-auditor.yml,
+# loom-guide.yml). Each caller is a thin `uses:` wrapper that supplies its
+# role name, pinned Claude model, and (via workflow_dispatch) an optional
+# runtime choice.
+#
+# Two runtimes are supported:
+#
+#   claude (default) - installs @anthropic-ai/claude-code and runs
+#     `claude -p "/<role>" --model <model> --dangerously-skip-permissions`
+#     with CLAUDE_API_KEY mapped to ANTHROPIC_API_KEY. Behaviour is identical
+#     to the historical hardcoded per-role workflows.
+#
+#   codex - installs @openai/codex and runs `codex exec "<role prompt>"`.
+#     Codex cannot resolve Claude slash commands (`/curator`, ...), so the
+#     role prompt is inlined from `.loom/roles/<role>.md`. Auth uses
+#     OPENAI_API_KEY. The sandbox is pinned to `workspace-write` (never a
+#     bypass-everything / danger flag in CI).
+#
+# Codex default model is centralized in the `codex-model` input default
+# below - bump it there in one place.
+#
+# Part of Epic #1 (dual-runtime worker support), Phase 2 (#13).
+
+on:
+  workflow_call:
+    inputs:
+      role:
+        description: "Support role slug to run (curator, champion, judge, auditor, guide)."
+        required: true
+        type: string
+      runtime:
+        description: "Worker runtime: 'claude' (default) or 'codex'."
+        required: false
+        type: string
+        default: claude
+      model:
+        description: "Claude model ID (used when runtime=claude)."
+        required: false
+        type: string
+        default: claude-sonnet-4-6
+      codex-model:
+        # Centralized default Codex model. This is the ONE place to bump the
+        # default Codex model choice for all support roles. gpt-5-codex is the
+        # code-optimized Codex model; override per-caller only when a role
+        # needs a different tier.
+        description: "Codex model ID (used when runtime=codex)."
+        required: false
+        type: string
+        default: gpt-5-codex
+    secrets:
+      CLAUDE_API_KEY:
+        description: "Anthropic API key for the claude runtime."
+        required: false
+      OPENAI_API_KEY:
+        description: "OpenAI API key for the codex runtime."
+        required: false
+
+jobs:
+  run-role:
+    runs-on: ubuntu-latest
+    # timeout-minutes must live here: it cannot be set on a `uses:` caller job.
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate runtime and required secret
+        # Secrets can't be referenced directly in `if:` conditions, so guard
+        # via env-var indirection here and fail fast with a clear message that
+        # names the secret required for the selected runtime.
+        env:
+          RUNTIME: ${{ inputs.runtime }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          case "$RUNTIME" in
+            claude)
+              if [ -z "$CLAUDE_API_KEY" ]; then
+                echo "::error::CLAUDE_API_KEY secret is required for the claude runtime. Add it under Settings -> Secrets and variables -> Actions."
+                exit 1
+              fi
+              ;;
+            codex)
+              if [ -z "$OPENAI_API_KEY" ]; then
+                echo "::error::OPENAI_API_KEY secret is required for the codex runtime. Add it under Settings -> Secrets and variables -> Actions."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown runtime '$RUNTIME'. Expected 'claude' or 'codex'."
+              exit 1
+              ;;
+          esac
+
+      - name: Install Claude CLI
+        if: ${{ inputs.runtime == 'claude' }}
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run role (claude)
+        if: ${{ inputs.runtime == 'claude' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROLE: ${{ inputs.role }}
+          MODEL: ${{ inputs.model }}
+        # Pinned model ID per the role mapping (issue #3477): cron support roles
+        # are predictable, cost-sensitive load, so they pin an exact ID rather
+        # than an alias. Bump deliberately on lineup changes.
+        run: claude -p "/$ROLE" --model "$MODEL" --dangerously-skip-permissions
+
+      - name: Install Codex CLI
+        if: ${{ inputs.runtime == 'codex' }}
+        run: npm install -g @openai/codex
+
+      - name: Run role (codex)
+        if: ${{ inputs.runtime == 'codex' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROLE: ${{ inputs.role }}
+          CODEX_MODEL: ${{ inputs.codex-model }}
+        # Codex can't resolve Claude slash commands, so inline the role prompt
+        # from the repo. Sandbox is pinned to workspace-write (the equivalent of
+        # the deprecated --full-auto flag) - never a bypass-everything flag.
+        run: |
+          role_file=".loom/roles/${ROLE}.md"
+          if [ ! -f "$role_file" ]; then
+            echo "::error::Role prompt file $role_file not found; cannot inline prompt for codex runtime."
+            exit 1
+          fi
+          codex exec "$(cat "$role_file")" --sandbox workspace-write -m "$CODEX_MODEL"
