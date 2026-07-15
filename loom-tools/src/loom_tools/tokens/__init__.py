@@ -47,6 +47,14 @@ from loom_tools.tokens.failure_counts import (
     reset_all,
     threshold_reached,
 )
+from loom_tools.tokens.providers import (
+    DEFAULT_PROVIDER,
+    ENV_VAR_BY_PROVIDER,
+    KNOWN_PROVIDERS,
+    env_var_for_provider,
+    load_provider_map,
+    provider_of,
+)
 from loom_tools.tokens.select import (
     EmptyTokenPoolError,
     SelectedToken,
@@ -55,7 +63,10 @@ from loom_tools.tokens.select import (
 )
 
 __all__ = [
+    "DEFAULT_PROVIDER",
     "DEFAULT_THRESHOLD",
+    "ENV_VAR_BY_PROVIDER",
+    "KNOWN_PROVIDERS",
     "AllowlistError",
     "EmptyTokenPoolError",
     "SelectedToken",
@@ -65,9 +76,12 @@ __all__ = [
     "bootstrap_tokens",
     "cleanup_bad_tokens",
     "clear_allowlist",
+    "env_var_for_provider",
     "is_bad",
     "list_accounts",
+    "load_provider_map",
     "mark_bad",
+    "provider_of",
     "read_allowlist",
     "record_failure",
     "record_success",

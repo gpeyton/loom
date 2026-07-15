@@ -1,8 +1,16 @@
 """Account health probe + ranking for the agent token pool.
 
-Probes each bootstrapped OAuth account by sending a minimal Anthropic
-``POST /v1/messages`` request and parses rate-limit headers to derive
-session (5h) and weekly (7d) utilization plus the next 7d reset time.
+Probes each bootstrapped account and ranks the pool for the spawn-time
+selector. Probing is provider-pluggable (#12): each provider supplies a
+probe function ``probe(name, token, ...) -> AccountResult`` with
+``status`` in ``{available, exhausted, rate_limited, blocked}`` (plus
+``error`` for transient failures), registered in :data:`PROBE_REGISTRY`.
+Accounts with no recorded provider are probed as ``anthropic`` — the
+pre-#12 behavior, bit-identical.
+
+The Anthropic probe sends a minimal ``POST /v1/messages`` request and
+parses rate-limit headers to derive session (5h) and weekly (7d)
+utilization plus the next 7d reset time.
 
 Resilient to header renames: matches by **suffix** (e.g.
 ``-5h-utilization``, ``-7d-utilization``, ``-7d-reset``) so that any
@@ -43,6 +51,12 @@ from typing import Any, Iterable
 
 import requests
 
+from loom_tools.tokens.providers import (
+    DEFAULT_PROVIDER,
+    load_provider_map,
+    provider_of,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -57,6 +71,12 @@ DEFAULT_PROBE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_PROBE_PROMPT = "hi"
 DEFAULT_TIMEOUT_SECONDS = 15
 EXHAUSTED_THRESHOLD = 0.95
+
+# OpenAI probe (#12): a minimal authenticated GET against the models
+# endpoint. This validates the API key without consuming completion
+# quota; OpenAI does not expose Anthropic-style utilization headers, so
+# a passing probe simply means ``available``.
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 
 # Suffix patterns matched case-insensitively against header names. Keeping
 # these as suffixes (not full names) makes the parser resilient to any
@@ -90,11 +110,13 @@ class AccountResult:
     s7d_utilization: float | None = None
     s7d_reset: str | None = None
     error: str | None = None
+    provider: str = DEFAULT_PROVIDER
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "name": self.name,
             "status": self.status,
+            "provider": self.provider,
             "5h_utilization": self.s5h_utilization,
             "7d_utilization": self.s7d_utilization,
             "7d_reset": self.s7d_reset,
@@ -297,7 +319,13 @@ def probe_account(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     session: requests.Session | None = None,
 ) -> AccountResult:
-    """Probe a single account, returning an AccountResult.
+    """Probe a single Anthropic account, returning an AccountResult.
+
+    This is the ``anthropic`` provider plugin (see
+    :data:`PROBE_REGISTRY`); its behavior — suffix-based header
+    matching, the 0.95 exhaustion threshold, oauth vs api-key auth
+    header selection, and skip-and-log on probe failure — predates the
+    provider abstraction (#12) and is preserved bit-identically.
 
     Probe failures (network errors, 5xx, timeout) are mapped to
     ``status="error"`` with a description in ``error``; they DO NOT
@@ -383,6 +411,128 @@ def probe_account(
 
 
 # ---------------------------------------------------------------------------
+# Provider probe plugins (#12)
+# ---------------------------------------------------------------------------
+#
+# Interface: ``probe(name, token, *, probe_prompt=..., model=...,
+# timeout=..., session=...) -> AccountResult`` where ``status`` is one of
+# ``available | exhausted | rate_limited | blocked`` (plus ``error`` for
+# transient probe failures). Plugins MUST NOT raise on probe failure —
+# skip-and-log so one bad account (or one unreachable provider) never
+# aborts the run. Extra keyword arguments a provider does not use (e.g.
+# ``model`` for openai) are accepted and ignored.
+
+
+def probe_openai_account(
+    name: str,
+    token: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    session: requests.Session | None = None,
+    **_ignored: Any,
+) -> AccountResult:
+    """Probe a single OpenAI account via a minimal models-endpoint GET.
+
+    Only API-key accounts are supported (there is no public
+    multi-account token-file mechanism for ChatGPT-plan OAuth). OpenAI
+    exposes no Anthropic-style utilization headers, so a 2xx probe maps
+    directly to ``available``. 401 -> blocked, 429 -> rate_limited,
+    everything else (network, timeout, 5xx, other 4xx) -> ``error``
+    without raising — mirroring the Anthropic plugin's skip-and-log
+    contract.
+    """
+    if not token:
+        # known-bad token (in .bad_tokens) — surface for selector visibility
+        return AccountResult(
+            name=name,
+            status="blocked",
+            error="bad_token_listed",
+            provider="openai",
+        )
+
+    headers = {
+        "authorization": f"Bearer {token}",
+        "user-agent": USER_AGENT,
+    }
+    sess = session or requests
+    try:
+        resp = sess.get(OPENAI_MODELS_URL, headers=headers, timeout=timeout)
+    except requests.Timeout:
+        logger.warning("probe %s (openai): timeout after %ss", name, timeout)
+        return AccountResult(
+            name=name, status="error", error="timeout", provider="openai"
+        )
+    except requests.ConnectionError as exc:
+        logger.warning("probe %s (openai): connection error: %s", name, exc)
+        return AccountResult(
+            name=name,
+            status="error",
+            error=f"connection: {exc}",
+            provider="openai",
+        )
+    except requests.RequestException as exc:
+        logger.warning("probe %s (openai): request exception: %s", name, exc)
+        return AccountResult(
+            name=name, status="error", error=str(exc), provider="openai"
+        )
+
+    code = resp.status_code
+    if code == 401:
+        return AccountResult(
+            name=name, status="blocked", error="auth_401", provider="openai"
+        )
+    if code == 429:
+        return AccountResult(name=name, status="rate_limited", provider="openai")
+    if code >= 400:
+        logger.warning("probe %s (openai): http %d", name, code)
+        return AccountResult(
+            name=name, status="error", error=f"http_{code}", provider="openai"
+        )
+
+    return AccountResult(name=name, status="available", provider="openai")
+
+
+#: Provider name -> probe plugin. Accounts whose provider has no entry
+#: here are reported as ``error`` (never probed against the wrong API,
+#: never aborting the run).
+PROBE_REGISTRY: dict[str, Any] = {
+    "anthropic": probe_account,
+    "openai": probe_openai_account,
+}
+
+
+def probe_account_for_provider(
+    provider: str,
+    name: str,
+    token: str,
+    **kwargs: Any,
+) -> AccountResult:
+    """Dispatch a probe to the plugin registered for *provider*.
+
+    Unknown providers yield ``status="error"`` (sorted to the bottom of
+    the ranking) rather than raising or falling back to another
+    provider's API — we never send one provider's secret to another
+    provider's endpoint.
+    """
+    probe = PROBE_REGISTRY.get(provider)
+    if probe is None:
+        logger.warning(
+            "probe %s: no probe plugin for provider '%s'; skipping",
+            name,
+            provider,
+        )
+        return AccountResult(
+            name=name,
+            status="error",
+            error=f"no_probe_for_provider:{provider}",
+            provider=provider,
+        )
+    result: AccountResult = probe(name, token, **kwargs)
+    result.provider = provider
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Ranking + atomic write
 # ---------------------------------------------------------------------------
 
@@ -449,16 +599,24 @@ def run_check(
     Probes are issued sequentially with 0.5-1.5s jitter between them
     (lean-genius pattern) when *stagger* is true. Tests can pass
     ``stagger=False`` to skip the sleep.
+
+    Each account is probed by its provider's plugin (#12), looked up
+    from ``index.json`` next to the token files; accounts with no
+    recorded provider are probed as ``anthropic`` (pre-#12 behavior).
+    The ranking always includes accounts from every provider.
     """
     pairs = discover_tokens(tokens_dir)
     if not pairs:
         logger.warning("no tokens found in %s", tokens_dir)
 
+    pmap = load_provider_map(tokens_dir)
+
     results: list[AccountResult] = []
     for i, (name, token) in enumerate(pairs):
         if i > 0 and stagger and token:
             time.sleep(0.5 + random.random())
-        result = probe_account(
+        result = probe_account_for_provider(
+            provider_of(name, pmap),
             name,
             token,
             probe_prompt=probe_prompt,
@@ -485,17 +643,19 @@ def format_table(report: ProbeReport) -> str:
     """Human-readable status table, sorted with best accounts first."""
     lines: list[str] = []
     lines.append(f"Token pool ranking (probed at {report.ranked_at})")
-    lines.append("=" * 78)
+    lines.append("=" * 89)
     lines.append(
-        f"{'Account':<28} {'5h util':>9} {'7d util':>9} {'Status':<13} {'7d resets':<22}"
+        f"{'Account':<28} {'Provider':<10} {'5h util':>9} {'7d util':>9} "
+        f"{'Status':<13} {'7d resets':<22}"
     )
-    lines.append("-" * 78)
+    lines.append("-" * 89)
     for a in report.accounts:
         s5 = f"{a.s5h_utilization:.2f}" if a.s5h_utilization is not None else "-"
         s7 = f"{a.s7d_utilization:.2f}" if a.s7d_utilization is not None else "-"
         reset = a.s7d_reset or "-"
         lines.append(
-            f"{a.name:<28} {s5:>9} {s7:>9} {a.status:<13} {reset:<22}"
+            f"{a.name:<28} {a.provider:<10} {s5:>9} {s7:>9} "
+            f"{a.status:<13} {reset:<22}"
         )
 
     counts: dict[str, int] = {}

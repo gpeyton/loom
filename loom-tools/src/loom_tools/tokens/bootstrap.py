@@ -29,11 +29,13 @@ from loom_tools.common.logging import (
     log_warning,
 )
 from loom_tools.common.paths import LoomPaths
+from loom_tools.tokens.providers import normalize_provider
 
 # ``ACCOUNT_<FIELD>_<N>=<value>`` — N is 1+ digits, FIELD is one of the
-# triple keys we recognize. Anchored to start of line.
+# triple keys we recognize. Anchored to start of line. ``PROVIDER`` (#12)
+# is optional per account and defaults to ``anthropic``.
 _ENV_LINE_RE = re.compile(
-    r"^ACCOUNT_(EMAIL|KEY|TOKEN_FILE)_(\d+)\s*=\s*(.*)$"
+    r"^ACCOUNT_(EMAIL|KEY|TOKEN_FILE|PROVIDER)_(\d+)\s*=\s*(.*)$"
 )
 
 # Filename safety: lowercase letters, digits, dot, dash, underscore. Must
@@ -80,11 +82,17 @@ def parse_env_accounts(env_path: Path) -> dict[int, dict[str, str]]:
 
     Returns:
         Mapping from account index ``N`` to a dict with keys ``email``,
-        ``key``, and ``file`` (any subset may be present).
+        ``key``, ``file``, and optionally ``provider`` (any subset may
+        be present).
     """
     accounts: dict[int, dict[str, str]] = {}
     text = env_path.read_text(encoding="utf-8", errors="replace")
-    field_to_key = {"EMAIL": "email", "KEY": "key", "TOKEN_FILE": "file"}
+    field_to_key = {
+        "EMAIL": "email",
+        "KEY": "key",
+        "TOKEN_FILE": "file",
+        "PROVIDER": "provider",
+    }
 
     for line in text.splitlines():
         stripped = line.lstrip()
@@ -206,7 +214,9 @@ def bootstrap_tokens(
         return result
 
     # Validate triples and build the work list, in stable order by N.
-    valid: list[tuple[int, str, str, str]] = []  # (n, email, key, filename)
+    # ``provider`` (#12) is optional and never makes a triple incomplete;
+    # a missing/empty ACCOUNT_PROVIDER_N defaults to ``anthropic``.
+    valid: list[tuple[int, str, str, str, str]] = []  # (n, email, key, filename, provider)
     for n in sorted(accounts):
         triple = accounts[n]
         missing = [k for k in ("email", "key", "file") if not triple.get(k)]
@@ -222,7 +232,8 @@ def bootstrap_tokens(
                 f"ACCOUNT_TOKEN_FILE_{n}={filename!r}: unsafe filename; skipping."
             )
             continue
-        valid.append((n, triple["email"], triple["key"], filename))
+        provider = normalize_provider(triple.get("provider"))
+        valid.append((n, triple["email"], triple["key"], filename, provider))
 
     if not valid:
         log_warning(
@@ -232,7 +243,7 @@ def bootstrap_tokens(
 
     # Detect duplicate filenames (would otherwise clobber each other).
     seen_files: dict[str, int] = {}
-    for n, _email, _key, filename in valid:
+    for n, _email, _key, filename, _provider in valid:
         if filename in seen_files:
             log_error(
                 f"Duplicate ACCOUNT_TOKEN_FILE: {filename!r} appears for "
@@ -250,7 +261,7 @@ def bootstrap_tokens(
             pass
 
     manifest_accounts: list[dict[str, object]] = []
-    for n, email, key, filename in valid:
+    for n, email, key, filename, provider in valid:
         token_path = tokens_dir / filename
         new_fp = fingerprint(key)
 
@@ -287,6 +298,7 @@ def bootstrap_tokens(
                     "name": _name_from_file(filename),
                     "email": email,
                     "file": filename,
+                    "provider": provider,
                     "key_fingerprint": existing_fp,
                     "drift": True,
                     "env_fingerprint": new_fp,
@@ -320,6 +332,7 @@ def bootstrap_tokens(
                 "name": _name_from_file(filename),
                 "email": email,
                 "file": filename,
+                "provider": provider,
                 "key_fingerprint": new_fp,
             }
         )
