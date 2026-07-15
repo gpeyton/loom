@@ -35,53 +35,49 @@
 # `.codex/prompts/` directory is NOT scanned. See `.codex/prompts/README.md`
 # for the one-time copy/symlink step.
 #
-# Safety guardrail posture — sandbox + approvals (Epic #1, Phase 3, #20)
-# ---------------------------------------------------------------------
-# Loom's Claude Code guardrails are PreToolUse hooks wired in
-# `.claude/settings.json` (`guard-destructive.sh`, `guard-worktree-paths.sh`).
-# Codex has no hooks system, so the closest safe-by-default posture is
-# expressed here as Codex's native sandbox + approval policy. These defaults
-# give Codex the strongest guard that still lets the roles function:
+# Safety guardrail posture — full autonomy by default (Epic #30 Phase 1, #33;
+# inverted from the original sandboxed default shipped in Epic #1 Phase 3 #20)
+# ---------------------------------------------------------------------------
+# Loom intentionally grants Codex the same unattended authority it already
+# grants Claude Code — Claude's Loom default is `--dangerously-skip-permissions`
+# (no hook-firing sandbox, no approval prompts). Epic #30 makes Codex match
+# that posture: `sandbox_mode = "danger-full-access"` and
+# `approval_policy = "never"` are the new defaults below, mirroring what
+# `spawn-codex.sh` (#31) now injects for Loom's skip-permissions convention:
+# `--dangerously-bypass-approvals-and-sandbox`.
 #
-#   - sandbox_mode = "workspace-write": filesystem writes are confined to the
-#     repository workspace. This is the coarse-grained analogue of
-#     guard-worktree-paths.sh (per-worktree confinement) and of
-#     guard-destructive.sh's "rm target outside repository" block. Writes
-#     outside the workspace are refused by the OS sandbox.
-#   - [sandbox_workspace_write] network_access = false: no outbound network
-#     from inside the sandbox by default. This is the analogue of
-#     guard-destructive.sh's `curl … | sh` / cloud-CLI-destruction blocks —
-#     a sandboxed command simply cannot reach the network to do damage.
-#   - approval_policy = "on-request": in an INTERACTIVE `codex` session the
-#     agent must ask before escalating outside the sandbox. (See the parity
-#     doc for the important non-interactive caveat: `codex exec` runs with no
-#     human present, so approvals degrade to a no-op and the SANDBOX is the
-#     load-bearing guard. This is why network_access=false and workspace-write
-#     matter more than the approval policy for Loom automation.)
+# This is PARITY, not a new risk class — see `.codex/GUARDRAIL-PARITY.md` for
+# the full trust-boundary rationale (why full autonomy is safe to standardize
+# on, and what it means for where you enable Codex workers).
 #
-# This matches what `spawn-codex.sh` (#15) injects for Loom's
-# skip-permissions convention: `--full-auto` == workspace-write + on-request.
-# CLI flags beat this config, but they ALIGN with it, so no Loom dispatch path
-# silently drops below the Claude guarantee. The ONLY sub-Claude path is the
-# explicit `LOOM_CODEX_UNSAFE=1` opt-in, which maps skip-permissions to
-# `--dangerously-bypass-approvals-and-sandbox` (danger-full-access + never) —
-# reserved for fully isolated runners.
+# Opting back into the old sandboxed posture (workspace-write confinement,
+# no outbound network, approval-on-request) is a per-operator choice: set
+# `LOOM_CODEX_SAFE=1` in the environment before spawning Codex workers. That
+# env var flips `spawn-codex.sh`'s skip-permissions mapping to `--full-auto`
+# instead of the bypass-everything flag. The `[sandbox_workspace_write]`
+# table below is retained for exactly that opt-out path — see the comment
+# on that table for why it is otherwise inert.
 #
-# The CI support-role workflow (#14, `.github/workflows/loom-role.yml`) pins
-# `codex exec … --sandbox workspace-write` with no bypass flag, matching this
-# posture; a fork cannot weaken it without editing the workflow.
+# The CI support-role workflow (`.github/workflows/loom-role.yml`) pins
+# `codex exec … --sandbox workspace-write` independently of this file and is
+# unaffected by this default change.
 #
-# Full hook-by-hook classification (covered / partial / no-equivalent):
+# Full hook-by-hook classification (what `LOOM_CODEX_SAFE=1` restores):
 # see `.codex/GUARDRAIL-PARITY.md`.
 
-sandbox_mode = "workspace-write"
-approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
 
 [sandbox_workspace_write]
-# No outbound network from the sandbox by default — the closest analogue to
-# guard-destructive.sh's supply-chain / cloud-destruction blocks. Flip to true
-# only for roles that genuinely need network, and prefer per-run CLI overrides
-# over widening this shared default.
+# SAFE-MODE-ONLY TABLE: Codex only reads [sandbox_workspace_write] when
+# sandbox_mode = "workspace-write". With the loom-default sandbox_mode above
+# set to "danger-full-access", Codex ignores this entire table — it has no
+# effect on a default Loom-spawned Codex worker. It exists here purely for
+# the LOOM_CODEX_SAFE=1 opt-out path: an operator who sets that env var gets
+# `spawn-codex.sh --full-auto`, which puts Codex into workspace-write mode,
+# at which point these settings become live again. Kept in sync with the old
+# safe-by-default posture (no outbound network from the sandbox) so the
+# opt-out reproduces the original Epic #1 Phase 3 (#20) guarantees exactly.
 network_access = false
 
 # MCP server entry — single source of truth
