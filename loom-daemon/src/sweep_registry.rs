@@ -1074,22 +1074,32 @@ pub struct CancelOutcome {
 /// slash-command custom prompts (openai/codex#3641) — so handing it
 /// `/loom-sweep <issue>` (the repo's Codex prompt name) would be treated
 /// as literal prose, not resolved. Instead we pass a natural-language
-/// instruction that points Codex at the repo-local `loom-sweep` shim
-/// (`.codex/prompts/loom-sweep.md`, shipped by #16), which documents the
-/// sequential-in-session Codex lifecycle and references the canonical
-/// sweep skill at `.claude/commands/loom/sweep.md`. This mirrors the
-/// established pattern in `.github/workflows/loom-role.yml`, which inlines
-/// role prompt text for Codex rather than relying on slash resolution.
+/// instruction that points Codex at the canonical Codex entry point
+/// (`.agents/skills/loom-sweep/SKILL.md`, shipped by #35/PR#43), which
+/// documents the sequential-in-session Codex lifecycle and references the
+/// canonical sweep skill at `.claude/commands/loom/sweep.md`. This mirrors
+/// the established pattern in `.github/workflows/loom-role.yml`, which
+/// inlines role prompt text for Codex rather than relying on slash
+/// resolution.
+///
+/// **Issue #53 note**: this used to point at `.codex/prompts/loom-sweep.md`
+/// (#16's original shim). That file still exists and still works during the
+/// transition window, but #35/PR#43 made the skill the documented onboarding
+/// path, and `defaults/scripts/spawn-codex-wave.sh`'s own child-prompt
+/// encoding (a separate, hand-kept-in-sync copy — see that script's
+/// `_encode_prompt`) was found still pointing at the retired prompt in the
+/// same #51/#53 reproduction that motivated the claim/lease work in this
+/// module's neighbourhood. Both copies now agree.
 #[must_use]
 pub fn encode_child_prompt(issue: u32, worker_type: Option<&str>) -> String {
     match worker_type {
         Some(w) if w.eq_ignore_ascii_case("codex") => format!(
-            "Read the file .codex/prompts/loom-sweep.md in this repository and \
+            "Read the file .agents/skills/loom-sweep/SKILL.md in this repository and \
              follow it exactly to run a Loom sweep for issue {issue} (treat its \
              arguments as: {issue}). You are running under the Codex runtime: \
              `codex exec` cannot resolve Claude slash commands or Codex \
              slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor \
-             -> Merge lifecycle sequentially in this one session per that shim's \
+             -> Merge lifecycle sequentially in this one session per that skill's \
              Codex guidance — do not attempt Claude Code Task-tool subagents."
         ),
         _ => format!("/loom:sweep {issue}"),
@@ -1546,9 +1556,11 @@ exit 0
         assert_eq!(encode_child_prompt(42, Some("gemini")), "/loom:sweep 42");
     }
 
-    /// Issue #19 (Phase 3): the Codex child-prompt encoding does NOT emit a
-    /// slash command (`codex exec` can't resolve them — openai/codex#3641),
-    /// points the child at the loom-sweep shim, and carries the issue number.
+    /// Issue #19 (Phase 3), repointed by issue #53: the Codex child-prompt
+    /// encoding does NOT emit a slash command (`codex exec` can't resolve
+    /// them — openai/codex#3641), points the child at the canonical
+    /// `.agents/skills/loom-sweep/SKILL.md` entry point (not the retired
+    /// `.codex/prompts/loom-sweep.md` shim), and carries the issue number.
     #[test]
     fn encode_child_prompt_codex_points_at_shim() {
         let p = encode_child_prompt(19, Some("codex"));
@@ -1564,8 +1576,12 @@ exit 0
             "codex prompt must be a natural-language instruction, not a slash command: {p}"
         );
         assert!(
-            p.contains(".codex/prompts/loom-sweep.md"),
-            "codex prompt must reference the loom-sweep shim: {p}"
+            p.contains(".agents/skills/loom-sweep/SKILL.md"),
+            "codex prompt must reference the canonical loom-sweep skill: {p}"
+        );
+        assert!(
+            !p.contains(".codex/prompts/loom-sweep.md"),
+            "codex prompt must NOT reference the retired loom-sweep prompt shim: {p}"
         );
         assert!(p.contains("19"), "codex prompt must carry the issue number: {p}");
         // Case-insensitive on the worker_type token.
@@ -1594,8 +1610,8 @@ exit 0
         );
         let recorded = std::fs::read_to_string(&record_log).unwrap();
         assert!(
-            recorded.contains(".codex/prompts/loom-sweep.md"),
-            "codex dispatch must pass the shim-pointing prompt on argv; got: {recorded}"
+            recorded.contains(".agents/skills/loom-sweep/SKILL.md"),
+            "codex dispatch must pass the skill-pointing prompt on argv; got: {recorded}"
         );
         assert!(
             !recorded.contains("argv: -p /loom:sweep"),
