@@ -569,7 +569,13 @@ impl SweepRegistry {
             .with_context(|| format!("failed to open log {}", log_path.display()))?;
         let log_clone = log_file.try_clone()?;
 
-        let prompt = format!("/loom:sweep {issue}");
+        // Child-prompt encoding is runtime-aware (issue #19, Phase 3 of
+        // epic #1). The Claude path is byte-identical to the pre-#19
+        // hardcoded `/loom:sweep {issue}`; the Codex path receives an
+        // invocation its `codex exec` runtime can actually resolve — Codex
+        // does NOT expand slash-command custom prompts in exec mode
+        // (openai/codex#3641). See [`encode_child_prompt`].
+        let prompt = encode_child_prompt(issue, worker_type);
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -1046,6 +1052,50 @@ pub struct CancelOutcome {
     pub was_running: bool,
 }
 
+/// Encode the `-p <prompt>` argument for a dispatched sweep child,
+/// runtime-aware (issue #19, Phase 3 of epic #1).
+///
+/// The `worker_type` seam is the same one `dispatch` threads into the
+/// child's `LOOM_WORKER` env (issue #2). This function maps it to the
+/// invocation string the child's runtime can actually resolve:
+///
+/// # Claude (default — load-bearing production path)
+///
+/// Any `worker_type` that is `None`, an empty string, or the literal
+/// `"claude"` (case-insensitive) yields `/loom:sweep <issue>` — **byte
+/// for byte** the pre-#19 hardcoded string. This is the strict default:
+/// every non-Codex value falls here, so no Claude dispatch changes.
+///
+/// # Codex
+///
+/// Selected **only** when `worker_type` equals `"codex"`
+/// (case-insensitive). `spawn-codex.sh` runs the child via
+/// `codex exec "<prompt>"`, and `codex exec` does **not** expand
+/// slash-command custom prompts (openai/codex#3641) — so handing it
+/// `/loom-sweep <issue>` (the repo's Codex prompt name) would be treated
+/// as literal prose, not resolved. Instead we pass a natural-language
+/// instruction that points Codex at the repo-local `loom-sweep` shim
+/// (`.codex/prompts/loom-sweep.md`, shipped by #16), which documents the
+/// sequential-in-session Codex lifecycle and references the canonical
+/// sweep skill at `.claude/commands/loom/sweep.md`. This mirrors the
+/// established pattern in `.github/workflows/loom-role.yml`, which inlines
+/// role prompt text for Codex rather than relying on slash resolution.
+#[must_use]
+pub fn encode_child_prompt(issue: u32, worker_type: Option<&str>) -> String {
+    match worker_type {
+        Some(w) if w.eq_ignore_ascii_case("codex") => format!(
+            "Read the file .codex/prompts/loom-sweep.md in this repository and \
+             follow it exactly to run a Loom sweep for issue {issue} (treat its \
+             arguments as: {issue}). You are running under the Codex runtime: \
+             `codex exec` cannot resolve Claude slash commands or Codex \
+             slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor \
+             -> Merge lifecycle sequentially in this one session per that shim's \
+             Codex guidance — do not attempt Claude Code Task-tool subagents."
+        ),
+        _ => format!("/loom:sweep {issue}"),
+    }
+}
+
 /// Generate a stable sweep ID for the given kind. Format follows the
 /// spawn-loop log naming convention so operators can correlate.
 #[must_use]
@@ -1478,6 +1528,78 @@ exit 0
         assert!(
             recorded.contains("LOOM_WORKER=unset"),
             "empty worker_type must not set LOOM_WORKER; got: {recorded}"
+        );
+    }
+
+    /// Issue #19 (Phase 3): the Claude child-prompt encoding is byte-for-byte
+    /// identical to the pre-#19 hardcoded string for every non-Codex
+    /// worker_type value (None / empty / "claude" / arbitrary). This is the
+    /// "do not regress the Claude path" acceptance criterion at the unit level.
+    #[test]
+    fn encode_child_prompt_claude_default_is_byte_identical() {
+        assert_eq!(encode_child_prompt(42, None), "/loom:sweep 42");
+        assert_eq!(encode_child_prompt(42, Some("")), "/loom:sweep 42");
+        assert_eq!(encode_child_prompt(42, Some("claude")), "/loom:sweep 42");
+        assert_eq!(encode_child_prompt(42, Some("CLAUDE")), "/loom:sweep 42");
+        // Any unknown runtime also defaults to the Claude slash command —
+        // Codex is the ONLY branch that diverges.
+        assert_eq!(encode_child_prompt(42, Some("gemini")), "/loom:sweep 42");
+    }
+
+    /// Issue #19 (Phase 3): the Codex child-prompt encoding does NOT emit a
+    /// slash command (`codex exec` can't resolve them — openai/codex#3641),
+    /// points the child at the loom-sweep shim, and carries the issue number.
+    #[test]
+    fn encode_child_prompt_codex_points_at_shim() {
+        let p = encode_child_prompt(19, Some("codex"));
+        // Must not be the Claude slash-command invocation. (The shim *path*
+        // legitimately contains "loom-sweep", so we only reject the Claude
+        // `/loom:sweep` command form — the thing codex exec can't resolve.)
+        assert!(
+            !p.contains("/loom:sweep"),
+            "codex prompt must not be the Claude slash command: {p}"
+        );
+        assert!(
+            p.starts_with("Read the file"),
+            "codex prompt must be a natural-language instruction, not a slash command: {p}"
+        );
+        assert!(
+            p.contains(".codex/prompts/loom-sweep.md"),
+            "codex prompt must reference the loom-sweep shim: {p}"
+        );
+        assert!(p.contains("19"), "codex prompt must carry the issue number: {p}");
+        // Case-insensitive on the worker_type token.
+        assert_eq!(encode_child_prompt(19, Some("Codex")), encode_child_prompt(19, Some("codex")));
+    }
+
+    /// Issue #19 (Phase 3): end-to-end dispatch with worker_type="codex" puts
+    /// the runtime-aware prompt on the spawned child's argv (AND still sets
+    /// LOOM_WORKER=codex via the existing #2 seam). The complementary
+    /// byte-identical Claude argv is covered by
+    /// `dispatch_happy_path_records_entry` (`argv: -p /loom:sweep 42`).
+    #[test]
+    #[serial]
+    fn dispatch_codex_worker_type_emits_shim_prompt_argv() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(48), None, None, Some("codex"))
+            .expect("dispatch should succeed");
+
+        let needle = "LOOM_WORKER=codex";
+        assert!(
+            wait_for_contents(&record_log, needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains(".codex/prompts/loom-sweep.md"),
+            "codex dispatch must pass the shim-pointing prompt on argv; got: {recorded}"
+        );
+        assert!(
+            !recorded.contains("argv: -p /loom:sweep"),
+            "codex dispatch must NOT pass the Claude slash command; got: {recorded}"
         );
     }
 
