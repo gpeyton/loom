@@ -12,4 +12,17 @@ surface rather than spawning shell processes directly, delegate role work
 to the matching loom-* custom agent, and preserve confirmation gates,
 worktree isolation, checkpoints, label ownership, tests, and merge
 restrictions (./.loom/scripts/merge-pr.sh, never gh pr merge).
+
+Backend policy (issue #54): "delegate role work to the matching loom-*
+custom agent" above means routing through the documented Loom backends
+(daemon dispatch_sweep, or process-level spawn-codex-wave.sh for
+parallel Codex work) or running the role sequentially in this session --
+it does NOT mean calling native Codex agent-collaboration primitives
+(spawn_agent / wait_agent / send_message / followup_task /
+interrupt_agent) on the loom-* custom agents. Native agent primitives are
+not yet a supported Loom orchestration backend. If asked to run "parallel
+Loom agents," invoke spawn-codex-wave.sh (LOOM_CODEX_MULTI_WAVE=1), never
+spawn_agent. Do not mix native-agent spawning with process-level fan-out
+or daemon dispatch in the same run. See sweep.md's "Codex backend policy"
+section for the full rationale.
 """

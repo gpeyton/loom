@@ -12,12 +12,17 @@
 # ---------------------------------------------------------------------------
 # What this is
 # ---------------------------------------------------------------------------
-# Codex has no Task-tool subagents (see sweep.md's "Codex strategy" section),
-# so there is nothing to dispatch a `loom-builder` / `loom-judge` /
-# `loom-doctor` *into* the way the Claude path does. The process-level
-# analogue of Claude's `--builders-per-wave N` parallel wave is fanning out
-# multiple `codex exec` children as independent OS processes — this script IS
-# that fan-out.
+# Codex has no Claude-Code-style Task-tool subagents (see sweep.md's "Codex
+# strategy" section), so there is nothing to dispatch a `loom-builder` /
+# `loom-judge` / `loom-doctor` *into* the way the Claude path does. The
+# process-level analogue of Claude's `--builders-per-wave N` parallel wave is
+# fanning out multiple `codex exec` children as independent OS processes --
+# this script IS that fan-out, and per issue #54 it is the ONLY supported
+# backend for parallel Loom work under Codex. Current Codex clients also
+# expose separate native, in-session collaboration primitives (spawn_agent /
+# wait_agent / interrupt_agent) -- those are explicitly NOT a supported Loom
+# backend (see sweep.md's "Codex backend policy" subsection); a request for
+# "parallel Loom agents" always routes here, never to spawn_agent.
 #
 # Given a wave (a list of issue numbers), this script:
 #   1. Spawns one child per issue, each running the existing single-role
@@ -410,7 +415,7 @@ fi
 # the same #51/#53 reproduction that motivated the claim/lease work below).
 _encode_prompt() {
     local issue="$1"
-    printf 'Read the file .agents/skills/loom-sweep/SKILL.md in this repository and follow it exactly to run a Loom sweep for issue %s (treat its arguments as: %s). You are running under the Codex runtime: `codex exec` cannot resolve Claude slash commands or Codex slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor -> Merge lifecycle sequentially in this one session per that skill'"'"'s Codex guidance -- do not attempt Claude Code Task-tool subagents.' "$issue" "$issue"
+    printf 'Read the file .agents/skills/loom-sweep/SKILL.md in this repository and follow it exactly to run a Loom sweep for issue %s (treat its arguments as: %s). You are running under the Codex runtime: `codex exec` cannot resolve Claude slash commands or Codex slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor -> Merge lifecycle sequentially in this one session per that skill'"'"'s Codex guidance -- do not attempt Claude Code Task-tool subagents, and do not use native Codex agent-collaboration primitives (spawn_agent, wait_agent, interrupt_agent) for this lifecycle either -- they are not a supported Loom backend (issue #54); a request for parallel Loom work routes to spawn-codex-wave.sh, not to native agent primitives.' "$issue" "$issue"
 }
 
 # --- Claim/lease preflight (issue #53) ---

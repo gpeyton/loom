@@ -1100,7 +1100,11 @@ pub fn encode_child_prompt(issue: u32, worker_type: Option<&str>) -> String {
              `codex exec` cannot resolve Claude slash commands or Codex \
              slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor \
              -> Merge lifecycle sequentially in this one session per that skill's \
-             Codex guidance — do not attempt Claude Code Task-tool subagents."
+             Codex guidance — do not attempt Claude Code Task-tool subagents, and \
+             do not use native Codex agent-collaboration primitives (spawn_agent, \
+             wait_agent, interrupt_agent) for this lifecycle either — they are not \
+             a supported Loom backend (issue #54); a request for parallel Loom \
+             work routes to spawn-codex-wave.sh, not to native agent primitives."
         ),
         _ => format!("/loom:sweep {issue}"),
     }
@@ -1586,6 +1590,29 @@ exit 0
         assert!(p.contains("19"), "codex prompt must carry the issue number: {p}");
         // Case-insensitive on the worker_type token.
         assert_eq!(encode_child_prompt(19, Some("Codex")), encode_child_prompt(19, Some("codex")));
+    }
+
+    /// Issue #54: the Codex child prompt must also prohibit native Codex
+    /// agent-collaboration primitives (`spawn_agent` et al.), not just
+    /// Claude Code Task-tool subagents. This is the single source of truth
+    /// every Codex child actually receives on argv, so the prohibition
+    /// needs to be load-bearing here, not just in sweep.md prose.
+    #[test]
+    fn encode_child_prompt_codex_prohibits_native_agent_primitives() {
+        let p = encode_child_prompt(54, Some("codex"));
+        assert!(
+            p.contains("spawn_agent"),
+            "codex prompt must explicitly name spawn_agent as prohibited: {p}"
+        );
+        assert!(
+            p.contains("not a supported Loom backend")
+                || p.contains("not a supported Loom orchestration backend"),
+            "codex prompt must state native agent primitives are not a supported backend: {p}"
+        );
+        assert!(
+            p.contains("spawn-codex-wave.sh"),
+            "codex prompt must name the actual required routing target for parallel work: {p}"
+        );
     }
 
     /// Issue #19 (Phase 3): end-to-end dispatch with worker_type="codex" puts
