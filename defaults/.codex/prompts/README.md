@@ -46,9 +46,14 @@ Arguments flow into the shim via the `$ARGUMENTS` placeholder
   `../config.toml`; see `../GUARDRAIL-PARITY.md` (Epic #1 Phase 3, #20) for the
   hook-by-hook covered / partial / no-equivalent classification and the
   documented residual gaps.
-- **No subagents**: `loom-sweep` under Codex runs the lifecycle phases
-  sequentially in one session instead of dispatching subagents
-  (Epic #1 Phase 3).
+- **No Claude-Code-style Task-tool subagents**: `loom-sweep` under Codex
+  runs the lifecycle phases sequentially in one session instead of
+  dispatching Task-tool subagents (Epic #1 Phase 3). Current Codex
+  clients do expose separate native, in-session collaboration primitives
+  (`spawn_agent`, `wait_agent`, etc.) — those are **not** a supported
+  Loom orchestration backend (issue #54); parallel Loom work always
+  routes to `spawn-codex-wave.sh` instead. See
+  `../.claude/commands/loom/sweep.md`'s "Codex backend policy" subsection.
 - **Prompts vs skills**: Codex marks custom prompts as deprecated in
   favor of skills. The shims still work during the transition window, but
   the skills port (issue #35) has landed — see the deprecation notice at

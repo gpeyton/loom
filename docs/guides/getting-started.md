@@ -708,13 +708,23 @@ or `/loom-sweep 42`. Each shim reads the same canonical
 
 ### Current limitations (honest list)
 
-- **No subagents**: `$loom-sweep` under Codex runs the sweep lifecycle
-  phases (Curator → Builder → Judge → Doctor → Merge) sequentially in one
-  session instead of dispatching parallel Task-tool subagents the way the
-  Claude Code path does. Multi-issue parallelism is available at the
-  process level instead — see `defaults/scripts/spawn-codex-wave.sh` — but
-  that is a separate operator-driven mechanism, not automatic per-sweep
-  parallelism.
+- **No Claude-Code-style Task-tool subagents**: `$loom-sweep` under Codex
+  runs the sweep lifecycle phases (Curator → Builder → Judge → Doctor →
+  Merge) sequentially in one session instead of dispatching parallel
+  Task-tool subagents the way the Claude Code path does. Multi-issue
+  parallelism is available at the process level instead — see
+  `defaults/scripts/spawn-codex-wave.sh` — but that is a separate
+  operator-driven mechanism, not automatic per-sweep parallelism.
+- **Native Codex agent primitives exist but are not a supported Loom
+  backend** (issue #54): current Codex clients expose native, in-session
+  collaboration primitives (`spawn_agent`, `wait_agent`, `send_message`,
+  `followup_task`, `interrupt_agent`). Loom deliberately does not route
+  Loom role/lifecycle dispatch through them — a request for "parallel Loom
+  agents" always goes to `spawn-codex-wave.sh` above, never to
+  `spawn_agent`. This is a policy choice (a capability gap, not a
+  technical impossibility) documented in `.claude/commands/loom/sweep.md`'s
+  "Codex backend policy" subsection; a fully-supported native-agent
+  backend is tracked as future work, not shipped today.
 - **No hook system**: Codex has no PreToolUse/UserPromptSubmit hook
   equivalent — its safety guarantees come from the sandbox/approval model
   instead. This is not an outstanding gap to fix; it's mapped in full in

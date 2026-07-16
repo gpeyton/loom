@@ -16,15 +16,28 @@ repository at `.claude/commands/loom/sweep.md` (the sweep skill is
 runtime-shared; that file is its single source of truth). Read it now
 and follow it.
 
-**Codex runtime (Epic #1 Phase 3, #19)**: the sweep skill's parallel
-dispatch assumes Claude Code Task-tool subagents, which Codex does not
-have. Under Codex, run the lifecycle **sequentially in this session** —
-for the target issue, perform Curator → Builder → Judge → Doctor (if
-needed) → Merge yourself, in order, following the corresponding
-`.loom/roles/<role>.md` file at each phase. Skip the skill's
-subagent/parallel-wave machinery. See the sweep skill's
-"Runtime-aware orchestration (Claude vs Codex)" section for the full
-Codex strategy, the model-tier mapping, and the guardrail-parity gate.
+**Codex runtime (Epic #1 Phase 3, #19)**: the sweep skill's Claude-Code
+Task-tool subagent dispatch does not exist under Codex. Under Codex, run
+the lifecycle **sequentially in this session** — for the target issue,
+perform Curator → Builder → Judge → Doctor (if needed) → Merge yourself,
+in order, following the corresponding `.loom/roles/<role>.md` file at
+each phase. Skip the skill's subagent/parallel-wave machinery. See the
+sweep skill's "Runtime-aware orchestration (Claude vs Codex)" section for
+the full Codex strategy, the model-tier mapping, and the guardrail-parity
+gate.
+
+- **Backend policy (issue #54) — do not use native Codex agent
+  primitives for Loom work.** Current Codex clients expose native,
+  in-session collaboration primitives (`spawn_agent`, `wait_agent`,
+  `send_message`, `followup_task`, `interrupt_agent`). Those primitives
+  are **not** a supported Loom orchestration backend — the only
+  supported way to parallelize Loom work under Codex is process-level
+  fan-out (`spawn-codex-wave.sh`, below). A request for "parallel Loom
+  agents," in any phrasing, routes to `spawn-codex-wave.sh`, never to
+  `spawn_agent`. Do not mix sequential-in-session, process-level
+  fan-out, daemon dispatch, and native-agent spawning within one run.
+  See the sweep skill's "Codex backend policy" subsection for the full
+  rationale.
 
 - The "one level deep" #3289 constraint is Claude-specific and does not
   apply to this process-level path — but still **settle each PR fully**
