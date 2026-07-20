@@ -151,23 +151,40 @@ def _strip_comment(line: str) -> str:
 
 
 def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
-    """Yield (name, status) pairs from the ranking file.
+    """Yield (name, status) pairs from the ranking file, soonest-reset first.
 
-    Format: ``name|status`` per line. Lines starting with ``#`` are skipped.
-    Malformed lines are skipped. ``status`` defaults to empty string.
+    Two formats are accepted:
+      * JSON (current probe-tokens.sh output): ``{"accounts": [{"name",
+        "status", "7d_reset", ...}]}`` — accounts are already sorted by
+        soonest reset; ``status`` "available" maps to "" (usable), others
+        (exhausted/blocked) pass through so the caller skips them.
+      * Legacy ``name|status`` per line (``#`` comments skipped).
     """
     try:
-        for raw in ranking_file.read_text(encoding="utf-8").splitlines():
-            stripped = _strip_comment(raw)
-            if not stripped:
-                continue
-            parts = stripped.split("|", 1)
-            name = parts[0].strip()
-            status = parts[1].strip() if len(parts) > 1 else ""
-            if name:
-                yield name, status
+        text = ranking_file.read_text(encoding="utf-8")
     except OSError:
         return
+    if text.lstrip().startswith("{"):
+        try:
+            for acct in json.loads(text).get("accounts", []):
+                name = (acct.get("name") or "").strip()
+                status = (acct.get("status") or "").strip()
+                if status == "available":
+                    status = ""
+                if name:
+                    yield name, status
+            return
+        except (ValueError, AttributeError):
+            pass  # fall through to legacy parse
+    for raw in text.splitlines():
+        stripped = _strip_comment(raw)
+        if not stripped:
+            continue
+        parts = stripped.split("|", 1)
+        name = parts[0].strip()
+        status = parts[1].strip() if len(parts) > 1 else ""
+        if name:
+            yield name, status
 
 
 def _read_allowlist(allowlist_file: Path) -> list[str]:
