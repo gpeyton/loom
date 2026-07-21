@@ -166,7 +166,18 @@ def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
         return
     if text.lstrip().startswith("{"):
         try:
-            for acct in json.loads(text).get("accounts", []):
+            accts = json.loads(text).get("accounts", [])
+            # Spread load: among available accounts, prefer the LEAST 5h-utilized
+            # (ties broken by file order = soonest weekly reset). Prevents the
+            # mass-stall pattern where every lane piles onto one account and
+            # burns its 5h window mid-task (Graham 2026-07-21).
+            def _load(a):
+                try:
+                    return float(a.get("5h_utilization") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            accts = sorted(accts, key=_load)
+            for acct in accts:
                 name = (acct.get("name") or "").strip()
                 status = (acct.get("status") or "").strip()
                 if status == "available":
