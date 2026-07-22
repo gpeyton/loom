@@ -167,16 +167,24 @@ def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
     if text.lstrip().startswith("{"):
         try:
             accts = json.loads(text).get("accounts", [])
-            # Spread load: among available accounts, prefer the LEAST 5h-utilized
-            # (ties broken by file order = soonest weekly reset). Prevents the
-            # mass-stall pattern where every lane piles onto one account and
-            # burns its 5h window mid-task (Graham 2026-07-21).
+            # WATERFALL FILL (Graham 2026-07-22): keep ranked order (soonest
+            # weekly reset first — expiring capacity is use-it-or-lose-it) but
+            # skip accounts already loaded past the sustainable-5h threshold;
+            # overflow cascades to the next-soonest. Uniform spreading is
+            # explicitly NOT wanted (it strands expiring capacity); pure
+            # concentration is not either (mass 5h stalls). The launcher's
+            # synthetic per-spawn bump makes in-burst load visible here.
             def _load(a):
                 try:
                     return float(a.get("5h_utilization") or 0.0)
                 except (TypeError, ValueError):
                     return 0.0
-            accts = sorted(accts, key=_load)
+            _THRESH = 0.70
+            under = [a for a in accts if _load(a) < _THRESH]
+            over = [a for a in accts if _load(a) >= _THRESH]
+            # ranked order preserved within each tier; loaded accounts remain
+            # eligible as last resort rather than failing the pool.
+            accts = under + over
             for acct in accts:
                 name = (acct.get("name") or "").strip()
                 status = (acct.get("status") or "").strip()
