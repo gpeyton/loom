@@ -182,7 +182,13 @@
 #   LOOM_SPAWN_NO_EXPORT If set, skip ALL auth resolution below tier 1
 #                       entirely — no CODEX_HOME profile selection, no pool
 #                       selection (matches spawn-claude.sh's contract).
-#   LOOM_PYTHON         Override the python interpreter (default: python3).
+#   LOOM_PYTHON         Override the python interpreter. When unset, the
+#                       engine venv (<engine>/loom-tools/.venv/bin/python) is
+#                       preferred, falling back to `python3` on PATH. The
+#                       resolved interpreter is asserted to be >= 3.10
+#                       (loom-tools' requires-python) before any loom_tools
+#                       module is imported; a sub-3.10 or unusable interpreter
+#                       exits 78 (EX_CONFIG).
 #   LOOM_PACKAGE_PATH   Override the loom_tools package source path.
 #   LOOM_CODEX_NO_EXEC  Test/CI hook: when set, print the resolved argv the
 #                       script WOULD exec (prefixed `spawn-codex would-exec:`)
@@ -200,6 +206,17 @@ NC='\033[0m'
 log_info() { echo -e "${BLUE}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] WARN${NC} $*" >&2; }
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR${NC} $*" >&2; }
+
+# --- Shared Python interpreter resolution (issue #72) ---
+# Same helper spawn-claude.sh uses: resolves LOOM_PYTHON > engine venv >
+# `python3` and asserts >= 3.10 before any loom_tools module is imported.
+_SPAWN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -r "${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh" ]]; then
+    log_error "Missing required helper: ${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh"
+    exit 78  # EX_CONFIG
+fi
+# shellcheck source=lib/python-resolve.sh
+source "${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh"
 
 # --- Argument parsing ---
 # We split the incoming dispatcher args into buckets:
@@ -350,7 +367,10 @@ POOL_ACCOUNT_NAME=""
 # credential bytes (issue #36 safety requirement).
 CODEX_PROFILE_NAME=""
 WORKSPACE=""
-PYTHON="${LOOM_PYTHON:-python3}"
+# Resolved by loom_setup_python() below (issue #72) — once, before the first
+# `$PYTHON` call site. Tier 1 (pre-set OPENAI_API_KEY) and LOOM_SPAWN_NO_EXPORT
+# never touch Python and deliberately stay Python-free.
+PYTHON=""
 PACKAGE_PATH=""
 
 # Resolve the loom_tools package source once (mirrors spawn-claude.sh's
@@ -389,6 +409,17 @@ elif [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
 else
     WORKSPACE="$(_resolve_workspace)"
     _resolve_package_path
+    # $PYTHON is resolved (and version-asserted) by loom_setup_python at the
+    # two points below where a loom_tools module is about to be imported —
+    # tier 3 (LOOM_CODEX_HOMES_DIR is set) and tier 4 (a .loom/tokens/ pool
+    # exists). Both call sites are guarded so that a Codex spawn which needs
+    # no loom_tools at all — tier 2's pinned CODEX_HOME, or tier 5's ambient
+    # `codex login` state — keeps working on hosts without a conforming
+    # Python. Where loom_tools IS load-bearing, a sub-3.10 or missing
+    # interpreter fails fast with EX_CONFIG naming the interpreter and its
+    # version, rather than surfacing later as an opaque import traceback
+    # (issue #72). loom_setup_python is idempotent, so the two guarded call
+    # sites resolve and assert exactly once per spawn.
 
     # Tier 2: explicit LOOM_CODEX_HOME pin. Used verbatim as CODEX_HOME (an
     # assignment, never a copy) iff it has a usable auth.json. A bad pin
@@ -411,6 +442,8 @@ else
         if [[ -z "$_codex_home_seed" ]]; then
             log_warn "spawn-codex: LOOM_CODEX_HOMES_DIR is set but neither LOOM_TERMINAL_ID nor LOOM_SWEEP_ID is set — cannot select deterministically, falling through to pool / ambient auth"
         else
+            # loom_tools is load-bearing from here — resolve + assert (#72).
+            loom_setup_python "$_SPAWN_SCRIPT_DIR" "$WORKSPACE"
             _profile_json=""
             if _profile_json="$(
                 PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
@@ -448,11 +481,21 @@ else
     if [[ -z "$CODEX_PROFILE_NAME" ]]; then
         # Try the openai side of the pool. Unlike spawn-claude.sh this NEVER
         # hard-fails (no EX_CONFIG): the pool is optional for Codex, and any
-        # selection failure (no pool, no openai accounts, all bad, python
-        # missing) falls through to ambient auth (tier 5). See the header for
-        # why this asymmetry is intentional.
+        # selection failure (no pool, no openai accounts, all bad) falls
+        # through to ambient auth (tier 5). See the header for why this
+        # asymmetry is intentional.
+        #
+        # The one exception is an unusable Python interpreter (< 3.10 or
+        # missing) when a pool DOES exist: that is a misconfiguration, not an
+        # absent optional pool, so loom_setup_python fails fast with EX_CONFIG
+        # instead of silently degrading to ambient auth (#72). With no
+        # .loom/tokens/ at all there is nothing to select and no interpreter
+        # is required — tier 5 must not be gated on Python.
+        if [[ -d "${WORKSPACE%/}/.loom/tokens" ]]; then
+            loom_setup_python "$_SPAWN_SCRIPT_DIR" "$WORKSPACE"
+        fi
         _selection_json=""
-        if _selection_json="$(
+        if [[ -n "$PYTHON" ]] && _selection_json="$(
             PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
             "$PYTHON" -m loom_tools.tokens.select \
                 --workspace "$WORKSPACE" --provider openai --json \

@@ -37,7 +37,13 @@
 #   LOOM_WORKSPACE         Override repo root detection.
 #   LOOM_SPAWN_NO_EXPORT   If set, skip selection (caller already exported a
 #                          token). Useful for testing the dispatch path.
-#   LOOM_PYTHON            Override the python interpreter (default: python3).
+#   LOOM_PYTHON            Override the python interpreter. When unset, the
+#                          engine venv (<engine>/loom-tools/.venv/bin/python)
+#                          is preferred, falling back to `python3` on PATH.
+#                          The resolved interpreter is asserted to be
+#                          >= 3.10 (loom-tools' requires-python) before any
+#                          loom_tools module is imported; a sub-3.10 or
+#                          unusable interpreter exits 78 (EX_CONFIG).
 #   LOOM_MODEL             Model to pass as `claude --model <value>` (issue
 #                          #3477). Lowest-priority tier: an explicit `--model`
 #                          in the passthrough args always wins. When neither
@@ -55,6 +61,18 @@ NC='\033[0m'
 log_info() { echo -e "${BLUE}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] WARN${NC} $*" >&2; }
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR${NC} $*" >&2; }
+
+# --- Shared Python interpreter resolution (issue #72) ---
+# Provides loom_setup_python(), which resolves LOOM_PYTHON > engine venv >
+# `python3` and asserts the result is >= 3.10 before any loom_tools module is
+# imported. Shared with spawn-codex.sh so the two spawners cannot drift.
+_SPAWN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -r "${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh" ]]; then
+    log_error "Missing required helper: ${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh"
+    exit 78  # EX_CONFIG
+fi
+# shellcheck source=lib/python-resolve.sh
+source "${_SPAWN_SCRIPT_DIR}/lib/python-resolve.sh"
 
 # --- Repo root resolution (handles worktrees) ---
 # If LOOM_WORKSPACE is set, trust it. Otherwise:
@@ -88,7 +106,11 @@ _resolve_workspace() {
 }
 
 WORKSPACE="$(_resolve_workspace)"
-PYTHON="${LOOM_PYTHON:-python3}"
+# Resolved by loom_setup_python() at the top of the token-selection block
+# below — i.e. exactly once, before the first `$PYTHON` call site. Spawn paths
+# that never touch Python (`--help`, a pre-set CLAUDE_CODE_OAUTH_TOKEN,
+# LOOM_SPAWN_NO_EXPORT) deliberately stay Python-free.
+PYTHON=""
 
 # --- Argument parsing ---
 USE_WRAPPER=false
@@ -186,6 +208,13 @@ fi
 
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    # Resolve the interpreter and assert loom-tools' >= 3.10 floor ONCE, ahead
+    # of every `$PYTHON` call site below (issue #72). Without this, a sub-3.10
+    # interpreter on PATH would import loom_tools anyway (PYTHONPATH is
+    # injected) and any 3.10-only syntax would surface as an unrelated-looking
+    # "Token selection failed" traceback. Exits 78 (EX_CONFIG) on failure.
+    loom_setup_python "$_SPAWN_SCRIPT_DIR" "$WORKSPACE"
+
     # Pre-flight: auto-unpin if every allowlisted account has hit the
     # consecutive-failure threshold (default 5). Without this, an
     # operator-set pin can trap the spawner once all pinned accounts
