@@ -61,7 +61,8 @@
 #        used as CODEX_HOME verbatim (never copied — see "Never copy
 #        auth.json" below). No usable profile (missing dir, empty pool, no
 #        seed available) falls through to tier 4 with a log line, never a
-#        hard failure.
+#        hard failure — the sole exception is an unusable Python interpreter,
+#        see the ASYMMETRY note below.
 #     4. `.loom/tokens/` pool (issue #12/#18): `python3 -m
 #        loom_tools.tokens.select --provider openai` picks an openai account
 #        (per-account provider is recorded in index.json by `loom-tokens
@@ -94,6 +95,14 @@
 #   situation because Claude rotation is the documented load-bearing auth
 #   path; for Codex every tier below OPENAI_API_KEY is OPTIONAL, with
 #   `codex login` as the expected fallback.
+#   ONE EXCEPTION (issue #72): an unusable Python interpreter (< 3.10, or
+#   missing/not executable) is a misconfiguration, not an absent optional
+#   tier, so it exits 78 (EX_CONFIG) at the two points where loom_tools is
+#   load-bearing — tier 3 once LOOM_CODEX_HOMES_DIR selection is about to
+#   run, and tier 4 when a `.loom/tokens/` pool exists. Spawns that need no
+#   loom_tools at all stay Python-free and are unaffected: tier 1's pre-set
+#   OPENAI_API_KEY, LOOM_SPAWN_NO_EXPORT, tier 2's pinned LOOM_CODEX_HOME,
+#   and tier 5's ambient auth when no pool is present.
 #
 #   Bad-token reporting: when a pool-selected key is in use in
 #   non-interactive (-p) mode, codex output is captured and classified via
