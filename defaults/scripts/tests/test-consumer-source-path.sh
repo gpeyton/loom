@@ -6,7 +6,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PYTHON_BIN="$(command -v python3)"
+
+# loom-tools requires Python >= 3.10 and the spawn scripts enforce that floor
+# (issue #72) — the stub selector below still has to run under a conforming
+# interpreter.
+# shellcheck source=lib/require-python.sh
+source "$SCRIPT_DIR/lib/require-python.sh"
+require_python_310 || exit 1
+PYTHON_BIN="$LOOM_TEST_PYTHON"
 TMP_ROOT="$(mktemp -d)"
 CONSUMER="$TMP_ROOT/consumer repo"
 SOURCE="$TMP_ROOT/loom source"
@@ -39,6 +46,7 @@ mkdir -p \
 cp "$SCRIPTS_DIR/spawn-claude.sh" "$CONSUMER/.loom/scripts/"
 cp "$SCRIPTS_DIR/spawn-codex.sh" "$CONSUMER/.loom/scripts/"
 cp "$SCRIPTS_DIR/lib/classify-error.sh" "$CONSUMER/.loom/scripts/lib/"
+cp "$SCRIPTS_DIR/lib/python-resolve.sh" "$CONSUMER/.loom/scripts/lib/"
 chmod +x "$CONSUMER/.loom/scripts/spawn-claude.sh" \
     "$CONSUMER/.loom/scripts/spawn-codex.sh"
 

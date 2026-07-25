@@ -159,6 +159,36 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### Spawn exits 78: "loom-tools requires >= 3.10"
+
+`spawn-claude.sh` / `spawn-codex.sh` refuse to run `loom_tools` (token
+selection, Codex-profile selection) under an interpreter below loom-tools'
+`requires-python = ">=3.10"` floor. The error names the interpreter and its
+version, e.g.:
+
+```
+ERROR Python interpreter '/usr/bin/python3' is Python 3.9.6, but loom-tools requires >= 3.10.
+```
+
+This is common on stock macOS, where `/usr/bin/python3` is the Command Line
+Tools 3.9. The spawn scripts prefer the engine venv automatically, so the fix
+is usually to create it:
+
+```bash
+# In the Loom engine checkout — creates <engine>/loom-tools/.venv
+./scripts/install/setup-python-tools.sh
+
+# Or point the spawners at any >= 3.10 interpreter explicitly
+export LOOM_PYTHON=/opt/homebrew/bin/python3.12
+```
+
+Interpreter precedence is `LOOM_PYTHON` > `<engine>/loom-tools/.venv/bin/python`
+> `python3` on `PATH`; the resolved choice is logged once per spawn as
+`spawn-claude: python=<path> (source=...)`. Spawn paths that never touch
+Python — `--help`, a pre-set `CLAUDE_CODE_OAUTH_TOKEN`/`OPENAI_API_KEY`,
+`LOOM_SPAWN_NO_EXPORT`, or a Codex spawn with no `.loom/tokens/` pool — are
+unaffected by the check.
+
 ### Codex worker troubleshooting (runtime parity)
 
 Loom supports the **OpenAI Codex CLI** as a co-equal worker runtime alongside

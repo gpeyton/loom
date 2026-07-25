@@ -1370,6 +1370,7 @@ EXPECTED_FILES=(
   ".loom/scripts/lib/loom-tools.sh"
   ".loom/scripts/lib/forge-helpers.sh"
   ".loom/scripts/lib/pipe-pane-cmd.sh"
+  ".loom/scripts/lib/python-resolve.sh"
   ".loom/hooks/guard-destructive.sh"
   ".loom/hooks/skill-router.sh"
   "CLAUDE.md"

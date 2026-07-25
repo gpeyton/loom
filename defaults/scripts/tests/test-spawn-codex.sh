@@ -15,6 +15,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# loom-tools requires Python >= 3.10 and the spawn scripts enforce that floor
+# (issue #72); pin a conforming interpreter for the loom_tools-backed paths
+# exercised below.
+# shellcheck source=lib/require-python.sh
+source "$SCRIPT_DIR/lib/require-python.sh"
+require_python_310 || exit 1
+export LOOM_PYTHON="$LOOM_TEST_PYTHON"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
