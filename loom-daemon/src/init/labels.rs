@@ -48,14 +48,21 @@
 //! 1. Removes every entry whose label name is in the currently-shipped Loom set
 //!    (these are Loom's own, and are about to be re-added inside the markers).
 //! 2. Removes top-level comment lines that appear **verbatim** in the shipped
-//!    block (Loom's own section headers — provably Loom-authored, and re-added
-//!    inside the markers, so nothing is actually lost).
+//!    block *and* carry at least one alphanumeric character (Loom's own section
+//!    headers — provably Loom-authored, and re-added inside the markers, so
+//!    nothing is actually lost). The alphanumeric requirement matters: the
+//!    shipped block contains content-free separators (a bare `#`, a
+//!    `# =====` rule) which are exactly the separators a consumer is likely to
+//!    have written independently, so a verbatim match on those proves nothing.
 //! 3. Splices the marked block in at the position of the first removed entry,
 //!    so consumer content keeps its relative order. If the file contained no
 //!    Loom labels at all, the block is appended at the end.
 //!
 //! Everything else — consumer entries, consumer comments, consumer ordering —
-//! survives byte-for-byte.
+//! is preserved. The one deliberate exception is whitespace: runs of blank
+//! lines are collapsed to a single blank line (see `normalize`), which is what
+//! makes repeated upgrades byte-idempotent. Consumer *content* is never
+//! altered, but a consumer's intentional double-blank becomes a single blank.
 //!
 //! The same name-based removal also runs on the marker path, so a consumer entry
 //! that collides with a Loom label name outside the markers can never produce a
@@ -149,13 +156,29 @@ fn collect_names(lines: &[&str]) -> HashSet<String> {
     lines.iter().filter_map(|l| entry_name(l)).collect()
 }
 
+/// True when a comment line carries actual content — at least one alphanumeric
+/// character after the leading `#`s.
+///
+/// Content-free comments (a bare `#`, a `# ============` rule) are *not*
+/// attributable: the shipped block contains them, but so does almost every
+/// hand-commented YAML file, so a verbatim match against the shipped block is
+/// no evidence at all that the consumer's copy came from Loom. Only
+/// content-bearing comments are treated as provably Loom-authored and therefore
+/// eligible for removal during the markerless migration.
+fn is_content_comment(line: &str) -> bool {
+    line.trim_start_matches('#')
+        .chars()
+        .any(char::is_alphanumeric)
+}
+
 /// Collect top-level (column 0) comment lines from a slice, excluding the
-/// markers themselves.
+/// markers themselves and any content-free separator lines.
 fn collect_top_level_comments<'a>(lines: &[&'a str]) -> HashSet<&'a str> {
     lines
         .iter()
         .filter(|l| {
             l.starts_with('#')
+                && is_content_comment(l)
                 && !is_marker(l, LABELS_SECTION_START)
                 && !is_marker(l, LABELS_SECTION_END)
         })
@@ -272,9 +295,12 @@ pub fn merge_labels_yml(shipped: &str, existing: Option<&str>) -> String {
         }
 
         // Markerless migration only: drop Loom's own top-level section comments.
-        // They are re-added verbatim inside the block, so no content is lost.
-        // On the marker path, comments outside the block are consumer-owned and
-        // are never touched.
+        // `loom_comments` holds only content-bearing lines (see
+        // `is_content_comment`), so a consumer's own `#` or `# ====` separator
+        // can never match here even though the shipped block contains both.
+        // The lines that do match are re-added verbatim inside the block, so no
+        // content is lost. On the marker path, comments outside the block are
+        // consumer-owned and are never touched.
         if !had_markers && lines[i].starts_with('#') && loom_comments.contains(lines[i]) {
             i += 1;
             continue;
@@ -345,9 +371,43 @@ mod tests {
 # END LOOM LABELS
 ";
 
+    /// Mirrors the real `defaults/.github/labels.yml` header shipped by #68,
+    /// which opens with content-free separator lines (a `# ====` rule and a
+    /// bare `#`). Those are the lines a consumer is most likely to have
+    /// authored independently, so they must never be attributed to Loom.
+    const SHIPPED_WITH_SEPARATORS: &str = "\
+# BEGIN LOOM LABELS
+# ============================================================================
+# LOOM-MANAGED BLOCK -- do not edit between the BEGIN/END LOOM LABELS markers.
+#
+# Your own labels belong OUTSIDE the markers (above or below this block).
+# ============================================================================
+# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work
+  color: \"3B82F6\"
+# END LOOM LABELS
+";
+
     /// Extract label names in file order (test helper).
     fn names(content: &str) -> Vec<String> {
         content.lines().filter_map(entry_name).collect()
+    }
+
+    /// Everything outside the marked block — i.e. the consumer-owned region
+    /// that the merge promises to leave alone (test helper).
+    fn outside_markers(content: &str) -> Vec<&str> {
+        let lines: Vec<&str> = content.lines().collect();
+        let block = find_marker_block(&lines);
+        assert!(block.is_some(), "merged output must have markers: {content}");
+        let (start, end) = block.unwrap_or((0, 0));
+        lines[..start]
+            .iter()
+            .chain(lines[end + 1..].iter())
+            .copied()
+            .collect()
     }
 
     #[test]
@@ -427,6 +487,95 @@ mod tests {
                 "area/ui".to_string(),
             ]
         );
+    }
+
+    /// Regression for the markerless-migration comment-deletion defect.
+    ///
+    /// The shipped block carries content-free separators (`# ====`, bare `#`).
+    /// Matching a consumer line verbatim against those proves nothing about
+    /// who wrote it, so they must survive the one-shot migration. Before the
+    /// `is_content_comment` guard this test lost three consumer lines.
+    #[test]
+    fn markerless_migration_keeps_consumer_separator_comments() {
+        let existing = "\
+# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work
+  color: \"3B82F6\"
+
+# ============================================================================
+# PROJECT LABELS -- ours, must survive
+#
+# The bare '#' line above is a separator we authored.
+# ============================================================================
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+";
+        let merged = merge_labels_yml(SHIPPED_WITH_SEPARATORS, Some(existing));
+        let outside = outside_markers(&merged);
+
+        assert_eq!(
+            outside.iter().filter(|l| **l == "#").count(),
+            1,
+            "consumer's bare '#' separator was deleted: {merged}"
+        );
+        assert_eq!(
+            outside
+                .iter()
+                .filter(|l| l.starts_with("# ===") && !l.contains(char::is_alphanumeric))
+                .count(),
+            2,
+            "consumer's '# ====' rules were deleted: {merged}"
+        );
+        assert!(
+            outside.contains(&"# PROJECT LABELS -- ours, must survive"),
+            "consumer heading was deleted: {merged}"
+        );
+        assert!(
+            outside.contains(&"# The bare '#' line above is a separator we authored."),
+            "consumer prose was deleted: {merged}"
+        );
+
+        // The guard must not cost orphan leakage: Loom's own *content-bearing*
+        // headers are still removed from the consumer region and re-added
+        // inside the markers.
+        assert!(
+            !outside.contains(&"# Loom Workflow Labels"),
+            "Loom's own header leaked outside the block: {merged}"
+        );
+        assert!(
+            !outside.contains(&"# Core Workflow States"),
+            "Loom's own header leaked outside the block: {merged}"
+        );
+
+        assert!(merged.contains("- name: feedback:static"));
+        assert!(duplicate_label_names(&merged).is_empty(), "{merged}");
+        assert_eq!(
+            merge_labels_yml(SHIPPED_WITH_SEPARATORS, Some(&merged)),
+            merged,
+            "still idempotent with separator-bearing shipped block"
+        );
+    }
+
+    #[test]
+    fn content_free_comments_are_never_attributed_to_loom() {
+        assert!(!is_content_comment("#"));
+        assert!(!is_content_comment("# ===================="));
+        assert!(!is_content_comment("# ----"));
+        assert!(!is_content_comment("#####"));
+        assert!(!is_content_comment("# -- * -- * --"));
+        assert!(is_content_comment("# Core Workflow States"));
+        assert!(is_content_comment("# 1"));
+
+        // The predicate is what keeps separators out of the attributable set.
+        let block: Vec<&str> = SHIPPED_WITH_SEPARATORS.lines().collect();
+        let collected = collect_top_level_comments(&block);
+        assert!(!collected.contains("#"));
+        assert!(!collected.iter().any(|l| !l.contains(char::is_alphanumeric)));
+        assert!(collected.contains("# Loom Workflow Labels"));
     }
 
     #[test]

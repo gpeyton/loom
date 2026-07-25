@@ -576,6 +576,61 @@ assert_not_contains "$LABELS_AFTER8" "- name: loom:building" \
     "markerless: Loom label loom:building was removed"
 rm -rf "$T8"
 
+# --- 5h: markerless legacy file with consumer separator comments ----------
+# Regression: the name-based fallback also drops top-level comment lines that
+# match the shipped defaults verbatim. Since #68 the shipped block opens with
+# content-free separators (a bare "#", a "# ====" rule) — lines a consumer is
+# just as likely to have authored. Matching those verbatim proves nothing, so
+# they must survive. Mirrors is_content_comment() in
+# loom-daemon/src/init/labels.rs and the Rust test
+# markerless_migration_keeps_consumer_separator_comments.
+T10=$(mktemp -d /tmp/loom-labels-separators-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T10" "# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work by human (ready for Builder to claim)
+  color: \"3B82F6\"
+
+# ============================================================================
+# PROJECT LABELS -- ours, must survive
+#
+# The bare '#' line above is a separator we authored.
+# ============================================================================
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+"
+
+"$UNINSTALL_SH" --yes --local "$T10" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+LABELS_AFTER10=$(cat "$T10/.github/labels.yml" 2>/dev/null || echo "<file deleted>")
+BARE_HASH_COUNT=$(printf '%s\n' "$LABELS_AFTER10" | grep -c '^#$' || true)
+RULE_COUNT=$(printf '%s\n' "$LABELS_AFTER10" | grep -c '^# =*$' || true)
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$BARE_HASH_COUNT" == "1" && "$RULE_COUNT" == "2" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: markerless uninstall keeps consumer separator comments (# and # ====)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: markerless uninstall deleted consumer separator comments" \
+        "(bare '#': $BARE_HASH_COUNT/1, '# ====': $RULE_COUNT/2)"
+    sed 's/^/      /' "$T10/.github/labels.yml" 2>/dev/null || true
+fi
+
+assert_contains "$LABELS_AFTER10" "# PROJECT LABELS -- ours, must survive" \
+    "markerless: consumer heading survived uninstall"
+assert_contains "$LABELS_AFTER10" "The bare '#' line above is a separator we authored." \
+    "markerless: consumer prose survived uninstall"
+assert_contains "$LABELS_AFTER10" "- name: feedback:static" \
+    "markerless separators: consumer label survived uninstall"
+assert_not_contains "$LABELS_AFTER10" "- name: loom:issue" \
+    "markerless separators: Loom label loom:issue was removed"
+assert_not_contains "$LABELS_AFTER10" "# Core Workflow States" \
+    "markerless separators: Loom's own content-bearing header was removed"
+rm -rf "$T10"
+
 # --- 5g: Loom-only file -> deleted outright ------------------------------
 # The pre-#68 contract (scripts/test-installer.sh Test 24) must still hold for
 # repos that never added labels of their own.

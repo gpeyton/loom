@@ -1107,8 +1107,11 @@ fi
 #      CLAUDE.md handling above.
 #   2. Markerless (installed on 0.10.x or earlier, never upgraded): fall back to
 #      removing entries whose label name is one Loom ships, plus Loom's own
-#      verbatim top-level comment lines. Both sets are read from
-#      defaults/.github/labels.yml, so only provably Loom-authored lines go.
+#      verbatim, content-bearing top-level comment lines. Both sets are read
+#      from defaults/.github/labels.yml, so only provably Loom-authored lines
+#      go. Content-free separators (bare "#", "# ====" rules) are excluded from
+#      the comment set — they appear in the shipped block but are equally
+#      likely to be consumer-authored, so a verbatim match proves nothing.
 #
 # In both shapes the file is deleted only when no `- name:` entry survives,
 # i.e. when it was entirely Loom's.
@@ -1135,7 +1138,12 @@ if [[ -f "$LABELS_YML" ]]; then
           sub(/[ \t]+#.*$/, "", n)
           gsub(/^"|"$/, "", n)
           if (n != "") names[n] = 1
-        } else if ($0 ~ /^#/) {
+        } else if ($0 ~ /^#/ && $0 ~ /[A-Za-z0-9]/) {
+          # Content-bearing comments only. The shipped block also contains
+          # content-free separators (a bare "#", a "# =====" rule); those are
+          # exactly what a consumer writes in their own hand-commented YAML, so
+          # a verbatim match on them proves nothing about authorship. Mirrors
+          # is_content_comment() in loom-daemon/src/init/labels.rs.
           comments[$0] = 1
         }
         next
@@ -1161,7 +1169,7 @@ if [[ -f "$LABELS_YML" ]]; then
             i = last + 1
             continue
           }
-          if (l ~ /^#/ && (l in comments)) { i++; continue }
+          if (l ~ /^#/ && l ~ /[A-Za-z0-9]/ && (l in comments)) { i++; continue }
           print l
           i++
         }

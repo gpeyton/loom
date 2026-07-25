@@ -435,8 +435,11 @@ and keeps the file when any of your labels remain.
 
 Upgrading from Loom 0.10.x or earlier? Your `labels.yml` has no markers yet. The
 first upgrade after this change migrates it in place: Loom's own entries are
-replaced by the marked block, everything else is left alone, and no duplicate
-label names are produced. Nothing needs to be done by hand.
+replaced by the marked block, and no duplicate label names are produced. Your
+labels, your comments, and their relative order are preserved; the only thing
+the migration changes about your content is whitespace — runs of blank lines are
+collapsed to a single blank line, which is what makes repeated upgrades a no-op
+diff. Nothing needs to be done by hand.
 
 ### Gitignore Updates
 
