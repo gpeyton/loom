@@ -580,8 +580,15 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
     # Also clean any untracked files left by the uninstall process
     # Only clean Loom-owned directories — NOT .claude/ which is a shared directory
-    # that may contain custom project-specific commands not installed by Loom
-    git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .agents/ .github/labels.yml 2>/dev/null || true
+    # that may contain custom project-specific commands not installed by Loom.
+    #
+    # Issue #68: .github/labels.yml was removed from this list. It is a SHARED
+    # file — Loom owns only the `# BEGIN/END LOOM LABELS` block; consumer labels
+    # live outside the markers. `git clean` would delete an untracked
+    # labels.yml wholesale, taking the consumer's labels with it. The uninstall
+    # step already strips just the marked block, so there is nothing left here
+    # for the clean to do.
+    git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .agents/ 2>/dev/null || true
 
     # Verify the working tree is clean
     if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
@@ -1132,6 +1139,23 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
     # even when a legacy over-broad manifest (v0.7.x, #3450) lists it.
     # If Loom ever ships new .github/ files (e.g. workflows), add those
     # exact paths here AND in scripts/uninstall-loom.sh.
+    #
+    # Issue #68: .github/labels.yml is a SHARED file, not a wholly Loom-owned
+    # one. Loom owns only the `# BEGIN LOOM LABELS` / `# END LOOM LABELS`
+    # block inside it (merged by `loom-daemon init` via
+    # loom-daemon/src/init/labels.rs); everything outside the markers is
+    # consumer-authored. It must therefore never be git-rm'd by the sweep,
+    # for the same reason CLAUDE.md / .gitignore never are — those get
+    # marker-scoped or additive treatment instead of wholesale removal.
+    #
+    # NOTE: labels.yml is deliberately left in the allowlist `case` below so
+    # the hand-maintained mirrors in scripts/uninstall-loom.sh and
+    # scripts/test-installer.sh (assert_carveout_in_sync) stay byte-identical.
+    # This earlier `continue` is what actually protects it.
+    if [[ "$prev_file" == ".github/labels.yml" ]]; then
+      continue
+    fi
+
     case "$prev_file" in
       CLAUDE.md|AGENTS.md|.gitignore|.claude/settings.json)
         continue

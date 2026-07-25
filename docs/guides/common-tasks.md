@@ -70,6 +70,12 @@ gh label sync -f .github/labels.yml
 gh label list | grep "loom:"
 ```
 
+`.github/labels.yml` is shared, not Loom-exclusive. Loom owns only the block
+between `# BEGIN LOOM LABELS` and `# END LOOM LABELS`; anything you add outside
+those markers is consumer-owned and is preserved across install, upgrade, and
+uninstall. Put your project's own labels there. See
+[getting-started.md](getting-started.md#githublabelsyml-is-a-shared-file).
+
 #### 2. Customize Terminal Roles
 
 Edit `.loom/config.json` to configure default terminals:

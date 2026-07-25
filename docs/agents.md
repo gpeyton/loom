@@ -436,6 +436,11 @@ gh label list
 gh label sync --file .github/labels.yml
 ```
 
+`.github/labels.yml` is co-owned: Loom manages only the block between
+`# BEGIN LOOM LABELS` and `# END LOOM LABELS`. Labels you add outside those
+markers are consumer-owned and are preserved across install, upgrade, and
+uninstall — so re-syncing applies both Loom's workflow labels and your own.
+
 ### Conflicting Work
 
 If two agents claim the same issue:

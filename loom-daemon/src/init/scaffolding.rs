@@ -22,9 +22,10 @@ use serde_json::Value;
 
 use super::file_ops::{
     copy_dir_with_report, copy_dir_with_report_filtered, force_merge_dir_with_report,
-    force_merge_dir_with_report_filtered, merge_dir_with_report,
+    force_merge_dir_with_report_filtered, merge_dir_with_report, merge_dir_with_report_filtered,
 };
 use super::git::extract_repo_info;
+use super::labels::merge_labels_yml;
 use super::templates::{assert_no_placeholders, substitute_template_variables, LoomMetadata};
 use super::InitReport;
 
@@ -53,6 +54,15 @@ pub const LEGACY_LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
 fn is_loom_hook_command(cmd: &str) -> bool {
     cmd.starts_with(LOOM_HOOK_PREFIX) || cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX)
 }
+
+/// Workspace-relative path of the shared label-definition file.
+///
+/// `.github/labels.yml` is deliberately excluded from the directory-level
+/// `.github/` copy and from post-install byte verification: it is a *shared*
+/// file whose Loom-owned portion is delimited by the
+/// `# BEGIN LOOM LABELS` / `# END LOOM LABELS` markers, with consumer-authored
+/// labels living outside them. See [`super::labels`] and issue #68.
+pub const LABELS_YML_REL_PATH: &str = ".github/labels.yml";
 
 /// Loom section markers for CLAUDE.md content preservation
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
@@ -608,6 +618,30 @@ pub fn setup_repository_scaffolding(
             Ok(())
         };
 
+    // Same as `copy_directory`, but honors a skip predicate so a single file
+    // inside an otherwise directory-copied tree can be owned by bespoke merge
+    // logic. Used for `.github/labels.yml` (issue #68).
+    let copy_directory_filtered = |src: &Path,
+                                   dst: &Path,
+                                   name: &str,
+                                   report: &mut InitReport,
+                                   skip: &dyn Fn(&str) -> bool|
+     -> Result<(), String> {
+        if src.exists() {
+            if !dst.exists() {
+                copy_dir_with_report_filtered(src, dst, name, report, skip)
+                    .map_err(|e| format!("Failed to copy {name}: {e}"))?;
+            } else if force {
+                force_merge_dir_with_report_filtered(src, dst, name, report, skip)
+                    .map_err(|e| format!("Failed to force-merge {name}: {e}"))?;
+            } else {
+                merge_dir_with_report_filtered(src, dst, name, report, skip)
+                    .map_err(|e| format!("Failed to merge {name}: {e}"))?;
+            }
+        }
+        Ok(())
+    };
+
     // Handle Loom CLAUDE.md content:
     //
     // 1. Write full Loom guide to `<workspace>/.loom/CLAUDE.md` (template substituted)
@@ -942,13 +976,50 @@ pub fn setup_repository_scaffolding(
         report,
     )?;
 
-    // Copy .github/ directory
-    copy_directory(
+    // Copy .github/ directory.
+    //
+    // `.github/labels.yml` is excluded from the directory copy and merged
+    // separately below. Both directory strategies are wrong for it:
+    //   - force-merge (`--force`, what Quick Install's reinstall always passes)
+    //     overwrote it wholesale, silently deleting consumer-authored labels;
+    //   - plain merge preserved it forever once it existed, so a repo that had
+    //     ever touched the file stopped receiving Loom's own label updates.
+    // See issue #68 and `super::labels`.
+    let labels_dst = workspace_path.join(LABELS_YML_REL_PATH);
+    // Snapshot BEFORE the copy — force-merge would otherwise destroy the
+    // consumer content we need to merge against.
+    let existing_labels = fs::read_to_string(&labels_dst).ok();
+
+    copy_directory_filtered(
         &defaults_path.join(".github"),
         &workspace_path.join(".github"),
         ".github",
         report,
+        &|rel| rel == LABELS_YML_REL_PATH,
     )?;
+
+    // Marker-scoped merge for .github/labels.yml (issue #68).
+    let labels_src = defaults_path.join(LABELS_YML_REL_PATH);
+    if labels_src.exists() {
+        let shipped = fs::read_to_string(&labels_src)
+            .map_err(|e| format!("Failed to read {LABELS_YML_REL_PATH} from defaults: {e}"))?;
+        let merged = merge_labels_yml(&shipped, existing_labels.as_deref());
+
+        if let Some(parent) = labels_dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create .github directory: {e}"))?;
+        }
+        fs::write(&labels_dst, &merged)
+            .map_err(|e| format!("Failed to write {LABELS_YML_REL_PATH}: {e}"))?;
+
+        match existing_labels {
+            None => report.added.push(LABELS_YML_REL_PATH.to_string()),
+            Some(previous) if previous != merged => {
+                report.updated.push(LABELS_YML_REL_PATH.to_string());
+            }
+            Some(_) => report.preserved.push(LABELS_YML_REL_PATH.to_string()),
+        }
+    }
 
     // Note: The label-external-issues.yml workflow is no longer installed by default.
     // It generated spammy "No jobs were run" emails in single-contributor repos.
@@ -3361,5 +3432,189 @@ Run `cargo run` to start.";
         // must pass.
         let clean = wrap_loom_content(LOOM_ROOT_POINTER);
         assert!(assert_no_placeholders(&clean, "CLAUDE.md").is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // .github/labels.yml marker-scoped merge (issue #68)
+    // ------------------------------------------------------------------
+
+    const SHIPPED_LABELS: &str = "\
+# BEGIN LOOM LABELS
+# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work
+  color: \"3B82F6\"
+# END LOOM LABELS
+";
+
+    /// Build a workspace + defaults pair carrying a `.github/labels.yml`, and
+    /// optionally seed a pre-existing consumer file at the workspace path.
+    fn setup_labels_test(
+        temp_dir: &TempDir,
+        existing: Option<&str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (workspace, defaults) =
+            setup_test_with_claude_template(temp_dir, "# Loom Orchestration - Repository Guide");
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::create_dir_all(defaults.join(".github")).unwrap();
+        fs::write(defaults.join(LABELS_YML_REL_PATH), SHIPPED_LABELS).unwrap();
+        if let Some(content) = existing {
+            fs::create_dir_all(workspace.join(".github")).unwrap();
+            fs::write(workspace.join(LABELS_YML_REL_PATH), content).unwrap();
+        }
+        (workspace, defaults)
+    }
+
+    fn read_labels(workspace: &Path) -> String {
+        fs::read_to_string(workspace.join(LABELS_YML_REL_PATH)).unwrap()
+    }
+
+    /// The exact pre-#68 shape: a markerless labels.yml with consumer labels
+    /// appended below Loom's block. This is the file that lost 59 lines.
+    const MARKERLESS_WITH_CONSUMER_LABELS: &str = "\
+# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work
+  color: \"3B82F6\"
+
+# ---- project labels ----
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+";
+
+    #[test]
+    fn test_labels_yml_fresh_install_ships_marked_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_labels_test(&temp_dir, None);
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = read_labels(&workspace);
+        assert_eq!(content, SHIPPED_LABELS);
+        assert!(report.added.contains(&LABELS_YML_REL_PATH.to_string()));
+    }
+
+    #[test]
+    fn test_labels_yml_force_reinstall_preserves_consumer_labels() {
+        // The failure mode Quick Install hits by default: `loom-daemon init
+        // --force` used to overwrite .github/labels.yml wholesale, deleting
+        // every consumer-authored label. This is the regression guard.
+        let temp_dir = TempDir::new().unwrap();
+        let existing = "\
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: STALE
+  color: \"000000\"
+# END LOOM LABELS
+
+# ---- project labels ----
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+";
+        let (workspace, defaults) = setup_labels_test(&temp_dir, Some(existing));
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
+
+        let content = read_labels(&workspace);
+        assert!(
+            content.contains("- name: feedback:static"),
+            "--force destroyed consumer labels: {content}"
+        );
+        assert!(content.contains("# ---- project labels ----"));
+        // Loom's own block was still updated (not frozen).
+        assert!(content.contains("description: Approved for work"), "{content}");
+        assert!(!content.contains("STALE"), "{content}");
+        assert!(report.updated.contains(&LABELS_YML_REL_PATH.to_string()));
+    }
+
+    #[test]
+    fn test_labels_yml_non_force_reinstall_still_applies_loom_updates() {
+        // The mirror-image failure mode: plain (non-force) merge preserved an
+        // existing labels.yml forever, so a customized file never received
+        // Loom's own label updates.
+        let temp_dir = TempDir::new().unwrap();
+        let existing = "\
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: STALE
+  color: \"000000\"
+# END LOOM LABELS
+
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+";
+        let (workspace, defaults) = setup_labels_test(&temp_dir, Some(existing));
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = read_labels(&workspace);
+        assert!(
+            content.contains("description: Approved for work"),
+            "non-force reinstall froze Loom's own labels: {content}"
+        );
+        assert!(content.contains("- name: feedback:static"));
+    }
+
+    #[test]
+    fn test_labels_yml_markerless_migration_adds_markers_without_data_loss() {
+        // Highest-risk case: every repo installed on 0.10.x has a markerless
+        // labels.yml. The first post-fix upgrade must add markers around Loom's
+        // labels while keeping consumer labels and producing no duplicates.
+        for force in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let (workspace, defaults) =
+                setup_labels_test(&temp_dir, Some(MARKERLESS_WITH_CONSUMER_LABELS));
+
+            let mut report = InitReport::default();
+            setup_repository_scaffolding(&workspace, &defaults, force, &mut report).unwrap();
+
+            let content = read_labels(&workspace);
+            assert!(
+                content.contains(super::super::labels::LABELS_SECTION_START),
+                "force={force}: markers not added: {content}"
+            );
+            assert!(content.contains(super::super::labels::LABELS_SECTION_END));
+            assert!(
+                content.contains("- name: feedback:static"),
+                "force={force}: consumer label destroyed: {content}"
+            );
+            assert!(content.contains("# ---- project labels ----"));
+            assert_eq!(
+                super::super::labels::duplicate_label_names(&content),
+                Vec::<String>::new(),
+                "force={force}: migration produced duplicate label names: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_labels_yml_repeated_upgrades_are_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) =
+            setup_labels_test(&temp_dir, Some(MARKERLESS_WITH_CONSUMER_LABELS));
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
+        let first = read_labels(&workspace);
+
+        let mut report2 = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, true, &mut report2).unwrap();
+        let second = read_labels(&workspace);
+
+        assert_eq!(first, second, "second upgrade produced a diff");
+        assert!(
+            report2.preserved.contains(&LABELS_YML_REL_PATH.to_string()),
+            "an unchanged labels.yml should report as preserved, got: {report2:?}"
+        );
     }
 }
