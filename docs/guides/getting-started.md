@@ -406,6 +406,41 @@ constraints in both root files so switching runtimes cannot weaken them.
 2. Sync labels to GitHub: `gh label sync -f .github/labels.yml`
 3. Customize labels for your project's workflow
 
+#### `.github/labels.yml` is a shared file
+
+`.github/labels.yml` is co-owned. Loom's own workflow labels live between two
+marker comments:
+
+```yaml
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: Approved for work by human (ready for Builder to claim)
+  color: "3B82F6"
+# END LOOM LABELS
+
+# Everything out here is yours.
+- name: area/api
+  description: API surface
+  color: "112233"
+```
+
+| Region | Owner | Install / upgrade | Uninstall |
+|--------|-------|-------------------|-----------|
+| Inside the markers | Loom | Replaced wholesale — edits are lost | Removed |
+| Outside the markers | You | Never touched | Never touched |
+
+Add your project's labels **outside** the markers. Upgrades replace only the
+marked block, so your labels survive; uninstall removes only the marked block,
+and keeps the file when any of your labels remain.
+
+Upgrading from Loom 0.10.x or earlier? Your `labels.yml` has no markers yet. The
+first upgrade after this change migrates it in place: Loom's own entries are
+replaced by the marked block, and no duplicate label names are produced. Your
+labels, your comments, and their relative order are preserved; the only thing
+the migration changes about your content is whitespace — runs of blank lines are
+collapsed to a single blank line, which is what makes repeated upgrades a no-op
+diff. Nothing needs to be done by hand.
+
 ### Gitignore Updates
 
 Loom automatically updates `.gitignore` with ephemeral patterns:
@@ -529,6 +564,10 @@ gh label sync -f .github/labels.yml
 # Verify labels were created
 gh label list | grep "loom:"
 ```
+
+Your own labels can live in the same file — add them outside the
+`# BEGIN LOOM LABELS` / `# END LOOM LABELS` markers and upgrades will preserve
+them. See [`.github/labels.yml` is a shared file](#githublabelsyml-is-a-shared-file).
 
 Labels enable workflow coordination between agents. See [WORKFLOWS.md](../workflows.md) for details.
 
@@ -864,7 +903,7 @@ brew install gh
 # Authenticate
 gh auth login
 
-# Sync labels
+# Sync labels (Loom's block plus any labels you added outside the markers)
 gh label sync -f .github/labels.yml
 ```
 

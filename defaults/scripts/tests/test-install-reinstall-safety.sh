@@ -409,6 +409,254 @@ rm -rf "$T6" /tmp/loom-uninstall-scope-test.log
 echo ""
 
 echo "================================================================"
+echo "Group 5: .github/labels.yml marker carve-out (issue #68)"
+echo "================================================================"
+echo ""
+
+# Upgrading a consumer repo used to truncate .github/labels.yml wholesale,
+# silently deleting consumer-authored labels (59 deletions / 0 insertions in
+# the original report). Loom now owns only the
+# "# BEGIN LOOM LABELS" .. "# END LOOM LABELS" block; content outside the
+# markers is consumer-owned across install, upgrade, and uninstall.
+#
+# The install/upgrade merge itself lives in the Rust path
+# (loom-daemon/src/init/labels.rs) because scripts/install-loom.sh delegates
+# ALL file copying to `loom-daemon init` -- see its unit tests for
+# force-reinstall, non-force reinstall, markerless migration, and idempotency.
+# This group covers the bash-side halves: the shipped data file's shape, the
+# stale-file-sweep carve-out, and uninstall's marker-scoped removal.
+
+SHIPPED_LABELS_YML="$REPO_ROOT/defaults/.github/labels.yml"
+
+# --- 5a: the shipped defaults file carries the markers -------------------
+# Without them every install path falls back to whole-file semantics and the
+# data-loss bug returns.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^# BEGIN LOOM LABELS$' "$SHIPPED_LABELS_YML" 2>/dev/null \
+    && grep -q '^# END LOOM LABELS$' "$SHIPPED_LABELS_YML" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: defaults/.github/labels.yml ships BEGIN/END LOOM LABELS markers"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: defaults/.github/labels.yml lost its BEGIN/END LOOM LABELS markers"
+fi
+
+# --- 5b: sync-labels.sh's positional 3-line parser still works ------------
+# scripts/install/sync-labels.sh reads each label as exactly
+# "- name:" / "description:" / "color:" on consecutive lines, with no YAML
+# parser. The markers are "#" comments, so they must be inert to that loop --
+# but a marker landing between an entry's lines would silently break sync.
+PARSE_ERRORS=$(awk '
+    /^- name:/ {
+        if (prev_desc != NR - 0) { }
+        name_line = NR
+        getline desc
+        getline color
+        if (desc !~ /^[ \t]+description:/) print "line " name_line ": missing description"
+        if (color !~ /^[ \t]+color:/) print "line " name_line ": missing color"
+        count++
+    }
+    END { if (count == 0) print "no label entries parsed" }
+' "$SHIPPED_LABELS_YML")
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -z "$PARSE_ERRORS" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: every shipped label parses under sync-labels.sh's positional 3-line contract"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: marker-wrapped labels.yml breaks sync-labels.sh's parser"
+    echo "$PARSE_ERRORS" | sed 's/^/      /'
+fi
+
+# --- 5c: no duplicate label names in the shipped file ---------------------
+SHIPPED_DUPES=$(grep '^- name:' "$SHIPPED_LABELS_YML" | sort | uniq -d)
+assert_contains "|$SHIPPED_DUPES|" "||" "shipped labels.yml has no duplicate label names"
+
+# --- 5d: the install-side stale-file sweep never touches labels.yml -------
+# install-loom.sh's sweep git-rm's manifest entries that the current defaults/
+# no longer ship. labels.yml is now only partly Loom-owned, so it must be
+# skipped outright rather than falling through to the sweep.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'prev_file" == ".github/labels.yml"' "$REPO_ROOT/scripts/install-loom.sh"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: install-loom.sh stale-file sweep skips .github/labels.yml"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: install-loom.sh stale-file sweep no longer carves out .github/labels.yml"
+fi
+
+# --- uninstall fixtures ---------------------------------------------------
+# Each case builds a throwaway repo with a minimal Loom footprint plus a
+# labels.yml of the given shape, then runs the real uninstaller.
+make_labels_uninstall_repo() {
+    local dir="$1" labels_content="$2"
+    git -C "$dir" init --quiet
+    git -C "$dir" config user.email "test@test.com"
+    git -C "$dir" config user.name "Test"
+    mkdir -p "$dir/.loom/roles" "$dir/.loom/scripts" "$dir/.github"
+    echo '{}' > "$dir/.loom/config.json"
+    printf '%s' "$labels_content" > "$dir/.github/labels.yml"
+    git -C "$dir" add -A
+    git -C "$dir" commit -m "Loom installed" --quiet
+}
+
+CONSUMER_LABEL_BLOCK='
+# ---- project labels (consumer-owned) ----
+- name: feedback:static
+  description: Static feedback label
+  color: "AABBCC"
+
+- name: area/ui
+  description: UI surface
+  color: "DDEEFF"
+'
+
+# --- 5e: marker-bearing file -> only the marked block is removed ----------
+T7=$(mktemp -d /tmp/loom-labels-marker-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T7" "# BEGIN LOOM LABELS
+# Loom Workflow Labels
+- name: loom:issue
+  description: Approved for work by human
+  color: \"3B82F6\"
+# END LOOM LABELS
+$CONSUMER_LABEL_BLOCK"
+
+"$UNINSTALL_SH" --yes --local "$T7" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$T7/.github/labels.yml" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: uninstall keeps .github/labels.yml when consumer labels exist"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: uninstall deleted .github/labels.yml despite consumer labels"
+    sed 's/^/      /' /tmp/loom-labels-uninstall.log
+fi
+
+LABELS_AFTER=$(cat "$T7/.github/labels.yml" 2>/dev/null || echo "")
+assert_contains "$LABELS_AFTER" "- name: feedback:static" \
+    "consumer label feedback:static survived uninstall"
+assert_contains "$LABELS_AFTER" "- name: area/ui" \
+    "consumer label area/ui survived uninstall"
+assert_contains "$LABELS_AFTER" "# ---- project labels (consumer-owned) ----" \
+    "consumer comment survived uninstall"
+assert_not_contains "$LABELS_AFTER" "- name: loom:issue" \
+    "Loom label loom:issue was removed by uninstall"
+assert_not_contains "$LABELS_AFTER" "BEGIN LOOM LABELS" \
+    "Loom marker block was removed by uninstall"
+rm -rf "$T7"
+
+# --- 5f: markerless legacy file -> name-based removal, consumer kept ------
+# Every repo installed on 0.10.x or earlier has a markerless labels.yml. An
+# uninstall before the first post-fix upgrade must still spare consumer labels.
+T8=$(mktemp -d /tmp/loom-labels-markerless-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T8" "# Loom Workflow Labels
+# These labels coordinate the Loom AI agent workflow
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work by human (ready for Builder to claim)
+  color: \"3B82F6\"
+
+- name: loom:building
+  description: Builder is implementing this issue
+  color: \"F59E0B\"
+$CONSUMER_LABEL_BLOCK"
+
+"$UNINSTALL_SH" --yes --local "$T8" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+LABELS_AFTER8=$(cat "$T8/.github/labels.yml" 2>/dev/null || echo "<file deleted>")
+assert_contains "$LABELS_AFTER8" "- name: feedback:static" \
+    "markerless: consumer label feedback:static survived uninstall"
+assert_contains "$LABELS_AFTER8" "- name: area/ui" \
+    "markerless: consumer label area/ui survived uninstall"
+assert_not_contains "$LABELS_AFTER8" "- name: loom:issue" \
+    "markerless: Loom label loom:issue was removed"
+assert_not_contains "$LABELS_AFTER8" "- name: loom:building" \
+    "markerless: Loom label loom:building was removed"
+rm -rf "$T8"
+
+# --- 5h: markerless legacy file with consumer separator comments ----------
+# Regression: the name-based fallback also drops top-level comment lines that
+# match the shipped defaults verbatim. Since #68 the shipped block opens with
+# content-free separators (a bare "#", a "# ====" rule) — lines a consumer is
+# just as likely to have authored. Matching those verbatim proves nothing, so
+# they must survive. Mirrors is_content_comment() in
+# loom-daemon/src/init/labels.rs and the Rust test
+# markerless_migration_keeps_consumer_separator_comments.
+T10=$(mktemp -d /tmp/loom-labels-separators-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T10" "# Loom Workflow Labels
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work by human (ready for Builder to claim)
+  color: \"3B82F6\"
+
+# ============================================================================
+# PROJECT LABELS -- ours, must survive
+#
+# The bare '#' line above is a separator we authored.
+# ============================================================================
+- name: feedback:static
+  description: Static feedback label
+  color: \"AABBCC\"
+"
+
+"$UNINSTALL_SH" --yes --local "$T10" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+LABELS_AFTER10=$(cat "$T10/.github/labels.yml" 2>/dev/null || echo "<file deleted>")
+BARE_HASH_COUNT=$(printf '%s\n' "$LABELS_AFTER10" | grep -c '^#$' || true)
+RULE_COUNT=$(printf '%s\n' "$LABELS_AFTER10" | grep -c '^# =*$' || true)
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$BARE_HASH_COUNT" == "1" && "$RULE_COUNT" == "2" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: markerless uninstall keeps consumer separator comments (# and # ====)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: markerless uninstall deleted consumer separator comments" \
+        "(bare '#': $BARE_HASH_COUNT/1, '# ====': $RULE_COUNT/2)"
+    sed 's/^/      /' "$T10/.github/labels.yml" 2>/dev/null || true
+fi
+
+assert_contains "$LABELS_AFTER10" "# PROJECT LABELS -- ours, must survive" \
+    "markerless: consumer heading survived uninstall"
+assert_contains "$LABELS_AFTER10" "The bare '#' line above is a separator we authored." \
+    "markerless: consumer prose survived uninstall"
+assert_contains "$LABELS_AFTER10" "- name: feedback:static" \
+    "markerless separators: consumer label survived uninstall"
+assert_not_contains "$LABELS_AFTER10" "- name: loom:issue" \
+    "markerless separators: Loom label loom:issue was removed"
+assert_not_contains "$LABELS_AFTER10" "# Core Workflow States" \
+    "markerless separators: Loom's own content-bearing header was removed"
+rm -rf "$T10"
+
+# --- 5g: Loom-only file -> deleted outright ------------------------------
+# The pre-#68 contract (scripts/test-installer.sh Test 24) must still hold for
+# repos that never added labels of their own.
+T9=$(mktemp -d /tmp/loom-labels-only-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T9" "# BEGIN LOOM LABELS
+- name: loom:issue
+  description: Approved for work by human
+  color: \"3B82F6\"
+# END LOOM LABELS
+"
+
+"$UNINSTALL_SH" --yes --local "$T9" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$T9/.github/labels.yml" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: uninstall removes .github/labels.yml when it held only Loom labels"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Loom-only .github/labels.yml survived uninstall"
+    sed 's/^/      /' "$T9/.github/labels.yml"
+fi
+rm -rf "$T9" /tmp/loom-labels-uninstall.log
+echo ""
+
+echo "================================================================"
 echo "Tests run:    $TESTS_RUN"
 echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
 if [[ "$TESTS_FAILED" -gt 0 ]]; then

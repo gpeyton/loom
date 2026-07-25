@@ -1,3 +1,15 @@
+# BEGIN LOOM LABELS
+# ============================================================================
+# LOOM-MANAGED BLOCK -- do not edit between the BEGIN/END LOOM LABELS markers.
+#
+# Everything inside these markers is owned by Loom and is replaced wholesale on
+# every install and upgrade. Edits made in here WILL be lost.
+#
+# Your own labels belong OUTSIDE the markers (above or below this block).
+# Content outside the markers is consumer-owned: install, upgrade, and
+# uninstall all leave it untouched. Uninstall removes only this marked block;
+# if consumer labels remain, the file itself is kept.
+# ============================================================================
 # Loom Workflow Labels
 # These labels coordinate the Loom AI agent workflow
 # Sync with: ./scripts/install/sync-labels.sh . (from workspace root)
@@ -90,3 +102,4 @@
 - name: tier:maintenance
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
+# END LOOM LABELS
