@@ -1624,8 +1624,18 @@ run_with_retry() {
         trap _flush_output_on_signal SIGHUP SIGTERM
 
         if [ -t 0 ]; then
-            # No prompt, TTY available - use script to preserve interactive mode
-            script -q "${temp_output}" claude "$@"
+            # No prompt, TTY available - use script to preserve interactive mode.
+            # util-linux script(1) and BSD/macOS script(1) take their arguments
+            # in incompatible orders. The BSD form `script -q FILE cmd args...`
+            # makes util-linux parse the command's own flags as script's, so an
+            # agent launched with --dangerously-skip-permissions dies instantly
+            # with "script: unrecognized option" and the retry ladder below then
+            # burns every attempt on a failure that will never clear.
+            if script --version 2>/dev/null | grep -q util-linux; then
+                script -q -c "$(printf '%q ' claude "$@")" "${temp_output}"
+            else
+                script -q "${temp_output}" claude "$@"
+            fi
             exit_code=$?
         else
             # No TTY (socket/pipe) - run claude directly, tee output for error detection
