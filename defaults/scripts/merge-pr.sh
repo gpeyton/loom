@@ -683,6 +683,26 @@ _remove_loom_worktree() {
   fi
 }
 
+# Default issue worktrees are only safe to remove after the forge has
+# confirmed that their linked issue is closed. This is deliberately fail-safe:
+# an open issue, a failed lookup, or any unfamiliar state preserves the
+# worktree while allowing the already-successful merge to finish.
+_issue_is_closed_for_cleanup() {
+  local issue_number="$1"
+  local issue_state
+  if ! issue_state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH")"; then
+    warning "Could not resolve state for issue #$issue_number — refusing to remove its worktree"
+    return 1
+  fi
+
+  issue_state="$(printf '%s' "$issue_state" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$issue_state" != "CLOSED" ]]; then
+    warning "Issue #$issue_number is not closed (state=${issue_state:-unknown}) — refusing to remove its worktree (a shepherd may be working in it)"
+    return 1
+  fi
+  return 0
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1)"
@@ -709,7 +729,11 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       DEFAULT_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
     fi
     if [[ -d "$DEFAULT_WT_PATH" ]]; then
-      _remove_loom_worktree "$DEFAULT_WT_PATH"
+      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+        info "Worktree cleanup skipped for issue #$ISSUE_NUM"
+      else
+        _remove_loom_worktree "$DEFAULT_WT_PATH"
+      fi
     else
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
@@ -722,7 +746,11 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
           # sentinel says it's safe to remove, so do so.
           info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
-          _remove_loom_worktree "$DISCOVERED_WT"
+          if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+            info "Worktree cleanup skipped for issue #$ISSUE_NUM"
+          else
+            _remove_loom_worktree "$DISCOVERED_WT"
+          fi
         else
           warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
           warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."

@@ -13,6 +13,7 @@
 #      - --no-cleanup-worktree wins over --worktree-path
 #      - --worktree-path bypasses sentinel on the explicit path
 #      - default path keeps sentinel guard
+#      - issue worktree cleanup is fail-safe unless its issue is CLOSED
 #      - discovery fallback emits hint without removing
 #
 # This is the companion to test-merge-pr-help.sh. The help test verifies
@@ -100,6 +101,10 @@ assert_grep "Discovered worktree for branch" "$MERGE_PR" \
     "discovery fallback emits a hint about the discovered path"
 assert_grep "re-run with: --worktree-path" "$MERGE_PR" \
     "discovery fallback suggests --worktree-path in the hint"
+assert_grep "_issue_is_closed_for_cleanup" "$MERGE_PR" \
+    "merge-pr.sh gates default issue worktree cleanup on issue state"
+assert_grep "forge_get_issue_state" "$MERGE_PR" \
+    "merge-pr.sh resolves issue state through forge helpers"
 
 # --- Test 3: Precedence — --no-cleanup-worktree warns when combined ---
 echo ""
@@ -146,8 +151,9 @@ simulate_cleanup() {
     #   $5 override_has_sentinel ("true" / "false") # does override path have .loom-managed
     #   $6 discovered          (string or "")     # discovered worktree path
     #   $7 discovered_has_sentinel ("true" / "false")
+    #   $8 issue_state (CLOSED, OPEN, unknown, or lookup-failed)
     local preserve="$1" cleanup="$2" override="$3" default_exists="$4" \
-          override_has_sentinel="$5" discovered="$6" discovered_has_sentinel="$7"
+          override_has_sentinel="$5" discovered="$6" discovered_has_sentinel="$7" issue_state="$8"
 
     if [[ "$cleanup" != "true" ]]; then
         echo "skip:no-cleanup"; return 0
@@ -165,6 +171,9 @@ simulate_cleanup() {
         return 0
     fi
     if [[ "$default_exists" == "true" ]]; then
+        if [[ -n "$issue_state" && "$issue_state" != "CLOSED" ]]; then
+            echo "skip:issue-not-closed"; return 0
+        fi
         echo "remove:default"
         return 0
     fi
@@ -183,7 +192,7 @@ simulate_cleanup() {
 # Args: preserve cleanup override default_exists override_has_sentinel discovered discovered_has_sentinel
 
 # Case A: LOOM_PRESERVE_WORKTREE=1 wins over everything
-result=$(simulate_cleanup 1 true "/path/x" false true "" false)
+result=$(simulate_cleanup 1 true "/path/x" false true "" false "")
 if [[ "$result" == "skip:env" ]]; then
     pass "case A: LOOM_PRESERVE_WORKTREE=1 short-circuits everything"
 else
@@ -191,7 +200,7 @@ else
 fi
 
 # Case B: --no-cleanup-worktree wins (cleanup=false)
-result=$(simulate_cleanup 0 false "/path/x" false true "" false)
+result=$(simulate_cleanup 0 false "/path/x" false true "" false "")
 if [[ "$result" == "skip:no-cleanup" ]]; then
     pass "case B: --no-cleanup-worktree short-circuits even with override"
 else
@@ -199,7 +208,7 @@ else
 fi
 
 # Case C: --worktree-path bypasses sentinel (no sentinel on override path)
-result=$(simulate_cleanup 0 true "/path/x" true false "" false)
+result=$(simulate_cleanup 0 true "/path/x" true false "" false "")
 if [[ "$result" == "remove:override-bypass-sentinel" ]]; then
     pass "case C: --worktree-path bypasses sentinel for non-Loom worktree"
 else
@@ -207,7 +216,7 @@ else
 fi
 
 # Case D: --worktree-path on Loom-managed worktree — still removes
-result=$(simulate_cleanup 0 true "/path/x" true true "" false)
+result=$(simulate_cleanup 0 true "/path/x" true true "" false "")
 if [[ "$result" == "remove:override-managed" ]]; then
     pass "case D: --worktree-path also removes Loom-managed worktrees"
 else
@@ -215,7 +224,7 @@ else
 fi
 
 # Case E: default path exists — remove via sentinel-guarded path
-result=$(simulate_cleanup 0 true "" true false "" false)
+result=$(simulate_cleanup 0 true "" true false "" false CLOSED)
 if [[ "$result" == "remove:default" ]]; then
     pass "case E: default Loom-convention path used when present"
 else
@@ -223,7 +232,7 @@ else
 fi
 
 # Case F: default missing, discovered worktree has sentinel — remove
-result=$(simulate_cleanup 0 true "" false false "/found" true)
+result=$(simulate_cleanup 0 true "" false false "/found" true "")
 if [[ "$result" == "remove:discovered-managed" ]]; then
     pass "case F: discovery removes Loom-managed worktree at non-standard path"
 else
@@ -231,7 +240,7 @@ else
 fi
 
 # Case G: default missing, discovered worktree LACKS sentinel — warn-only
-result=$(simulate_cleanup 0 true "" false false "/found" false)
+result=$(simulate_cleanup 0 true "" false false "/found" false "")
 if [[ "$result" == "warn:discovered-user-owned" ]]; then
     pass "case G: discovery warns but does NOT remove user-owned worktree"
 else
@@ -239,11 +248,27 @@ else
 fi
 
 # Case H: nothing found anywhere — quiet success
-result=$(simulate_cleanup 0 true "" false false "" false)
+result=$(simulate_cleanup 0 true "" false false "" false "")
 if [[ "$result" == "skip:nothing-to-do" ]]; then
     pass "case H: nothing-found is a quiet no-op"
 else
     fail "case H: expected 'skip:nothing-to-do', got '$result'"
+fi
+
+# Case I: an open issue preserves the default issue worktree
+result=$(simulate_cleanup 0 true "" true false "" false OPEN)
+if [[ "$result" == "skip:issue-not-closed" ]]; then
+    pass "case I: open issue preserves the default worktree"
+else
+    fail "case I: expected 'skip:issue-not-closed', got '$result'"
+fi
+
+# Case J: unknown or failed lookup also preserves the worktree (fail safe)
+result=$(simulate_cleanup 0 true "" true false "" false unknown)
+if [[ "$result" == "skip:issue-not-closed" ]]; then
+    pass "case J: unknown issue state preserves the default worktree"
+else
+    fail "case J: expected 'skip:issue-not-closed', got '$result'"
 fi
 
 # --- Summary ---
