@@ -82,6 +82,14 @@ remains `pending` or `in_progress`. If `update_plan` is unavailable, emit the
 canonical `SWEEP_PHASE issue=#N phase=<phase> status=<status> reason="<text>"`
 line required by the canonical sweep spec at every transition.
 
+For daemon dispatch, the parent creates the same plan before dispatch. After
+each successful acknowledgement, rewrite that issue's five parent items as
+`delegated to daemon (<sweep-id>)` and complete them; the daemon-spawned child
+is a new invocation that creates and owns a fresh full lifecycle plan. If
+dispatch fails, settle the affected parent items as
+`BLOCKED — daemon dispatch failed: <reason>`. This is a plan handoff only and
+does not add daemon monitoring or protocol behavior.
+
 ## Backend policy: native Codex agents are not a supported Loom backend (issue #54)
 
 Current Codex clients expose native, in-session collaboration primitives —

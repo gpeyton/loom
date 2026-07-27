@@ -451,6 +451,17 @@ completed normally, completed with an explicit skip/not-needed reason, or
 terminally marked `BLOCKED — <reason>`. The summary outcome counts still come
 from forge/checkpoint state, never from the runtime plan alone.
 
+**Daemon handoff.** The daemon-dispatch parent still creates the complete
+five-item plan before dispatch. After each successful dispatch acknowledgement
+returns a sweep ID, rewrite that issue's five parent items with
+`delegated to daemon (<sweep-id>)` and mark them completed. The detached
+daemon child is a new sweep invocation and owns a fresh full lifecycle plan;
+the parent's completed items record handoff, not lifecycle completion. If a
+dispatch fails, rewrite the affected issue's items as
+`BLOCKED — daemon dispatch failed: <reason>` and complete them before the
+parent reports the failed dispatch. This plan-only handoff does not add daemon
+subscription, monitoring, or protocol behavior.
+
 ### CRITICAL: Only Builders parallelize — issue-creating roles must be serialized (issue #3707)
 
 **Waves parallelize Builders only.** The reason a wave can safely fan out `N` agents at once is that each Builder works in an isolated git worktree and produces **exactly one PR at the end** — no shared mutable forge state is touched mid-run, so two concurrent Builders never collide. `/loom:sweep` itself only ever dispatches Builders (plus per-issue Curator/Judge/Doctor, which run **sequentially within a wave**), so today's wave loop is safe by construction.
@@ -1081,6 +1092,12 @@ mcp__loom__dispatch_sweep(kind={"Issue": N}, depends_on=<parent>)
 This is purely "start populating a parameter that already exists" — the daemon and the `mcp__loom__dispatch_sweep` schema already accept `depends_on` (#3729/#3742), forwarding it to the child as `--depends-on <parent>`, so there is **no daemon-side code change**. Candidates with no detected edge dispatch exactly as today (no `depends_on` argument). To respect the parent-before-child topological ordering on the daemon path, dispatch the reordered candidate list in order (a parent stacked-before its child is dispatched first so its `feature/issue-<parent>` branch exists when the child's Builder resolves the base).
 
 The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispatch (`Dispatched sweep <sweep-id> for issue #N to daemon`). The daemon's spawn-time logic picks an OAuth token from the rotation pool, detaches a `claude -p "/loom:sweep N"` child, and runs the sweep in that child's session — completely independent of this orchestrator session.
+
+Immediately after that acknowledgement, apply the mandatory task-list
+**Daemon handoff** rule: settle the five parent items as
+`delegated to daemon (<sweep-id>)`. The daemon-spawned child creates and owns
+its own fresh five-phase plan. A failed dispatch instead settles the affected
+parent items as `BLOCKED — daemon dispatch failed: <reason>`.
 
 **The skill does NOT subscribe to events.** Phase B's pub/sub bus is consumed by long-running monitors and the spawn loop, not by the skill itself. The skill is fire-and-forget: dispatch, log, exit.
 

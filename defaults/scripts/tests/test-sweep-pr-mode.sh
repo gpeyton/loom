@@ -123,10 +123,10 @@ assert_contains "Skip: loom:operator-only PRs" 'loom:operator-only'
 echo
 echo "--- Load-bearing constraints (#3289, #3298, #3373) ---"
 
-# #3289: one level deep, never spawn /shepherd as subagent.
+# #3289: one level deep, never spawn a nested orchestrator as a subagent.
 assert_contains "One-level-deep callout preserved" 'One level deep'
-assert_contains "Never-dispatch-/shepherd-as-subagent guard preserved (issue-side, original phrasing)" 'Do NOT, under any circumstances, dispatch `/shepherd` as a subagent'
-assert_contains "Never-invoke /shepherd/judge/doctor slash commands as subagents (Mode C constraints)" '`/shepherd`, `/judge`, or `/doctor` as a subagent'
+assert_contains "Never-dispatch-nested-orchestrator guard preserved" 'Do NOT, under any circumstances, dispatch a nested orchestrator skill (`/loom:sweep`) as a subagent'
+assert_contains "Never-invoke nested /loom:sweep from Builder dispatch" 'Do NOT invoke `/loom:sweep` as a subagent here'
 
 # Sequential per-PR Judge.
 assert_contains "Per-PR Judge sequential within wave" 'Per-PR Judge is sequential'
@@ -143,7 +143,7 @@ assert_contains "Checkpoint fallback for PRs without Closes #N" "lacks a Closes 
 echo
 echo "--- Dry-run output (PR-set format) ---"
 
-assert_contains "PR-set dry-run header" '/sweep --prs --dry-run plan'
+assert_contains "PR-set dry-run header" '/loom:sweep --prs --dry-run plan'
 assert_contains "PR-set dry-run shows would-Judge" 'would Judge'
 assert_contains "PR-set dry-run shows would-Doctor-then-Judge" 'would Doctor → Judge'
 assert_contains "PR-set dry-run shows would-merge" 'would merge'
@@ -173,6 +173,9 @@ assert_contains "Blocked reason has terminal encoding" 'BLOCKED — <reason>'
 assert_contains "Terminal assertion rejects pending tasks" 'while any task remains `pending` or `in_progress`'
 assert_contains "Dry-run prints would-be runtime tasks" 'Would-be runtime task list:'
 assert_file_contains "Codex skill mandates update_plan" "$CODEX_SWEEP_SKILL" 'visible `update_plan` plan'
+assert_contains "Daemon parent plan records successful handoff" 'delegated to daemon (<sweep-id>)'
+assert_contains "Daemon child owns a fresh lifecycle plan" 'daemon child is a new sweep invocation and owns a fresh full lifecycle plan'
+assert_file_contains "Codex skill mirrors daemon plan handoff" "$CODEX_SWEEP_SKILL" 'delegated to daemon (<sweep-id>)'
 
 for role in curator builder judge doctor; do
     assert_file_contains "$role preserves root sweep plan" "$ROLE_DIR/$role.md" 'Sequential Codex sweep plan ownership'
@@ -188,10 +191,10 @@ assert_contains "--builders-per-wave ignored in Mode C" '`--builders-per-wave N`
 echo
 echo "--- Examples section coverage ---"
 
-assert_contains "Example: explicit numeric PR list with --prs" '/sweep --prs 100 101 102'
-assert_contains "Example: NL description with --prs" '/sweep --prs all open loom:pr'
-assert_contains "Example: NL trigger without --prs" '/sweep all open loom:pr PRs'
-assert_contains "Example: PR-set dry-run" '/sweep --prs 100 101 102 --dry-run'
+assert_contains "Example: explicit numeric PR list with --prs" '/loom:sweep --prs 100 101 102'
+assert_contains "Example: NL description with --prs" '/loom:sweep --prs all open loom:pr'
+assert_contains "Example: NL trigger without --prs" '/loom:sweep all open loom:pr PRs'
+assert_contains "Example: PR-set dry-run" '/loom:sweep --prs 100 101 102 --dry-run'
 
 echo
 echo "--- Constraints + Limitations updated ---"
