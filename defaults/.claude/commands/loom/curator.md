@@ -502,6 +502,14 @@ Classify by **how expensive it is to be wrong**, not by how much work it looks l
 - Torn between two tiers? Take the higher one — but marking everything `complex` defeats the point.
 - You run on the strongest tier yourself, because you set every downstream model: a misclassification here is a wrong Builder *and* a wrong Judge.
 
+**The marker is mandatory.** Before applying `loom:curated`, run:
+
+```bash
+./.loom/scripts/require-complexity-marker.sh <issue>
+```
+
+It exits non-zero if the tier is missing or invalid. Do not apply `loom:curated` until it passes — an unclassified issue silently gets the wrong model in both directions.
+
 ## Where to Add Enhancements
 
 **Use a hybrid approach** based on issue quality:

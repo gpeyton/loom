@@ -435,6 +435,13 @@ Resolve `<runtime>` (the dispatched worker type) and the tier against `sweep.tie
 - It is not a label and creates none.
 - Tier-1 and tier-2 pins still win.
 - The Curator's own dispatch ignores the marker — it produces the classification.
+- **Resolve by command, not by judgement.** Do not read the table above and decide a model yourself — run:
+
+  ```bash
+  MODEL="$(./.loom/scripts/resolve-tier-model.sh <issue> <runtime>)"
+  ```
+
+  Pass `$MODEL` to the Task tool's `model` parameter for in-session role dispatch, and export it as `LOOM_MODEL` (or pass `--model "$MODEL"`) for any spawned child process. Exit code 3 means no mapping exists — fall through to tier 3. A dispatch that never ran this command has not applied the tier.
 - Log the resolved model and reason per dispatch, e.g. `model: builder=haiku (complexity=mechanical)`.
 
 **No-Fable-Judge hard invariant (issue #3702)**: **Judge model resolution can never resolve to `fable`, regardless of `sweep.escalation` contents or any marker.** The escalation ladder and the tier-2.5 marker apply only to the Curator-marker→Builder path and to the rejection-triggered Doctor — never to Judge. The Judge is the escalation sensor (see #3481); reviewing security-adjacent diffs is precisely Fable's refusal surface, and a refusing Judge would deadlock the control loop. If a resolved Judge model would ever be `fable` (alias or pinned ID), fall back to `opus` for the Judge dispatch and log the substitution.
