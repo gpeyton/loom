@@ -119,6 +119,15 @@ Check for an invocation argument:
 > runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
 > on.
 
+### Sequential Codex sweep plan ownership
+
+When this role runs inline inside a sequential Codex `$loom-sweep`, preserve
+the root sweep's existing `update_plan` plan; do not replace it with a
+role-local lifecycle plan. The root marks `#N Builder (PR)` in progress
+before this role begins. After PR creation succeeds, the caller writes the
+`builder-done` sweep checkpoint with the PR number, then marks that existing
+plan item completed before proceeding to Judge.
+
 If a number is provided (e.g., `/builder 42`):
 1. Treat that number as the target **issue** to work on
 2. **Skip** the "Finding Work" section entirely

@@ -1,11 +1,11 @@
 #!/bin/bash
-# test-sweep-pr-mode.sh - Smoke tests for /sweep PR-set mode (Mode C, #3384).
+# test-sweep-pr-mode.sh - Smoke tests for /sweep contracts (#3384, #66).
 #
 # /sweep is a markdown skill (prose-engineered), so these tests are
 # documentation-shape checks: they verify the skill file contains the
 # required Mode C structure, the Mode A/B/C classifier rules, the
-# PR-set dry-run output format, and the load-bearing constraints from
-# #3289 / #3298 / #3373.
+# PR-set dry-run output format, the runtime task-list contract, and the
+# load-bearing constraints from #66 / #3289 / #3298 / #3373.
 #
 # Run from anywhere — uses an absolute path to the skill file via the
 # script's own directory.
@@ -14,6 +14,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SWEEP_MD="$SCRIPT_DIR/../../../defaults/.claude/commands/loom/sweep.md"
+CODEX_SWEEP_SKILL="$SCRIPT_DIR/../../../defaults/.agents/skills/loom-sweep/SKILL.md"
+ROLE_DIR="$SCRIPT_DIR/../../../defaults/.claude/commands/loom"
 
 if [[ ! -f "$SWEEP_MD" ]]; then
     echo "FAIL: skill file not found at $SWEEP_MD" >&2
@@ -58,6 +60,18 @@ assert_not_contains() {
     else
         echo "PASS: $desc"
         PASS=$((PASS + 1))
+    fi
+}
+
+# Check a literal in an explicitly named contract file.
+assert_file_contains() {
+    local desc="$1" target_file="$2" needle="$3"
+    if grep -qF -- "$needle" "$target_file"; then
+        echo "PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $desc (missing literal in $target_file: $needle)" >&2
+        FAIL=$((FAIL + 1))
     fi
 }
 
@@ -109,10 +123,10 @@ assert_contains "Skip: loom:operator-only PRs" 'loom:operator-only'
 echo
 echo "--- Load-bearing constraints (#3289, #3298, #3373) ---"
 
-# #3289: one level deep, never spawn /shepherd as subagent.
+# #3289: one level deep, never spawn a nested orchestrator as a subagent.
 assert_contains "One-level-deep callout preserved" 'One level deep'
-assert_contains "Never-dispatch-/shepherd-as-subagent guard preserved (issue-side, original phrasing)" 'Do NOT, under any circumstances, dispatch `/shepherd` as a subagent'
-assert_contains "Never-invoke /shepherd/judge/doctor slash commands as subagents (Mode C constraints)" '`/shepherd`, `/judge`, or `/doctor` as a subagent'
+assert_contains "Never-dispatch-nested-orchestrator guard preserved" 'Do NOT, under any circumstances, dispatch a nested orchestrator skill (`/loom:sweep`) as a subagent'
+assert_contains "Never-invoke nested /loom:sweep from Builder dispatch" 'Do NOT invoke `/loom:sweep` as a subagent here'
 
 # Sequential per-PR Judge.
 assert_contains "Per-PR Judge sequential within wave" 'Per-PR Judge is sequential'
@@ -129,7 +143,7 @@ assert_contains "Checkpoint fallback for PRs without Closes #N" "lacks a Closes 
 echo
 echo "--- Dry-run output (PR-set format) ---"
 
-assert_contains "PR-set dry-run header" '/sweep --prs --dry-run plan'
+assert_contains "PR-set dry-run header" '/loom:sweep --prs --dry-run plan'
 assert_contains "PR-set dry-run shows would-Judge" 'would Judge'
 assert_contains "PR-set dry-run shows would-Doctor-then-Judge" 'would Doctor → Judge'
 assert_contains "PR-set dry-run shows would-merge" 'would merge'
@@ -142,6 +156,33 @@ assert_contains "Dry-run gate: no merge-pr.sh" 'no `merge-pr.sh`'
 assert_contains "Dry-run gate: no Task/subagent dispatch" 'no Task/subagent dispatch'
 
 echo
+echo "--- Visible runtime task list contract (#66) ---"
+
+assert_contains "Runtime task list is mandatory" 'Mandatory visible runtime task list'
+assert_contains "Claude runtime maps to TodoWrite" '`TodoWrite` task list'
+assert_contains "Codex runtime maps to update_plan" '`update_plan`'
+assert_contains "Per-issue Curator item is specified" '#N Curator'
+assert_contains "Per-issue Builder item is specified" '#N Builder (PR)'
+assert_contains "Per-issue Judge item is specified" '#N Judge'
+assert_contains "Per-issue Doctor item is specified" '#N Doctor (if rejected)'
+assert_contains "Per-issue Merge item is specified" '#N Merge'
+assert_contains "Wave settle items are specified" 'Wave W settle'
+assert_contains "Checkpoint precedes visible task update" 'complete phase work → write checkpoint → update visible task list'
+assert_contains "Judge rejection re-opens Doctor" 'Judge rejection completes Judge with `(changes requested)`, then re-opens'
+assert_contains "Blocked reason has terminal encoding" 'BLOCKED — <reason>'
+assert_contains "Terminal assertion rejects pending tasks" 'while any task remains `pending` or `in_progress`'
+assert_contains "Dry-run prints would-be runtime tasks" 'Would-be runtime task list:'
+assert_file_contains "Codex skill mandates update_plan" "$CODEX_SWEEP_SKILL" 'visible `update_plan` plan'
+assert_contains "Daemon parent plan records successful handoff" 'delegated to daemon (<sweep-id>)'
+assert_contains "Daemon child owns a fresh lifecycle plan" 'daemon child is a new sweep invocation and owns a fresh full lifecycle plan'
+assert_file_contains "Codex skill mirrors daemon plan handoff" "$CODEX_SWEEP_SKILL" 'delegated to daemon (<sweep-id>)'
+
+for role in curator builder judge doctor; do
+    assert_file_contains "$role preserves root sweep plan" "$ROLE_DIR/$role.md" 'Sequential Codex sweep plan ownership'
+    assert_file_contains "$role names update_plan ownership" "$ROLE_DIR/$role.md" 'existing `update_plan` plan'
+done
+
+echo
 echo "--- Wave model (Mode C: size-1, --builders-per-wave ignored) ---"
 
 assert_contains "Mode C waves are size-1" 'size-1 wave'
@@ -150,10 +191,10 @@ assert_contains "--builders-per-wave ignored in Mode C" '`--builders-per-wave N`
 echo
 echo "--- Examples section coverage ---"
 
-assert_contains "Example: explicit numeric PR list with --prs" '/sweep --prs 100 101 102'
-assert_contains "Example: NL description with --prs" '/sweep --prs all open loom:pr'
-assert_contains "Example: NL trigger without --prs" '/sweep all open loom:pr PRs'
-assert_contains "Example: PR-set dry-run" '/sweep --prs 100 101 102 --dry-run'
+assert_contains "Example: explicit numeric PR list with --prs" '/loom:sweep --prs 100 101 102'
+assert_contains "Example: NL description with --prs" '/loom:sweep --prs all open loom:pr'
+assert_contains "Example: NL trigger without --prs" '/loom:sweep all open loom:pr PRs'
+assert_contains "Example: PR-set dry-run" '/loom:sweep --prs 100 101 102 --dry-run'
 
 echo
 echo "--- Constraints + Limitations updated ---"

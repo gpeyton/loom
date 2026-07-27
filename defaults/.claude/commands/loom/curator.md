@@ -28,6 +28,15 @@ Check for an invocation argument:
 > runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
 > on.
 
+### Sequential Codex sweep plan ownership
+
+When this role runs inline inside a sequential Codex `$loom-sweep`, preserve
+the root sweep's existing `update_plan` plan; do not replace it with a
+role-local lifecycle plan. The root marks `#N Curator` in progress before
+this role begins. On successful completion, the caller writes the
+`curator-done` sweep checkpoint, then marks that existing plan item completed
+before proceeding to Builder.
+
 If a number is provided (e.g., `/curator 42`):
 1. **FIRST, claim the issue immediately** by running this command:
    ```bash

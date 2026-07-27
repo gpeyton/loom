@@ -364,6 +364,104 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 - **Mode A/B (issue-set)**: the candidate list is partitioned into waves of up to `N = --builders-per-wave` issues, where an omitted flag resolves to the Stage -1 auto wave size (see "Resolve auto wave size" — up to 10 on the daemon path, core-scaled within `[3, 6]` on the subagent path, disk-clamped). Issues are picked into waves in order. Within a wave, builders are dispatched in parallel; across waves, processing is sequential. Each wave fully settles (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
 - **Mode C (PR-set)**: the candidate list is processed in **size-1 waves** (one PR per wave). `--builders-per-wave` is ignored because there is no Builder phase. Each PR is routed per its current label (Judge / Doctor→Judge / Merge — see "PR-set Wave Lifecycle" below) and fully settles before the next PR is touched. Sequential per-PR processing is a **width** choice — parallel Judge/Doctor across PRs is unbenchmarked and every wave member's Task result is read back into this orchestrator session (context pressure) — and parallels the issue-side "per-PR Judge is sequential within a wave" policy. It is **not** the #3289 rule, which governs nested (grandchild) dispatch depth, not wave width.
 
+### Mandatory visible runtime task list (issue #66)
+
+Every sweep invocation MUST create and maintain the runtime's native visible
+task list for its full lifetime. Prose status messages are useful context, but
+they are not a substitute for this state surface. After target resolution,
+Stage -1 backend selection, and the required backend announcement — but before
+daemon dispatch, the dry-run gate, or the first live phase — the root sweep
+orchestrator creates the list.
+
+**Issue-set task shape.** Create these five ordered items for every issue `N`,
+even when forge state or a checkpoint will cause one to be skipped:
+
+```text
+#N Curator
+#N Builder (PR)
+#N Judge
+#N Doctor (if rejected)
+#N Merge
+```
+
+For `--builders-per-wave > 1`, also create `Wave W settle` items so the
+operator can see the join boundary between waves. Mode C creates the
+applicable Judge / Doctor / Merge items per PR and records Curator / Builder
+as completed skips (`Mode C: existing PR`). A PR with exactly one closing
+issue uses `#N`; otherwise use `PR #P` as the item prefix.
+
+**Runtime mapping and ownership:**
+
+- **Claude Code:** the root `/sweep` session owns one `TodoWrite` task list.
+  Role subagents report results to the root; they MUST NOT create a competing
+  parent-lifecycle list.
+- **Codex:** a sequential-in-session `$loom-sweep` owns one `update_plan`
+  plan. A process-level fan-out child owns the plan for its single issue while
+  the parent owns the wave-settle item. Native Codex collaboration agents
+  remain unsupported and are not implied by this mapping.
+- **No native plan surface:** emit a mandatory transition line in this exact
+  shape instead:
+  `SWEEP_PHASE issue=#N phase=<phase> status=<pending|in_progress|completed|blocked> reason="<text-or-empty>"`.
+
+**Initialization and resume.** Reconcile the initial list from the checkpoint
+and current forge labels. Phases before the checkpoint become completed;
+the resume phase and later phases remain pending. Existing-PR routes,
+operator-only items, closed items, pre-flight skips, and checkpoint/forge
+divergence handling must update the affected item text with the explicit
+reason rather than leaving tasks apparently abandoned. Never reset a
+checkpoint-completed phase to pending.
+
+**Phase-entry rule.** Immediately before dispatching or beginning Curator,
+Builder, Judge, Doctor, or Merge, mark that phase `in_progress`. Parallel
+Claude Builder dispatches may therefore have multiple Builder items active.
+Codex's sequential path has exactly one active lifecycle item; process-level
+children each expose their own active item.
+
+**Phase-exit invariant (load-bearing):**
+
+```text
+complete phase work → write checkpoint → update visible task list →
+publish the phase event / emit the fallback log line → proceed
+```
+
+The checkpoint write and task update are one phase-exit step. Never mark a
+task completed before its durable checkpoint is written. For a phase without
+checkpoint scope (for example, a Mode C PR with no closing issue), the
+successful forge transition takes the checkpoint position in this ordering.
+
+Apply the invariant to every path:
+
+- Judge approval completes Judge and completes the optional item as
+  `Doctor (not needed: Judge approved)`.
+- Judge rejection completes Judge with `(changes requested)`, then re-opens
+  or adds Doctor and marks it `in_progress`. After Doctor's checkpoint and
+  task completion, return Judge to `in_progress` for the single re-review.
+- A skipped/bypassed phase is terminal: append `(skipped: <reason>)` and mark
+  it completed.
+- `TodoWrite` and `update_plan` have no portable blocked status. Encode a
+  terminal blocker as `BLOCKED — <reason>` in the task text, then put the
+  item in the runtime's completed state. The text preserves the non-success
+  outcome while allowing the plan to settle.
+- A merge succeeds only after `merge-pr.sh` returns `0`; then complete Merge
+  and perform the existing terminal checkpoint cleanup.
+
+**Terminal assertion.** A sweep MUST NOT print its final summary or conclude
+while any task remains `pending` or `in_progress`. Every item must be either
+completed normally, completed with an explicit skip/not-needed reason, or
+terminally marked `BLOCKED — <reason>`. The summary outcome counts still come
+from forge/checkpoint state, never from the runtime plan alone.
+
+**Daemon handoff.** The daemon-dispatch parent still creates the complete
+five-item plan before dispatch. After each successful dispatch acknowledgement
+returns a sweep ID, rewrite that issue's five parent items with
+`delegated to daemon (<sweep-id>)` and mark them completed. The detached
+daemon child is a new sweep invocation and owns a fresh full lifecycle plan;
+the parent's completed items record handoff, not lifecycle completion. If a
+dispatch fails, rewrite the affected issue's items as
+`BLOCKED — daemon dispatch failed: <reason>` and complete them before the
+parent reports the failed dispatch. This plan-only handoff does not add daemon
+subscription, monitoring, or protocol behavior.
+
 ### CRITICAL: Only Builders parallelize — issue-creating roles must be serialized (issue #3707)
 
 **Waves parallelize Builders only.** The reason a wave can safely fan out `N` agents at once is that each Builder works in an isolated git worktree and produces **exactly one PR at the end** — no shared mutable forge state is touched mid-run, so two concurrent Builders never collide. `/loom:sweep` itself only ever dispatches Builders (plus per-issue Curator/Judge/Doctor, which run **sequentially within a wave**), so today's wave loop is safe by construction.
@@ -995,6 +1093,12 @@ This is purely "start populating a parameter that already exists" — the daemon
 
 The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispatch (`Dispatched sweep <sweep-id> for issue #N to daemon`). The daemon's spawn-time logic picks an OAuth token from the rotation pool, detaches a `claude -p "/loom:sweep N"` child, and runs the sweep in that child's session — completely independent of this orchestrator session.
 
+Immediately after that acknowledgement, apply the mandatory task-list
+**Daemon handoff** rule: settle the five parent items as
+`delegated to daemon (<sweep-id>)`. The daemon-spawned child creates and owns
+its own fresh five-phase plan. A failed dispatch instead settles the affected
+parent items as `BLOCKED — daemon dispatch failed: <reason>`.
+
 **The skill does NOT subscribe to events.** Phase B's pub/sub bus is consumed by long-running monitors and the spawn loop, not by the skill itself. The skill is fire-and-forget: dispatch, log, exit.
 
 **Mode C is excluded.** Mode C uses `--prs` (or NL triggers); the daemon does not handle PR-set dispatch in v0.10.0. If `PROBE_MODE` returned Mode C, this branch is unreachable — the `DECIDE` precedence sends Mode C to subagent before this branch is evaluated.
@@ -1132,9 +1236,18 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
 
 2. **Compute wave partition.** Partition the candidate list into waves of size `--builders-per-wave`, or the Stage -1 resolved auto wave size when the flag was omitted (see "Resolve auto wave size"), preserving input order. Record `(issue, wave_index, total_waves)` for each candidate. Apply the same silent-clamp and pre-flight-skip rules that the live path uses (closed / `loom:building` / `loom:blocked` issues are tagged as "would skip" in the plan but still appear in the output for transparency). **When stacking edges were resolved in step 1a, first reorder** so every parent's wave is at or before its child's wave (a parent/child pair may share a wave — the child still branches off the parent's branch, not the shared pre-wave `main` snapshot) per "Auto-stack detection and wave ordering", then partition the reordered list.
 
-3. **Print the plan.** Emit a table or block per the issue-set format below.
+3. **Create and show the would-be runtime task list.** Initialize the native
+   `TodoWrite` / `update_plan` surface from "Mandatory visible runtime task
+   list" above and include the same list in the printed plan under a
+   `Would-be runtime task list:` heading. Annotate each phase with its
+   would-run / would-skip action.
 
-4. **EXIT.** Do not proceed to "Wave Lifecycle". The shell must return as soon as the plan is printed.
+4. **Settle the dry-run task list.** Before exit, mark every task completed
+   with `(dry-run only; not executed)` so the terminal assertion has no
+   pending or in-progress entries. This updates only the runtime UI; it does
+   not mutate forge or repository state.
+
+5. **EXIT.** Do not proceed to "Wave Lifecycle". The shell must return as soon as the plan is printed and the dry-run task list is settled.
 
 **Issue-set output spec** (Modes A and B; minimum useful — do **not** add token-pool selection or agent dispatch internals):
 
@@ -1150,6 +1263,13 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
     #125  "Refactor baz module"           labels: loom:building                 → would skip (already in flight)
     #126  "Document quux"                 labels: (none)                        → would curate, build
     #198  "Polish frobnicator"            labels: loom:issue                    → would merge (existing PR #201 already loom:pr)
+
+  Would-be runtime task list:
+    #123 Curator → would skip (already approved)
+    #123 Builder (PR) → would run
+    #123 Judge → would run after PR creation
+    #123 Doctor (if rejected) → conditional
+    #123 Merge → would run after approval
 
 Total: 3 would-build, 1 would-route-to-judge, 1 would-merge, 1 would-skip. No issues were modified.
 ```
@@ -1185,9 +1305,15 @@ Each stacked child's per-candidate action then reads e.g. `→ would build (stac
 
 2. **Compute wave partition.** Mode C waves are size-1 (`--builders-per-wave` is ignored). Each PR is its own wave. Record `(pr, wave_index=N, total_waves=M)` for each candidate. Apply the same skip rules the live path uses (closed PRs, multiple-label conflicts, missing required label all tagged "would skip" in the plan but still listed for transparency).
 
-3. **Print the plan.** Emit the PR-set output spec below.
+3. **Create and show the would-be runtime task list.** Initialize the native
+   task surface and print Judge / Doctor / Merge items for each PR under a
+   `Would-be runtime task list:` heading. Curator and Builder appear as
+   completed Mode C skips.
 
-4. **EXIT.** Do not proceed to "PR-set Wave Lifecycle". The shell must return as soon as the plan is printed.
+4. **Settle the dry-run task list.** Mark every item completed with
+   `(dry-run only; not executed)` before returning.
+
+5. **EXIT.** Do not proceed to "PR-set Wave Lifecycle". The shell must return as soon as the plan is printed and the dry-run task list is settled.
 
 **PR-set output spec** (Mode C):
 
@@ -1204,6 +1330,13 @@ Each stacked child's per-candidate action then reads e.g. `→ would build (stac
     PR #203  "Polish frobnicator"            labels: (none)                       → would skip (no actionable label)
   Wave 5:
     PR #204  "Document quux"                 state: MERGED                        → would skip (PR already merged)
+
+  Would-be runtime task list:
+    PR #200 Curator → would skip (Mode C: existing PR)
+    PR #200 Builder (PR) → would skip (Mode C: existing PR)
+    PR #200 Judge → would run
+    PR #200 Doctor (if rejected) → conditional
+    PR #200 Merge → would run after approval
 
 Total: 1 would-judge, 1 would-doctor-then-judge, 1 would-merge, 2 would-skip. No PRs were modified.
 ```
