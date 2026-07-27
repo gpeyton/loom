@@ -1,5 +1,5 @@
 use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
-use crate::errors::DaemonError;
+use crate::errors::{DaemonError, ErrorCode, ErrorDomain};
 use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
@@ -788,14 +788,19 @@ fn handle_request(
                     token_name: outcome.token_name,
                     log_path: outcome.log_path,
                 },
-                Err(e) => Response::Error {
-                    message: format!("dispatch_sweep failed: {e}"),
-                },
+                Err(e) => Response::StructuredError(
+                    DaemonError::new(
+                        ErrorDomain::Configuration,
+                        ErrorCode::CONFIG_INVALID_VALUE,
+                        format!("dispatch_sweep failed: {e}"),
+                    )
+                    .recoverable(false),
+                ),
             }
         }
 
         Request::ListSweeps { state_filter } => {
-            let sr = sweep_registry
+            let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
             let sweeps = sr.list(state_filter.as_ref());
@@ -1099,6 +1104,7 @@ exit 0
         let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        config.skip_auth_preflight = true;
         let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
         (sr, dir, record_log)
     }
@@ -1180,13 +1186,13 @@ exit 0
             &bus,
         );
         match response {
-            Response::Error { message } => {
+            Response::StructuredError(error) => {
                 assert!(
-                    message.contains("PrSet"),
-                    "expected PrSet rejection message; got: {message}"
+                    error.message.contains("PrSet"),
+                    "expected PrSet rejection message; got: {error:?}"
                 );
             }
-            other => panic!("Expected Error, got: {other:?}"),
+            other => panic!("Expected StructuredError, got: {other:?}"),
         }
     }
 

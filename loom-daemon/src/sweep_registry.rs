@@ -99,6 +99,9 @@ pub struct SweepRegistryConfig {
     /// When `true`, skip the actual label flip via `gh`. Used by unit tests
     /// that don't have GitHub credentials.
     pub skip_label_flip: bool,
+    /// Skip auth-source validation. This exists only for isolated registry
+    /// tests whose fake child does not need real credentials.
+    pub skip_auth_preflight: bool,
 }
 
 impl SweepRegistryConfig {
@@ -110,6 +113,7 @@ impl SweepRegistryConfig {
             spawn_bin: None,
             gh_bin: None,
             skip_label_flip: false,
+            skip_auth_preflight: false,
         }
     }
 
@@ -279,7 +283,11 @@ impl SweepRegistry {
     }
 
     /// Return all tracked sweeps matching the optional state filter.
-    pub fn list(&self, filter: Option<&SweepState>) -> Vec<SweepInfo> {
+    pub fn list(&mut self, filter: Option<&SweepState>) -> Vec<SweepInfo> {
+        // A read is also an opportunity to correct the detached-child view.
+        // This prevents a rapidly exiting child from being reported as
+        // Running until the periodic reaper's next tick.
+        self.reap_once();
         self.entries
             .values()
             .filter(|info| match filter {
@@ -340,6 +348,12 @@ impl SweepRegistry {
                 ));
             }
         };
+
+        // Auth failure is deterministic and must be detected before we claim
+        // the issue or mutate its forge label. The spawn wrapper remains the
+        // authority for token selection; this is intentionally only a cheap
+        // readiness check.
+        self.ensure_auth_source()?;
 
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
@@ -418,6 +432,28 @@ impl SweepRegistry {
             matches!(info.state, SweepState::Running | SweepState::Pending)
                 && info.idempotency_key.as_deref() == Some(key)
         })
+    }
+
+    fn ensure_auth_source(&self) -> Result<()> {
+        if self.config.skip_auth_preflight || std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_some()
+        {
+            return Ok(());
+        }
+        let tokens_dir = self.config.workspace_root.join(".loom").join("tokens");
+        let has_token = std::fs::read_dir(&tokens_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "token"));
+        if has_token {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "no daemon auth source is available: no *.token file under {} and CLAUDE_CODE_OAUTH_TOKEN is unset. Run `loom-tokens bootstrap` to populate .loom/tokens/, or set CLAUDE_CODE_OAUTH_TOKEN explicitly to bypass selection.",
+                tokens_dir.display()
+            ))
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1326,6 +1362,7 @@ exit 0
         let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        config.skip_auth_preflight = true;
         (SweepRegistry::new(config), record_log)
     }
 
@@ -1396,6 +1433,22 @@ exit 0
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
         assert!(lock.exists(), "expected lock dir at {}", lock.display());
+    }
+
+    #[test]
+    fn dispatch_without_auth_leaves_no_lock_or_entry() {
+        let dir = tempdir().unwrap();
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.skip_label_flip = true;
+        let mut registry = SweepRegistry::new(config);
+
+        let error = registry
+            .dispatch(&SweepKind::Issue(70), None, None, None)
+            .expect_err("missing auth must reject dispatch before claiming");
+
+        assert!(error.to_string().contains("no daemon auth source"));
+        assert!(registry.is_empty());
+        assert!(!dir.path().join(".loom/locks/issue-70").exists());
     }
 
     /// Issue #3477 (Phase 1): a `model` dispatch param threads through to
