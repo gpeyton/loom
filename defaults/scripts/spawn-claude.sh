@@ -20,9 +20,12 @@
 # the wrapper.
 #
 # Behavior on missing tokens:
-#   When `.loom/tokens/` is absent, empty, or all tokens are bad, this script
-#   exits 78 (EX_CONFIG) with a message instructing the user to run
-#   `loom-tokens bootstrap`. It does NOT silently fall back to keychain.
+#   An absent or empty `.loom/tokens/` directory means rotation was never
+#   configured. In that degraded single-account mode, use a token already
+#   supplied by the daemon/environment (including the workspace `.env`) or
+#   let `claude` use its inherited login. A configured pool that cannot select
+#   a usable token remains a hard failure; never mask that condition by
+#   falling back to keychain auth.
 #
 # Worktree handling:
 #   When invoked from a git worktree, the script resolves the canonical repo
@@ -207,6 +210,36 @@ if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
 fi
 
 # --- Token selection ---
+# A deliberately small dotenv reader: we only read the one credential Loom
+# needs and never `source` an operator's arbitrary shell file.
+_workspace_env_token() {
+    local env_file="$WORKSPACE/.env" line value
+    [[ -r "$env_file" ]] || return 1
+    line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?CLAUDE_CODE_OAUTH_TOKEN=' "$env_file" | tail -n1 || true)"
+    [[ -n "$line" ]] || return 1
+    value="${line#*=}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [[ -n "$value" ]] || return 1
+    printf '%s' "$value"
+}
+
+_pool_is_unconfigured() {
+    local token_dir="$WORKSPACE/.loom/tokens"
+    [[ ! -d "$token_dir" ]] && return 0
+    ! find "$token_dir" -maxdepth 1 -type f -name '*.token' -print -quit | grep -q .
+}
+
+if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && _pool_is_unconfigured; then
+    if _env_token="$(_workspace_env_token)"; then
+        export CLAUDE_CODE_OAUTH_TOKEN="$_env_token"
+        log_warn "spawn-claude: single-account mode; using CLAUDE_CODE_OAUTH_TOKEN from workspace .env (rotation is off)"
+    else
+        export LOOM_SPAWN_NO_EXPORT=1
+        log_warn "spawn-claude: single-account mode; using inherited Claude authentication (rotation is off)"
+    fi
+fi
+
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     # Resolve the interpreter and assert loom-tools' >= 3.10 floor ONCE, ahead
     # of every `$PYTHON` call site below (issue #72). Without this, a sub-3.10
