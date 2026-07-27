@@ -494,11 +494,13 @@ fi
 
 - **The three tiers.** You are classifying *how expensive it is to be wrong*, not how much typing the issue involves:
 
-  | Value | Emit when | Model |
-  |---|---|---|
-  | `mechanical` | Verifiable by tests or by inspection, no design judgement: file splits, dead-code deletion, renames, hardcoded constants/dates, missing ARIA attributes, mock/fixture fixes, adding a missing constraint. A reviewer can tell it's right by reading it. | `haiku` |
-  | `routine` | Normal bugs and features needing some reasoning but with contained blast radius. **This is the default** — most issues. | `sonnet` |
-  | `complex` | Being wrong is expensive or hard to detect: money, payments or billing; security, authentication or access control; deletions and destructive migrations; long-horizon or cross-cutting design work. | `opus` |
+  | Value | Emit when |
+  |---|---|
+  | `mechanical` | Verifiable by tests or by inspection, no design judgement: file splits, dead-code deletion, renames, hardcoded constants/dates, missing ARIA attributes, mock/fixture fixes, adding a missing constraint. A reviewer can tell it's right by reading it. |
+  | `routine` | Normal bugs and features needing some reasoning but with contained blast radius. **This is the default** — most issues. |
+  | `complex` | Being wrong is expensive or hard to detect: money, payments or billing; security, authentication or access control; deletions and destructive migrations; long-horizon or cross-cutting design work. |
+
+  **Never name a model.** The tier is runtime-neutral — the same issue may be built by a Claude or a Codex worker. `sweep.md` resolves the concrete model from `.loom/config.json` → `sweep.tierModels[<runtime>][<tier>]`. Your job is the classification; the mapping is not yours to make.
 
 - **What it does**: at dispatch the sweep skill reads the marker as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from the table above. **`complex` also applies to that issue's Judge** — when being wrong is expensive, the review must be at least as strong as the build. `mechanical` never downgrades the Judge; a cheap build still gets a normal review.
 

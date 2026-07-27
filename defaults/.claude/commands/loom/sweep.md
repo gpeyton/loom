@@ -413,9 +413,11 @@ Every role subagent dispatched by this skill (`loom-curator`, `loom-builder`, `l
 
 | Marker | Builder model | Judge model |
 |---|---|---|
-| `mechanical` | `haiku` | unchanged (a cheap build still gets a normal review) |
-| `routine` / absent / malformed | `sonnet` | unchanged |
-| `complex` | `opus` | **`opus`** — raised to match the Builder |
+| `mechanical` | `tierModels[<runtime>].mechanical` | unchanged (a cheap build still gets a normal review) |
+| `routine` / absent / malformed | `tierModels[<runtime>].routine` | unchanged |
+| `complex` | `tierModels[<runtime>].complex` | **raised to `tierModels[<runtime>].complex`** to match the Builder |
+
+**The tier is runtime-neutral; the model is not.** The Curator classifies work by cost-of-being-wrong and never names a model. Resolve the concrete model from `.loom/config.json` → `sweep.tierModels[<runtime>][<tier>]`, where `<runtime>` is the dispatched worker type (`claude`, `codex`, …) — the same value that selects the worker runner. Shipped defaults map Claude to `haiku|sonnet|opus` and Codex to `gpt-5-mini|gpt-5|gpt-5-codex`; a workspace retunes either by editing config, and a new runtime is added by adding a key. **Never hardcode a model name in this file or infer one from the tier.** If the runtime has no `tierModels` entry, or the tier is missing from it, resolve nothing at tier 2.5 and fall through to tier 3 — an unknown runtime must degrade to the existing chain, never to a Claude model name.
 
 **`complex` is the only value that touches the Judge.** When being wrong is expensive, the review must be at least as strong as the build; a `complex` issue must never be reviewed by a weaker model than built it. `mechanical` never downgrades the Judge — cheapening review is how a cheap build's mistakes ship.
 
