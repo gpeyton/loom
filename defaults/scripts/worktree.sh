@@ -697,8 +697,8 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
-  ✓ Symlinks node_modules from main (avoids pnpm install)
-  ✓ Symlinks nested per-package node_modules for pnpm/monorepo workspaces
+  ✓ Installs isolated pnpm dependencies per worktree (reuses pnpm's shared store)
+  ✓ Supports legacy node_modules symlinks only via worktree.dependencyMode=symlink
   ✓ Symlinks extra gitignored paths via .loom/config.json worktree.linkPaths
   ✓ Excludes created symlinks via .git/info/exclude (no accidental git add)
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
@@ -731,20 +731,30 @@ Project-Specific Hooks:
     cd "\$1"
     pnpm install  # or: lake exe cache get, pip install -e ., etc.
 
-Monorepo / Generated-Artifact Symlinks:
-  In addition to the root node_modules symlink, worktree.sh symlinks:
-    - Nested per-package node_modules (e.g. apps/web/node_modules) discovered by
-      scanning the main workspace for node_modules dirs that sit next to a
-      package.json (pnpm/monorepo layouts). No YAML parser dependency.
-    - Extra gitignored paths listed in .loom/config.json under worktree.linkPaths,
-      e.g. generated wasm-pack bindings that are expensive to rebuild per worktree:
+Dependency Setup / Generated-Artifact Symlinks:
+  By default, pnpm projects receive a real worktree-local install:
 
-        { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
+    CI=true pnpm install --frozen-lockfile
 
-  Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
-  never stages it. All symlinking is best-effort — a failed link warns and
-  continues; it never aborts worktree creation. Repos with no nested node_modules
-  and no worktree.linkPaths config see no behavior change.
+  pnpm still reuses its content-addressed store, so package contents are
+  deduplicated without sharing mutable node_modules paths or install metadata
+  with the main checkout. To opt into the old, non-isolated behavior:
+
+    { "worktree": { "dependencyMode": "symlink" } }
+
+  Compatibility mode symlinks root and nested per-package node_modules from the
+  main checkout. It is intended only for projects that knowingly accept shared
+  mutable dependencies.
+
+  Extra gitignored paths listed in .loom/config.json under worktree.linkPaths
+  remain explicit, independent links, e.g. generated wasm-pack bindings that
+  are expensive to rebuild per worktree:
+
+    { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
+
+  Each compatibility/generated-artifact symlink is added to the worktree's
+  .git/info/exclude so 'git add -A' never stages it. Dependency installation and
+  symlinking are best-effort: failures warn and never abort worktree creation.
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
@@ -1496,28 +1506,17 @@ if _try_worktree_add; then
         cd - > /dev/null
     fi
 
-    # Symlink node_modules from main workspace if available
-    # This avoids expensive pnpm install on every worktree (30-60s savings)
+    # Dependency setup is isolated by default (#62). A real worktree-local pnpm
+    # install keeps node_modules paths and .modules.yaml metadata rooted in the
+    # worktree while pnpm's content-addressed store still deduplicates package
+    # contents. Consumers that knowingly accept the old shared mutable tree can
+    # opt in with .loom/config.json:
+    #   { "worktree": { "dependencyMode": "symlink" } }
     MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
     MAIN_NODE_MODULES="$MAIN_WORKSPACE_DIR/node_modules"
     WORKTREE_NODE_MODULES="$ABS_WORKTREE_PATH/node_modules"
     WORKTREE_PACKAGE_JSON="$ABS_WORKTREE_PATH/package.json"
-
-    if [[ -d "$MAIN_NODE_MODULES" && -f "$WORKTREE_PACKAGE_JSON" && ! -e "$WORKTREE_NODE_MODULES" ]]; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Symlinking node_modules from main workspace..."
-        fi
-
-        if ln -s "$MAIN_NODE_MODULES" "$WORKTREE_NODE_MODULES" 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "node_modules symlinked (skipping pnpm install)"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Could not symlink node_modules (will install on first build)"
-            fi
-        fi
-    fi
+    LOOM_CONFIG_FILE="$MAIN_WORKSPACE_DIR/.loom/config.json"
 
     # Resolve the info/exclude path that applies to this worktree. Running
     # `git rev-parse --git-path info/exclude` from inside the worktree returns
@@ -1547,41 +1546,80 @@ if _try_worktree_add; then
             || echo "$entry" >> "$WORKTREE_INFO_EXCLUDE" 2>/dev/null || true
     }
 
-    # Symlink nested (per-package) node_modules for pnpm/monorepo workspaces.
-    # The root node_modules symlink above does not cover per-package installs
-    # (e.g. apps/web/node_modules), so a fresh worktree fails typecheck/build
-    # until each is linked. Directory-scan discovery (no YAML parser dependency,
-    # see #3528): find node_modules dirs at shallow depth that sit next to a
-    # package.json, skipping the root (already handled) and anything nested
-    # inside another node_modules (avoids recursing into node_modules/.pnpm/**).
-    if [[ -d "$MAIN_NODE_MODULES" ]]; then
-        while IFS= read -r -d '' pkg_node_modules; do
-            pkg_dir="$(dirname "$pkg_node_modules")"
-            rel_path="${pkg_dir#"$MAIN_WORKSPACE_DIR"/}"
-            # Skip if the prefix strip did nothing (path not under main workspace).
-            if [[ "$rel_path" == "$pkg_dir" ]]; then
-                continue
+    DEPENDENCY_MODE="isolated"
+    if command -v jq >/dev/null 2>&1 && [[ -f "$LOOM_CONFIG_FILE" ]]; then
+        CONFIGURED_DEPENDENCY_MODE=$(jq -r '.worktree.dependencyMode // "isolated"' \
+            "$LOOM_CONFIG_FILE" 2>/dev/null || echo "isolated")
+        case "$CONFIGURED_DEPENDENCY_MODE" in
+            isolated|symlink)
+                DEPENDENCY_MODE="$CONFIGURED_DEPENDENCY_MODE"
+                ;;
+            *)
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_warning "Unknown worktree.dependencyMode '$CONFIGURED_DEPENDENCY_MODE'; using isolated"
+                fi
+                ;;
+        esac
+    fi
+
+    if [[ "$DEPENDENCY_MODE" == "symlink" ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_warning "Using legacy shared node_modules compatibility mode (non-isolated)"
+        fi
+
+        if [[ -d "$MAIN_NODE_MODULES" && -f "$WORKTREE_PACKAGE_JSON" && ! -e "$WORKTREE_NODE_MODULES" ]]; then
+            if ln -s "$MAIN_NODE_MODULES" "$WORKTREE_NODE_MODULES" 2>/dev/null; then
+                _append_worktree_exclude "node_modules"
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_success "node_modules symlinked from main workspace"
+                fi
+            elif [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Could not symlink node_modules"
             fi
-            # Only mirror package roots (node_modules alongside a package.json).
-            if [[ ! -f "$pkg_dir/package.json" ]]; then
-                continue
-            fi
-            worktree_pkg_dir="$ABS_WORKTREE_PATH/$rel_path"
-            worktree_pkg_node_modules="$worktree_pkg_dir/node_modules"
-            if [[ -d "$worktree_pkg_dir" && ! -e "$worktree_pkg_node_modules" ]]; then
-                if ln -s "$pkg_node_modules" "$worktree_pkg_node_modules" 2>/dev/null; then
-                    _append_worktree_exclude "$rel_path/node_modules"
-                    if [[ "$JSON_OUTPUT" != "true" ]]; then
-                        print_success "Symlinked $rel_path/node_modules from main workspace"
-                    fi
-                else
-                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        fi
+
+        # Compatibility mode applies one policy to the root and nested package
+        # dependency trees. Discover shallow package-level node_modules dirs
+        # alongside package.json, skipping contents inside node_modules itself.
+        if [[ -d "$MAIN_NODE_MODULES" ]]; then
+            while IFS= read -r -d '' pkg_node_modules; do
+                pkg_dir="$(dirname "$pkg_node_modules")"
+                rel_path="${pkg_dir#"$MAIN_WORKSPACE_DIR"/}"
+                if [[ "$rel_path" == "$pkg_dir" || ! -f "$pkg_dir/package.json" ]]; then
+                    continue
+                fi
+                worktree_pkg_dir="$ABS_WORKTREE_PATH/$rel_path"
+                worktree_pkg_node_modules="$worktree_pkg_dir/node_modules"
+                if [[ -d "$worktree_pkg_dir" && ! -e "$worktree_pkg_node_modules" ]]; then
+                    if ln -s "$pkg_node_modules" "$worktree_pkg_node_modules" 2>/dev/null; then
+                        _append_worktree_exclude "$rel_path/node_modules"
+                        if [[ "$JSON_OUTPUT" != "true" ]]; then
+                            print_success "Symlinked $rel_path/node_modules from main workspace"
+                        fi
+                    elif [[ "$JSON_OUTPUT" != "true" ]]; then
                         print_warning "Could not symlink $rel_path/node_modules"
                     fi
                 fi
+            done < <(find "$MAIN_WORKSPACE_DIR" -mindepth 2 -maxdepth 3 -type d \
+                        -name node_modules -not -path "*/node_modules/*" -print0 2>/dev/null)
+        fi
+    elif [[ -f "$WORKTREE_PACKAGE_JSON" && -f "$ABS_WORKTREE_PATH/pnpm-lock.yaml" ]]; then
+        if command -v pnpm >/dev/null 2>&1; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_info "Installing isolated pnpm dependencies in worktree..."
             fi
-        done < <(find "$MAIN_WORKSPACE_DIR" -mindepth 2 -maxdepth 3 -type d \
-                    -name node_modules -not -path "*/node_modules/*" -print0 2>/dev/null)
+            if (cd "$ABS_WORKTREE_PATH" && CI=true pnpm install --frozen-lockfile); then
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_success "Isolated pnpm dependencies installed (shared store reused)"
+                fi
+            elif [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Isolated pnpm install failed (worktree still created)"
+            fi
+        elif [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_warning "pnpm project detected but pnpm is unavailable; install dependencies in the worktree before building"
+        fi
+    elif [[ -f "$WORKTREE_PACKAGE_JSON" && "$JSON_OUTPUT" != "true" ]]; then
+        print_info "No pnpm lockfile detected; dependency setup remains worktree-local"
     fi
 
     # Symlink additional gitignored paths configured in .loom/config.json under
@@ -1589,7 +1627,6 @@ if _try_worktree_add; then
     # to rebuild per worktree). Best-effort: missing config, missing jq, malformed
     # JSON, or an empty/absent key all silently skip this step (#3528). Mirrors
     # the inline-jq-with-guard pattern from validate-roles.sh.
-    LOOM_CONFIG_FILE="$MAIN_WORKSPACE_DIR/.loom/config.json"
     if command -v jq >/dev/null 2>&1 && [[ -f "$LOOM_CONFIG_FILE" ]]; then
         while IFS= read -r link_path; do
             if [[ -z "$link_path" ]]; then
