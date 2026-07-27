@@ -337,6 +337,24 @@ forge_get_pr_nocache() {
   fi
 }
 
+# Get an issue's state.
+# Usage: forge_get_issue_state NWO ISSUE_NUMBER [gh-command]
+# Returns the forge's state string on stdout. Callers must treat a failed or
+# unknown lookup as unsafe when the result would permit destructive cleanup.
+forge_get_issue_state() {
+  local nwo="$1"
+  local issue_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then
+    forge_split_nwo "$nwo"
+    gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/issues/$issue_number" \
+      | jq -r '.state'
+  else
+    "$gh_cmd" api "repos/$nwo/issues/$issue_number" --jq '.state' 2>/dev/null
+  fi
+}
+
 # Check if repo auto-deletes branches on merge.
 # Usage: forge_check_auto_delete NWO
 # Returns: "true" or "false" on stdout

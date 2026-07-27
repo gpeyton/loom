@@ -631,6 +631,42 @@ assert_not_contains "$LABELS_AFTER10" "# Core Workflow States" \
     "markerless separators: Loom's own content-bearing header was removed"
 rm -rf "$T10"
 
+# --- 5i: malformed marker set -> consumer content survives uninstall -------
+# An orphan BEGIN followed by a later complete pair used to make sed delete the
+# entire span, including consumer labels between the two BEGIN lines.
+T11=$(mktemp -d /tmp/loom-labels-malformed-uninstall.XXXXXX)
+make_labels_uninstall_repo "$T11" "# BEGIN LOOM LABELS
+# Consumer labels between malformed markers must survive.
+- name: area/api
+  description: API surface
+  color: \"112233\"
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: Approved for work by human
+  color: \"3B82F6\"
+# END LOOM LABELS
+- name: area/web
+  description: Web surface
+  color: \"445566\"
+"
+
+"$UNINSTALL_SH" --yes --local "$T11" > /tmp/loom-labels-uninstall.log 2>&1 || true
+
+LABELS_AFTER11=$(cat "$T11/.github/labels.yml" 2>/dev/null || echo "<file deleted>")
+assert_contains "$LABELS_AFTER11" "- name: area/api" \
+    "malformed markers: consumer label before Loom block survived uninstall"
+assert_contains "$LABELS_AFTER11" "- name: area/web" \
+    "malformed markers: consumer label after Loom block survived uninstall"
+assert_contains "$LABELS_AFTER11" "Consumer labels between malformed markers must survive." \
+    "malformed markers: consumer comment survived uninstall"
+assert_not_contains "$LABELS_AFTER11" "- name: loom:issue" \
+    "malformed markers: Loom label was removed"
+assert_not_contains "$LABELS_AFTER11" "BEGIN LOOM LABELS" \
+    "malformed markers: orphan BEGIN markers were removed"
+assert_not_contains "$LABELS_AFTER11" "END LOOM LABELS" \
+    "malformed markers: END marker was removed"
+rm -rf "$T11" /tmp/loom-labels-uninstall.log
+
 # --- 5g: Loom-only file -> deleted outright ------------------------------
 # The pre-#68 contract (scripts/test-installer.sh Test 24) must still hold for
 # repos that never added labels of their own.

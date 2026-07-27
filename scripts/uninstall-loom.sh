@@ -1119,13 +1119,20 @@ LABELS_YML="$WORKTREE_ABS/.github/labels.yml"
 if [[ -f "$LABELS_YML" ]]; then
   LABELS_TOUCHED=false
 
-  if grep -q '^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null && \
-     grep -q '^[[:space:]]*# END LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null; then
+  LABELS_BEGIN_COUNT=$(grep -c '^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+  LABELS_END_COUNT=$(grep -c '^[[:space:]]*# END LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+  if [[ "$LABELS_BEGIN_COUNT" == "1" && "$LABELS_END_COUNT" == "1" ]] && \
+     awk '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/ { begin = NR }
+          /^[[:space:]]*# END LOOM LABELS[[:space:]]*$/ { end = NR }
+          END { exit !(begin < end) }' "$LABELS_YML"; then
     info "Removing Loom label block from .github/labels.yml (marker-based)..."
     sed '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/,/^[[:space:]]*# END LOOM LABELS[[:space:]]*$/d' \
       "$LABELS_YML" > "${LABELS_YML}.tmp" && mv "${LABELS_YML}.tmp" "$LABELS_YML"
     LABELS_TOUCHED=true
   elif [[ -f "$LOOM_ROOT/defaults/.github/labels.yml" ]]; then
+    if [[ "$LABELS_BEGIN_COUNT" != "0" || "$LABELS_END_COUNT" != "0" ]]; then
+      warning ".github/labels.yml has malformed Loom markers; removing Loom entries by name instead of deleting a marker range"
+    fi
     info "Removing Loom labels from markerless .github/labels.yml (name-based)..."
     # Pass 1 reads the shipped defaults to learn which label names and which
     # top-level comment lines are Loom's. Pass 2 rewrites the target, dropping
