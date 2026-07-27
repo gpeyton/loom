@@ -141,6 +141,18 @@ for phase in curator-done builder-done judge-done doctor-done merge-done; do
     fi
 done
 
+# 15b. A rejected Judge outcome is durable and retains its PR routing key.
+assert "write judge-rejected with pr-number" "$CHECKPOINT" write 64 judge-rejected --task-id sweep-test --pr-number 214
+out=$("$CHECKPOINT" read 64)
+if echo "$out" | grep -q '"phase": "judge-rejected"' && echo "$out" | grep -q '"pr_number": 214'; then
+    echo "PASS: judge-rejected persists with its PR number"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: judge-rejected checkpoint did not retain its PR number: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+assert_exit "judge-rejected without pr-number exits 1" 1 "$CHECKPOINT" write 65 judge-rejected --task-id sweep-test
+
 # --- Optional attempt field (#3481, model escalation bookkeeping) ---
 
 # 16. write with --attempt round-trips through read and attempt
