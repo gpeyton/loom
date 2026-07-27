@@ -81,7 +81,7 @@ const UNKNOWN_PRICING: ModelPricing = ModelPricing {
 const PRICING_TABLE: &[PricingEntry] = &[
     // --- Anthropic (Claude) ---
     PricingEntry {
-        match_substrings: &["claude-3-5-sonnet", "claude-sonnet-4"],
+        match_substrings: &["claude-3-5-sonnet", "claude-sonnet-"],
         pricing: ModelPricing {
             input_cost_per_1k: 0.003,
             output_cost_per_1k: 0.015,
@@ -90,7 +90,7 @@ const PRICING_TABLE: &[PricingEntry] = &[
         },
     },
     PricingEntry {
-        match_substrings: &["claude-3-opus", "claude-opus-4"],
+        match_substrings: &["claude-3-opus", "claude-opus-", "claude-fable-"],
         pricing: ModelPricing {
             input_cost_per_1k: 0.015,
             output_cost_per_1k: 0.075,
@@ -99,7 +99,7 @@ const PRICING_TABLE: &[PricingEntry] = &[
         },
     },
     PricingEntry {
-        match_substrings: &["claude-3-haiku"],
+        match_substrings: &["claude-3-haiku", "claude-haiku-"],
         pricing: ModelPricing {
             input_cost_per_1k: 0.00025,
             output_cost_per_1k: 0.00125,
@@ -208,87 +208,12 @@ impl ModelPricing {
                 .any(|needle| model_lower.contains(needle))
             {
                 return entry.pricing.clone();
-impl ModelPricing {
-    /// Get pricing for a given model.
-    ///
-    /// Matching is **generation-agnostic**: it keys off the family stem
-    /// (`claude-sonnet-`, `claude-opus-`, `claude-haiku-`, `claude-fable-`)
-    /// rather than a pinned generation number, so a future generation (e.g.
-    /// `claude-sonnet-6`) prices correctly with no code change (#3981). The
-    /// legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
-    /// predate the `-<generation>-` naming scheme and are matched explicitly.
-    /// Mirrors `loom_tools.sweep_experiment.model_pricing` in Python — keep
-    /// both in sync.
-    pub fn for_model(model: &str) -> Self {
-        // Normalize model name for matching
-        let model_lower = model.to_lowercase();
-
-        // Anthropic models (prices as of Jan 2025)
-        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-sonnet-") {
-            Self {
-                input_cost_per_1k: 0.003,
-                output_cost_per_1k: 0.015,
-                cache_read_cost_per_1k: 0.0003,
-                cache_write_cost_per_1k: 0.00375,
-            }
-        } else if model_lower.contains("claude-3-opus")
-            || model_lower.contains("claude-opus-")
-            || model_lower.contains("claude-fable-")
-        {
-            // `claude-fable-*` (the #3702 escalation-ladder rung above Opus)
-            // has no published per-token rate, so it is conservatively priced
-            // at the Opus rate rather than falling through to the cheaper
-            // default and under-reporting cost.
-            Self {
-                input_cost_per_1k: 0.015,
-                output_cost_per_1k: 0.075,
-                cache_read_cost_per_1k: 0.0015,
-                cache_write_cost_per_1k: 0.01875,
-            }
-        } else if model_lower.contains("claude-3-haiku") || model_lower.contains("claude-haiku-") {
-            Self {
-                input_cost_per_1k: 0.00025,
-                output_cost_per_1k: 0.00125,
-                cache_read_cost_per_1k: 0.00003,
-                cache_write_cost_per_1k: 0.0003,
-            }
-        } else if model_lower.contains("gpt-4o") {
-            // OpenAI GPT-4o pricing
-            Self {
-                input_cost_per_1k: 0.005,
-                output_cost_per_1k: 0.015,
-                cache_read_cost_per_1k: 0.0025, // 50% discount for cached
-                cache_write_cost_per_1k: 0.005,
-            }
-        } else if model_lower.contains("gpt-4-turbo") {
-            Self {
-                input_cost_per_1k: 0.01,
-                output_cost_per_1k: 0.03,
-                cache_read_cost_per_1k: 0.005,
-                cache_write_cost_per_1k: 0.01,
-            }
-        } else if model_lower.contains("gpt-3.5") {
-            Self {
-                input_cost_per_1k: 0.0005,
-                output_cost_per_1k: 0.0015,
-                cache_read_cost_per_1k: 0.00025,
-                cache_write_cost_per_1k: 0.0005,
-            }
-        } else {
-            // Default to Claude Sonnet pricing as reasonable middle ground
-            log::debug!("Unknown model '{model}', using default Sonnet pricing");
-            Self {
-                input_cost_per_1k: 0.003,
-                output_cost_per_1k: 0.015,
-                cache_read_cost_per_1k: 0.0003,
-                cache_write_cost_per_1k: 0.00375,
             }
         }
 
         log::warn!("Unknown model '{model}', pricing as zero-cost (unknown) — not Claude Sonnet");
         UNKNOWN_PRICING.clone()
     }
-
     /// Calculate total cost for given token counts
     #[allow(clippy::cast_precision_loss)]
     pub fn calculate_cost(

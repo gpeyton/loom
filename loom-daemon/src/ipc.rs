@@ -2303,6 +2303,11 @@ exit 0
             } => {
                 assert!(matches!(kind, SweepKind::Issue(9)));
                 assert_eq!(worker_type.as_deref(), Some("codex"));
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
     // ===== DispatchSweep serde compat for `effort` (Issue #3716) =====
 
     /// A wire payload WITHOUT the `effort` field (the pre-#3716 client shape)
