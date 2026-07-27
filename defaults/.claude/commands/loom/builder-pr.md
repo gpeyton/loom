@@ -302,6 +302,14 @@ Local verification:
 - [ ] Each criterion has explicit verification (not "I think it works")
 ```
 
+### Hard stop for unmet criteria
+
+If any acceptance criterion remains unchecked and is not explicitly out of
+scope in the issue text, **do not create a `Closes #N` PR**. Continue
+implementation, or atomically mark the issue `loom:blocked` with a comment
+listing the unmet criteria and the reason it cannot proceed. Do not use the
+Judge/Doctor loop to finish work the Builder already knows is incomplete.
+
 ### Step 4: Document Verification in PR Description
 
 Include criterion verification in your PR description:
