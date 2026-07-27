@@ -29,7 +29,7 @@ Add exactly one of these to the issue body before applying loom:curated:
 
   <!-- loom:complexity=mechanical -->   verifiable by tests/inspection
   <!-- loom:complexity=routine -->      normal work, contained blast radius
-  <!-- loom:complexity=complex -->      money, security, destructive, cross-cutting
+  <!-- loom:complexity=complex -->      needs real design judgement, or wrong is costly
 
 Torn between two? Take the higher one.
 EOF

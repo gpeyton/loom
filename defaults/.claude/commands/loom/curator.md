@@ -494,7 +494,7 @@ Classify by **how expensive it is to be wrong**, not by how much work it looks l
 |---|---|
 | `mechanical` | Verifiable by tests or inspection, no design judgement — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
 | `routine` | Normal bugs and features, contained blast radius. **Default** — most issues. |
-| `complex` | Money, security and access control, destructive migrations, cross-cutting design. |
+| `complex` | Real design judgement, or consequences that are hard to detect by reading the diff — architecture, cross-cutting change, subtle logic, anything where being wrong is expensive. Money, security and destructive migrations are common cases, not the whole list. |
 
 - Absent marker means `routine`. Don't emit `routine` explicitly.
 - **Never name a model.** The tier is runtime-neutral; `sweep.md` resolves it from `sweep.tierModels[<runtime>][<tier>]`.
