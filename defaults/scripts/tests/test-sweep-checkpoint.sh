@@ -25,9 +25,13 @@ trap 'rm -rf "$TMP_REPO"' EXIT
 cd "$TMP_REPO" || exit 1
 git init -q .
 mkdir -p .loom/scripts
-# Use a script-relative copy so `repo_root` lands here, not in the real loom checkout.
+# Commit the helper so the fixture can create a real linked worktree.
 cp "$HELPER" .loom/scripts/sweep-checkpoint.sh
 chmod +x .loom/scripts/sweep-checkpoint.sh
+git config user.email "loom-test@example.com"
+git config user.name "Loom Test"
+git add .loom/scripts/sweep-checkpoint.sh
+git commit -qm "test fixture"
 
 CHECKPOINT="$TMP_REPO/.loom/scripts/sweep-checkpoint.sh"
 
@@ -64,6 +68,20 @@ assert_eq() {
         echo "FAIL: $desc (expected '$expected', got '$actual')" >&2
         FAIL=$((FAIL + 1))
     fi
+}
+run_in_dir() {
+    local dir="$1"; shift
+    (cd "$dir" && "$@")
+}
+list_has_issue() {
+    local dir="$1" helper="$2" issue="$3"
+    (cd "$dir" && "$helper" list) | grep -qx "$issue"
+}
+write_checkpoint_fixture() {
+    local target="$1" phase="$2" timestamp="$3"
+    mkdir -p "$(dirname "$target")"
+    printf '{\n  "phase": "%s",\n  "task_id": "legacy-fixture",\n  "timestamp": "%s",\n  "pr_number": null\n}\n' \
+        "$phase" "$timestamp" > "$target"
 }
 
 # 1. exists on missing checkpoint → exit 1
@@ -348,6 +366,86 @@ else
 fi
 out=$("$CHECKPOINT" phase 82)
 assert_eq "fallback-default checkpoint still reads phase" "curator-done" "$out"
+
+# --- Canonical main-workspace storage from linked worktrees (issue #63) ---
+
+LINKED_WORKTREE="$TMP_REPO/.loom/worktrees/issue-90"
+mkdir -p "$(dirname "$LINKED_WORKTREE")"
+git worktree add -q -b feature/issue-90 "$LINKED_WORKTREE" HEAD
+LINKED_CHECKPOINT="$LINKED_WORKTREE/.loom/scripts/sweep-checkpoint.sh"
+MAIN_NESTED="$TMP_REPO/nested/main"
+LINKED_NESTED="$LINKED_WORKTREE/nested/worktree"
+mkdir -p "$MAIN_NESTED" "$LINKED_NESTED"
+
+# 38. A write from a nested linked-worktree cwd lands in the main workspace.
+assert "worktree-nested write succeeds" run_in_dir "$LINKED_NESTED" \
+    "$LINKED_CHECKPOINT" write 90 builder-done --task-id sweep-worktree --pr-number 901
+if [[ -f "$TMP_REPO/.loom/sweep-checkpoint/issue-90.json" \
+   && ! -f "$LINKED_WORKTREE/.loom/sweep-checkpoint/issue-90.json" ]]; then
+    echo "PASS: worktree write uses the main-workspace checkpoint directory"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: worktree write did not use the main-workspace checkpoint directory" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# 39. read/phase/exists/list all resolve the same record from nested main cwd.
+out=$(run_in_dir "$MAIN_NESTED" "$CHECKPOINT" read 90)
+if echo "$out" | grep -q '"pr_number": 901'; then
+    echo "PASS: main-nested read sees worktree-written checkpoint"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: main-nested read missed worktree-written checkpoint: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+out=$(run_in_dir "$MAIN_NESTED" "$CHECKPOINT" phase 90)
+assert_eq "main-nested phase sees builder-done" "builder-done" "$out"
+assert "main-nested exists sees worktree-written checkpoint" run_in_dir \
+    "$MAIN_NESTED" "$CHECKPOINT" exists 90
+assert "main-nested list includes worktree-written checkpoint" list_has_issue \
+    "$MAIN_NESTED" "$CHECKPOINT" 90
+
+# 40. delete from a nested linked-worktree cwd removes the canonical record.
+assert "worktree-nested delete removes canonical checkpoint" run_in_dir \
+    "$LINKED_NESTED" "$LINKED_CHECKPOINT" delete 90
+assert_exit "canonical checkpoint is absent after worktree delete" 1 \
+    "$CHECKPOINT" exists 90
+
+# 41. A newer legacy worktree-local checkpoint is atomically promoted.
+"$CHECKPOINT" write 91 curator-done --task-id canonical-old >/dev/null
+LEGACY_91="$LINKED_WORKTREE/.loom/sweep-checkpoint/issue-91.json"
+write_checkpoint_fixture "$LEGACY_91" builder-done "2099-01-01T00:00:00Z"
+out=$("$CHECKPOINT" phase 91 2>"$TMP_REPO/migrate-newer.err")
+assert_eq "newer legacy checkpoint wins by timestamp" "builder-done" "$out"
+assert_exit "newer legacy checkpoint is removed after migration" 1 test -f "$LEGACY_91"
+assert "newer legacy migration emits a loud notice" grep -q \
+    "promoted newer legacy worktree sweep checkpoint" "$TMP_REPO/migrate-newer.err"
+
+# 42. An older legacy duplicate is removed and the canonical record wins.
+"$CHECKPOINT" write 92 judge-done --task-id canonical-new --pr-number 902 >/dev/null
+LEGACY_92="$LINKED_WORKTREE/.loom/sweep-checkpoint/issue-92.json"
+write_checkpoint_fixture "$LEGACY_92" curator-done "2000-01-01T00:00:00Z"
+out=$("$CHECKPOINT" phase 92 2>"$TMP_REPO/migrate-older.err")
+assert_eq "newer canonical checkpoint wins by timestamp" "judge-done" "$out"
+assert_exit "older legacy checkpoint is removed after reconciliation" 1 test -f "$LEGACY_92"
+assert "older legacy reconciliation emits a loud notice" grep -q \
+    "removed older legacy worktree sweep checkpoint" "$TMP_REPO/migrate-older.err"
+
+# 43. A malformed timestamp conflict is never silently discarded.
+"$CHECKPOINT" write 93 curator-done --task-id canonical-valid >/dev/null
+LEGACY_93="$LINKED_WORKTREE/.loom/sweep-checkpoint/issue-93.json"
+write_checkpoint_fixture "$LEGACY_93" builder-done "not-a-timestamp"
+out=$("$CHECKPOINT" phase 93 2>"$TMP_REPO/migrate-malformed.err")
+assert_eq "canonical phase remains readable with malformed legacy conflict" "curator-done" "$out"
+assert "malformed legacy conflict remains for manual reconciliation" test -f "$LEGACY_93"
+assert "malformed legacy conflict emits a loud warning" grep -q \
+    "missing or malformed timestamps" "$TMP_REPO/migrate-malformed.err"
+
+# 44. Normal writes and migrations leave no atomic-write scratch files.
+strays=$(find "$TMP_REPO/.loom/sweep-checkpoint" \
+    \( -name 'issue-*.tmp.*' -o -name 'issue-*.migrate.tmp.*' \) \
+    -type f 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "no stray write or migration temp files" "0" "$strays"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

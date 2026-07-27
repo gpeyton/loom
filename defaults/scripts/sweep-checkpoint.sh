@@ -82,9 +82,22 @@ usage() {
     exit 1
 }
 
-# Resolve repo root (handles invocation from worktree subdirs).
+# Resolve the main workspace root from both the main checkout and linked
+# worktrees. `--show-toplevel` is worktree-local, while `--git-common-dir`
+# points at the main checkout's .git directory from every linked worktree.
 repo_root() {
-    git rev-parse --show-toplevel 2>/dev/null || pwd
+    local common abs_common
+    common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+    if [[ -z "$common" ]]; then
+        pwd
+        return
+    fi
+
+    abs_common="$(cd "$common" 2>/dev/null && pwd -P)" || {
+        pwd
+        return
+    }
+    dirname "$abs_common"
 }
 
 checkpoint_dir() {
@@ -98,6 +111,86 @@ checkpoint_file() {
 
 ensure_dir() {
     mkdir -p "$(checkpoint_dir)"
+}
+
+checkpoint_timestamp() {
+    local checkpoint="$1"
+    sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$checkpoint" | head -n1
+}
+
+valid_checkpoint_timestamp() {
+    [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+}
+
+install_checkpoint_atomically() {
+    local source="$1" target="$2"
+    local tmp="${target}.migrate.tmp.$$"
+
+    if cp "$source" "$tmp" && mv "$tmp" "$target"; then
+        if ! rm -f "$source"; then
+            echo "WARNING: migrated legacy sweep checkpoint to $target but could not remove $source" >&2
+        fi
+        return 0
+    fi
+
+    rm -f "$tmp"
+    echo "WARNING: could not migrate legacy sweep checkpoint $source to $target; leaving it in place" >&2
+    return 1
+}
+
+# Older versions resolved the checkpoint directory with `--show-toplevel`, so
+# writes issued from a linked worktree could strand newer phase state inside
+# that worktree. Reconcile those legacy files on every helper entry: the newest
+# ISO-8601 timestamp wins, while malformed conflicts remain in place with a
+# loud warning instead of being silently ignored.
+reconcile_legacy_checkpoints() {
+    local main_root canonical_dir listed_worktree worktree_root legacy_dir
+    main_root="$(repo_root)"
+    canonical_dir="$main_root/.loom/sweep-checkpoint"
+    mkdir -p "$canonical_dir"
+
+    while IFS= read -r listed_worktree; do
+        worktree_root="$(cd "$listed_worktree" 2>/dev/null && pwd -P)" || continue
+        [[ -n "$worktree_root" && "$worktree_root" != "$main_root" ]] || continue
+        legacy_dir="$worktree_root/.loom/sweep-checkpoint"
+        [[ -d "$legacy_dir" ]] || continue
+
+        local legacy_file issue target legacy_ts canonical_ts
+        for legacy_file in "$legacy_dir"/issue-*.json; do
+            [[ -f "$legacy_file" ]] || continue
+            issue="${legacy_file##*/issue-}"
+            issue="${issue%.json}"
+            [[ "$issue" =~ ^[0-9]+$ ]] || continue
+            target="$canonical_dir/issue-${issue}.json"
+
+            if [[ ! -f "$target" ]]; then
+                if install_checkpoint_atomically "$legacy_file" "$target"; then
+                    echo "WARNING: migrated legacy worktree sweep checkpoint $legacy_file to $target" >&2
+                fi
+                continue
+            fi
+
+            legacy_ts="$(checkpoint_timestamp "$legacy_file")"
+            canonical_ts="$(checkpoint_timestamp "$target")"
+            if ! valid_checkpoint_timestamp "$legacy_ts" || ! valid_checkpoint_timestamp "$canonical_ts"; then
+                echo "WARNING: conflicting sweep checkpoints for issue #$issue have missing or malformed timestamps; keeping both for manual reconciliation: $target and $legacy_file" >&2
+                continue
+            fi
+
+            if [[ "$legacy_ts" > "$canonical_ts" ]]; then
+                if install_checkpoint_atomically "$legacy_file" "$target"; then
+                    echo "WARNING: promoted newer legacy worktree sweep checkpoint for issue #$issue ($legacy_ts > $canonical_ts): $target" >&2
+                fi
+            else
+                if rm -f "$legacy_file"; then
+                    echo "WARNING: removed older legacy worktree sweep checkpoint for issue #$issue ($legacy_ts <= $canonical_ts): $legacy_file" >&2
+                else
+                    echo "WARNING: canonical sweep checkpoint is newer for issue #$issue, but could not remove legacy file $legacy_file" >&2
+                fi
+            fi
+        done
+    done < <(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
 }
 
 validate_issue() {
@@ -259,6 +352,11 @@ cmd_list() {
 main() {
     local cmd="${1:-}"
     shift || true
+    case "$cmd" in
+        write|read|phase|attempt|model|exists|delete|list)
+            reconcile_legacy_checkpoints
+            ;;
+    esac
     case "$cmd" in
         write)   cmd_write "$@" ;;
         read)    cmd_read "$@" ;;
