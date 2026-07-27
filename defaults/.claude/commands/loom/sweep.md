@@ -400,6 +400,33 @@ Concretely, when this skill says "dispatch builders for the wave", that means: i
 
 If a future maintainer is tempted to "simplify" by replacing the wave-loop with parallel `/loom:sweep` calls: don't. Read #3289, then read this section again.
 
+### Background Task visibility and settling barrier
+
+Under the Claude strategy, **every direct role Task dispatch** (`loom-curator`, `loom-builder`, `loom-judge`, and `loom-doctor`, in issue-set and PR-set modes) MUST pass `run_in_background: true`. This is a presentation and observability contract: a live role stays visible in Claude Code's background-task indicator instead of looking like an idle sweep. It does **not** change the one-level-deep topology, model selection, label transitions, checkpoint timing, or phase ordering.
+
+For every background dispatch:
+
+1. Pass the role's resolved `model` parameter exactly as described below, plus `run_in_background: true`.
+2. Retain every returned task ID and associate it with its issue or PR.
+3. At the phase barrier, await every outstanding completion notification. If a notification has not already arrived, use `TaskOutput` with `block: true` for that task ID. Do not invent a polling loop, inactivity timeout, interrupt, or replacement.
+4. Treat the terminal Task result exactly as the former synchronous result. Read forge state and write the phase checkpoint only **after** the required Task has completed successfully.
+
+The barrier depends on the phase:
+
+- **Curator:** dispatch one background `loom-curator`, then await it before the approval gate.
+- **Builder wave:** launch every Builder in the wave in the same tool-call block, then await **all** returned task IDs before `check-main-clean.sh` or any Judge dispatch.
+- **Judge / Doctor:** dispatch one background role at a time and await it before reading its label outcome, writing its checkpoint, or starting the next role/PR. A Doctor→Judge cycle therefore remains sequential even though both Tasks are background-visible.
+
+**Foreground fallback for older harnesses.** If the running harness does not expose `run_in_background` or rejects that parameter, fall back to the same synchronous Task call; do not emulate background execution with nested agents. Keep the role visible by emitting these structured lines around the call:
+
+```text
+Role phase: <role> <issue-or-pr> — dispatched (foreground fallback)
+Role phase: <role> <issue-or-pr> — completed (foreground fallback)
+Role phase: <role> <issue-or-pr> — failed (foreground fallback)
+```
+
+Emit exactly one terminal line (`completed` or `failed`) for each `dispatched` line. The foreground fallback preserves the same phase barrier and checkpoint rules.
+
 ### Model selection for subagent dispatch (issue #3477, Phase 1)
 
 Every role subagent dispatched by this skill (`loom-curator`, `loom-builder`, `loom-judge`, `loom-doctor`) gets its model resolved through a fixed precedence chain. Resolve once per role at dispatch time and pass the result via the Task tool's `model` parameter:
@@ -667,7 +694,7 @@ The check is case-insensitive on the token but exact on the value — only the l
 
 ### Claude strategy (default — unchanged)
 
-Task-tool subagent waves exactly as documented in **Execution Model**, **Wave Lifecycle**, and **PR-set Wave Lifecycle** above. Builders parallelize within a wave (`--builders-per-wave`), Judge/Doctor run sequentially per-PR, one level deep, and the #3289 parallel-grandchild stall hazard bounds the nesting. **No behaviour change: if `runtime == claude`, ignore this whole section and run the rest of the skill verbatim.**
+Task-tool subagent waves exactly as documented in **Execution Model**, **Wave Lifecycle**, and **PR-set Wave Lifecycle** above. Every direct role Task uses `run_in_background: true` and settles through the "Background Task visibility and settling barrier" contract. Builders parallelize within a wave (`--builders-per-wave`), Judge/Doctor run sequentially per-PR, one level deep, and the #3289 parallel-grandchild stall hazard bounds the nesting. **No lifecycle behaviour change: if `runtime == claude`, ignore this whole section and run the rest of the skill verbatim.**
 
 ### Codex strategy (process-level, sequential)
 
@@ -676,6 +703,7 @@ Codex has no Claude-Code-style Task-tool subagents — there is nothing to dispa
 - **Run the lifecycle sequentially in this one session.** For the target issue, perform Curator → Builder → Judge → Doctor (if needed) → Merge **yourself, in order**, following the corresponding `.loom/roles/<role>.md` file at each phase (the same role contracts the Claude subagents load). Do **not** attempt Claude Code Task-tool subagents; they do not exist under Codex.
 - **The "one level deep" #3289 constraint is Claude-specific and does not apply here** — there is no stream-pump and no parallel grandchildren to stall. **But preserve the sequencing #3289's policy also enforces:** settle each PR fully (Judge → optional single Doctor→Judge cycle → Merge) before touching the next, and honour the single Doctor→Judge cycle cap. The sequential settling is load-bearing regardless of runtime.
 - **Checkpointing, label discipline, `worktree.sh`, and `merge-pr.sh` are all runtime-agnostic** and used identically. The only thing that changes is *who* executes each phase (this session, sequentially) versus *what* executes it (a dispatched subagent).
+- **Keep Codex phases visible without pretending they are Claude background Tasks.** Maintain the sweep task list and emit a `Phase: <role> <issue-or-pr> — started` line plus exactly one `completed` or `failed` terminal line around each inline role phase. For parallel Codex sweeps, `spawn-codex-wave.sh` children and their structured status file are the process-level analogue of Claude background Tasks; the existing Codex backend policy and supervision contract remain unchanged.
 
 The repo-local Codex shim `.codex/prompts/loom-sweep.md` (#16) documents this sequential-in-session contract for a Codex operator; the daemon child-prompt encoding (below) points Codex children at it.
 
@@ -1288,7 +1316,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
 #### C1a. `loom:review-requested` → Judge phase only
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for this PR.
-- Dispatch `loom-judge` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/loom:sweep` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
+- Dispatch `loom-judge` as a **single background Task** from this orchestrator session with `run_in_background: true`, retain its task ID, and await it before reading the PR's outcome label. Follow the foreground fallback if background Tasks are unsupported. Do **NOT** invoke `/loom:sweep` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
 - If a previous Judge attempt for this PR died mid-flight without a fresh checkpoint (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" in the Wave Lifecycle (the rule is phase-generic; Mode C inherits it, same as the Doctor-cycle cap).
 - Expected exit states:
   - **Approve** → PR labeled `loom:pr` by Judge. If a closing-issue checkpoint is in scope, write `judge-done`:
@@ -1311,7 +1339,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
 If the PR entered the wave already labeled `loom:changes-requested` (e.g., from a previous Judge run), or just transitioned there from C1a, run inline Doctor → Judge cycles for this PR — **up to `sweep.max_doctor_cycles`** (default 1; see "Doctor-cycle cap" in the Execution Model):
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for this PR.
-- Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/loom:sweep` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
+- Dispatch `loom-doctor` as a **single background Task** from this orchestrator session with `run_in_background: true`, retain its task ID, and await it before writing `doctor-done` or reading forge state. Follow the foreground fallback if background Tasks are unsupported. Do **NOT** invoke `/loom:sweep` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
 - If a previous Doctor attempt for this PR died mid-flight without a fresh `doctor-done` checkpoint (rate limit, crash), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than duplicating the pushed fix — see "Mid-phase-death recovery" in the Wave Lifecycle (inherited here, same as the Doctor-cycle cap).
 - **Model escalation (#3481)**: Mode C inherits the issue-side rule unchanged — this Doctor is dispatched because of a `loom:changes-requested` rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model: pass `ladder[1]` from `sweep.escalation` (default ladder: `opus`) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`).
 - Doctor addresses the judge feedback, commits the fixes, pushes, and re-labels the PR `loom:review-requested`.
@@ -1320,7 +1348,7 @@ If the PR entered the wave already labeled `loom:changes-requested` (e.g., from 
   # <attempt> is the cycle index + 1: 2 for the first Doctor cycle, 3 for the second, etc.
   ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "$RUN_ID" --pr-number P --attempt <attempt> --model <doctor-model>
   ```
-- Re-dispatch `loom-judge` for the PR (now `loom:review-requested` again).
+- Re-dispatch `loom-judge` for the PR (now `loom:review-requested` again) with `run_in_background: true`, retain its task ID, and await it before reading the second outcome.
 - Expected exit states:
   - **Approve** → PR labeled `loom:pr`. Write `judge-done` checkpoint (if in scope), continue to **C2 (Merge)**.
   - **Request changes again, cap not yet reached** (`sweep.max_doctor_cycles > 1`) → run the next Doctor → Judge cycle for this PR (incrementing `--attempt`), up to the configured cap.
@@ -1506,6 +1534,7 @@ For each surviving issue `N` in the wave:
 - **Checkpoint skip.** If `CHECKPOINT_PHASE` is one of `curator-done`, `builder-done`, `judge-rejected`, `judge-done`, `doctor-done`, skip the curator phase entirely (it already completed in a prior sweep run). Do NOT re-invoke the curator skill — re-curating is wasted work and can produce churn on an issue that's already mid-lifecycle.
 - Otherwise (no checkpoint, or `CHECKPOINT_PHASE` is empty): if the issue does not already have `loom:curated` or `loom:issue`, run the curator skill on it.
   - Load and follow the instructions in `.claude/commands/loom/curator.md` for issue `N`.
+  - Dispatch `loom-curator` as a background Task with `run_in_background: true`, retain its task ID, and await it before checking the exit label or entering the approval gate. Follow the foreground fallback if background Tasks are unsupported.
   - Expected exit state: issue has `loom:curated`.
 - If the issue already has `loom:curated` or `loom:issue`, skip the curator skill invocation but still write the checkpoint below (so future sweep runs can skip the redundant label probe).
 - **On successful completion** (curator ran, or curator-skip-because-already-curated), write the checkpoint:
@@ -1538,7 +1567,7 @@ If `CHECKPOINT_PHASE` is `judge-rejected`, `judge-done`, or `doctor-done`, see t
 
 For issues without `builder-done`-or-later checkpoints, proceed with the normal Builder dispatch:
 
-Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/loom:sweep` as a subagent here** — see the "One level deep" rule in Execution Model above.
+Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). Every Builder Task passes `run_in_background: true`; retain the returned task ID for each issue. Follow the foreground fallback for any harness that cannot background Tasks. **Do NOT invoke `/loom:sweep` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
 Each builder is responsible for:
 
@@ -1554,7 +1583,7 @@ Each builder is responsible for:
   The **only** thing `--auto-stack` changes here is how `DEPENDS_ON[N]` is *sourced* — the `worktree.sh --base` / `gh pr create --base` mechanics are untouched. Two sources feed the map: (a) an explicit single-issue `--depends-on <parent>` (unchanged, typically a daemon `dispatch_sweep` forwarding `depends_on` as `--depends-on`), and (b) an auto-stack-detected same-candidate-set edge (see "Auto-stack detection and wave ordering"). Absent both, the wave lifecycle does not auto-create stacks.
   **Same-wave parent/child.** When the topological ordering placed a parent and its child in the **same** wave, the child's Builder branches off `feature/issue-<parent>` even though the parent's Builder is running concurrently in that wave — `worktree.sh --base` resolves the parent branch as soon as the parent Builder has pushed it. The child does **not** branch off the shared pre-wave `main` snapshot its unstacked wave-mates use.
 
-**Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker). This await is **mandatory and explicit** — block on every builder's `TaskOutput` / completion notification. The harness may launch each Task async regardless of `run_in_background: false`, so proceeding to Judge on a dispatch flag alone can start Judge before builders finish; the "await all builders before Judge" rule is enforced by this explicit block, not by any dispatch flag (see "Subagent dispatch is async-only", #3822).
+**Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker). This await is **mandatory and explicit**: consume completion notifications or call `TaskOutput` with `block: true` for every outstanding task ID. Do not run `check-main-clean.sh` or dispatch a Judge until every Builder has reached a terminal result. The harness may launch each Task async regardless of `run_in_background: false`, so proceeding to Judge on a dispatch flag alone can start Judge before builders finish; the "await all builders before Judge" rule is enforced by this explicit block, not by any dispatch flag (see "Subagent dispatch is async-only", #3822).
 
 **Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent runs without `LOOM_WORKTREE_PATH` injected, so the `guard-worktree-paths.sh` hook does not fire on this path. If a builder used repo-relative paths after a cwd reset, it may have written to the **main** worktree instead of its issue worktree. After the wave's builders return and before advancing any PR to Judge, run:
 
@@ -1697,6 +1726,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 - Otherwise (`builder-done`, or no checkpoint yet because Builder just ran in this wave), run Judge normally.
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
+- Dispatch `loom-judge` as a background Task with `run_in_background: true`, retain its task ID, and await it before reading the PR label or writing `judge-done` / `judge-rejected`. Follow the foreground fallback if background Tasks are unsupported.
 - The judge uses `gh pr comment` (NOT `gh pr review --approve`) because GitHub's self-review API restriction applies — see `judge.md` for the full explanation.
 - **If a previous Judge attempt for this PR died mid-flight without writing a fresh checkpoint** (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" above.
 - Expected exit states per PR:
@@ -1719,6 +1749,7 @@ If Judge requests changes on PR `#X` mid-wave, or `CHECKPOINT_PHASE == "judge-re
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for PR `#X`.
 - **If a previous Doctor attempt for `#X` died mid-flight without writing a fresh `doctor-done` checkpoint** (rate limit, crash — the #3676 shape), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than dispatching a fresh Doctor that would duplicate the pushed fix — see "Mid-phase-death recovery" above.
+- Dispatch `loom-doctor` as a background Task with `run_in_background: true`, retain its task ID, and await it before writing `doctor-done` or re-labeling the PR. Follow the foreground fallback if background Tasks are unsupported.
 - **Model escalation (#3481)**: this Doctor is dispatched because of a Judge rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model — pass `ladder[min(attempt - 1, len - 1)]` from `sweep.escalation` (cycle 1 → `ladder[1]`, default `opus`) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`).
 - Doctor addresses the judge's feedback, commits the fixes, and pushes.
 - **On successful Doctor completion**, write the `doctor-done` checkpoint for the issue (carrying the PR number, the attempt counter, and the model the Doctor actually ran on — escalated or pinned, #3482) **before** re-invoking Judge:
@@ -1727,7 +1758,7 @@ If Judge requests changes on PR `#X` mid-wave, or `CHECKPOINT_PHASE == "judge-re
   ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "$RUN_ID" --pr-number <PR> --attempt <attempt> --model <doctor-model>
   ```
   This way, if sweep is killed between Doctor and the follow-up Judge, the resume run will see `doctor-done` and re-enter at the Judge phase (step 5), not redo the Doctor work.
-- On completion, re-label the PR from `loom:changes-requested` back to `loom:review-requested` and **re-run the Judge phase** (step 5) for this PR.
+- On completion, re-label the PR from `loom:changes-requested` back to `loom:review-requested` and **re-run the Judge phase** (step 5) for this PR with the same background Task + await contract.
 - **Cap: up to `sweep.max_doctor_cycles` Doctor→Judge cycles per PR (default 1).** If Judge still requests changes after the configured number of Doctor passes, mark this PR as blocked (`PR #X blocked: doctor cycle exhausted after <k> Doctor→Judge round(s); human attention required`), log the reason, and proceed to the next PR in the wave (do NOT block the wave on it).
 - **Distinct-defect exception (default cap only).** When `max_doctor_cycles` is at its default of 1 and the second Judge rejection is a demonstrably distinct defect from the first (forward progress, not the same disagreement re-litigated), you MAY grant **exactly one** additional bounded Doctor→Judge cycle before blocking — single-use per PR, never composing with an operator-raised cap. Emit the required log line naming the distinction (`PR #X: granted one extra Doctor cycle — second rejection is a distinct defect (<short reason>)`). Same-defect or ambiguous rejections still block immediately. See "Doctor-cycle cap" for the full rule.
 
@@ -1924,6 +1955,7 @@ Do not auto-stop the daemon. Do not block on this warning — proceed with the s
 
 ## Constraints
 
+- **Background-visible Claude role dispatch.** Every direct Claude Task call for Curator, Builder, Judge, or Doctor passes `run_in_background: true`, retains its task ID, and is awaited at the phase barrier. If unsupported, use the documented foreground fallback status lines. Backgrounding never changes nesting depth, wave ordering, model plumbing, or checkpoint timing.
 - **Wave model, one level deep.** When `--builders-per-wave > 1` (Modes A/B only), dispatch `loom-builder` / `loom-judge` / `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. In Mode C, dispatch `loom-judge` and `loom-doctor` as **single subagent Tasks** per PR (size-1 waves). **Never invoke `/loom:sweep`, `/judge`, or `/doctor` as a subagent from `/loom:sweep`** — that is the two-levels-deep pattern that triggers the #3289 stall. See "CRITICAL: One level deep" in the Execution Model.
 - **Per-PR Judge is sequential within a wave.** Builders parallelize (Modes A/B); judges do not. Mode C inherits this: PRs are processed one per size-1 wave. Don't parallelize judges or PRs without a separate design pass.
 - **Configurable Doctor→Judge cycle cap per PR (`sweep.max_doctor_cycles`, default 1).** Inline within the wave (Modes A/B issue-side and Mode C PR-side both enforce this). If Judge still requests changes after the configured number of Doctor passes, the PR is blocked — do not retry indefinitely. At the default cap of 1, the orchestrator may grant one extra bounded cycle when the second rejection is a demonstrably distinct defect (logged, single-use, never on an operator-raised cap) — see "Doctor-cycle cap".

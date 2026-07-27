@@ -109,10 +109,10 @@ assert_contains "Skip: loom:operator-only PRs" 'loom:operator-only'
 echo
 echo "--- Load-bearing constraints (#3289, #3298, #3373) ---"
 
-# #3289: one level deep, never spawn /shepherd as subagent.
+# #3289: one level deep, never spawn a nested /loom:sweep orchestrator.
 assert_contains "One-level-deep callout preserved" 'One level deep'
-assert_contains "Never-dispatch-/shepherd-as-subagent guard preserved (issue-side, original phrasing)" 'Do NOT, under any circumstances, dispatch `/shepherd` as a subagent'
-assert_contains "Never-invoke /shepherd/judge/doctor slash commands as subagents (Mode C constraints)" '`/shepherd`, `/judge`, or `/doctor` as a subagent'
+assert_contains "Never-dispatch-nested-/loom:sweep-as-subagent guard preserved" 'Do NOT, under any circumstances, dispatch a nested orchestrator skill (`/loom:sweep`) as a subagent'
+assert_contains "Never-invoke /loom:sweep/judge/doctor slash commands as subagents (Mode C constraints)" '`/loom:sweep`, `/judge`, or `/doctor` as a subagent'
 
 # Sequential per-PR Judge.
 assert_contains "Per-PR Judge sequential within wave" 'Per-PR Judge is sequential'
@@ -129,7 +129,7 @@ assert_contains "Checkpoint fallback for PRs without Closes #N" "lacks a Closes 
 echo
 echo "--- Dry-run output (PR-set format) ---"
 
-assert_contains "PR-set dry-run header" '/sweep --prs --dry-run plan'
+assert_contains "PR-set dry-run header" '/loom:sweep --prs --dry-run plan'
 assert_contains "PR-set dry-run shows would-Judge" 'would Judge'
 assert_contains "PR-set dry-run shows would-Doctor-then-Judge" 'would Doctor → Judge'
 assert_contains "PR-set dry-run shows would-merge" 'would merge'
@@ -150,10 +150,10 @@ assert_contains "--builders-per-wave ignored in Mode C" '`--builders-per-wave N`
 echo
 echo "--- Examples section coverage ---"
 
-assert_contains "Example: explicit numeric PR list with --prs" '/sweep --prs 100 101 102'
-assert_contains "Example: NL description with --prs" '/sweep --prs all open loom:pr'
-assert_contains "Example: NL trigger without --prs" '/sweep all open loom:pr PRs'
-assert_contains "Example: PR-set dry-run" '/sweep --prs 100 101 102 --dry-run'
+assert_contains "Example: explicit numeric PR list with --prs" '/loom:sweep --prs 100 101 102'
+assert_contains "Example: NL description with --prs" '/loom:sweep --prs all open loom:pr'
+assert_contains "Example: NL trigger without --prs" '/loom:sweep all open loom:pr PRs'
+assert_contains "Example: PR-set dry-run" '/loom:sweep --prs 100 101 102 --dry-run'
 
 echo
 echo "--- Constraints + Limitations updated ---"
@@ -163,6 +163,25 @@ assert_contains "Constraints: uniform no-gh-pr-merge mandate" 'uniform across Mo
 assert_contains "Limitations entry: Mode C (#3384)" '#3384'
 assert_contains "Limitations entry: mixed-mode won't fix" 'Mixed-mode invocations'
 assert_contains "Limitations entry: PRs without Closes #N" 'PRs without `Closes #N` references'
+
+echo
+echo "--- Background Task visibility + settling barrier (#67) ---"
+
+assert_contains "Background dispatch contract is explicit" 'Background Task visibility and settling barrier'
+assert_contains "Every direct Claude role Task is backgrounded" 'every direct role Task dispatch'
+assert_contains "Task calls pin run_in_background" '`run_in_background: true`'
+assert_contains "Curator dispatch is background-visible" 'Dispatch `loom-curator` as a background Task with `run_in_background: true`'
+assert_contains "Builder wave retains task IDs" 'Every Builder Task passes `run_in_background: true`; retain the returned task ID'
+assert_contains "Judge dispatch is background-visible" 'Dispatch `loom-judge` as a background Task with `run_in_background: true`'
+assert_contains "Doctor dispatch is background-visible" 'Dispatch `loom-doctor` as a background Task with `run_in_background: true`'
+assert_contains "Barrier uses blocking TaskOutput" '`TaskOutput` with `block: true`'
+assert_contains "Barrier runs before main-clean backstop and Judge" 'Do not run `check-main-clean.sh` or dispatch a Judge until every Builder has reached a terminal result'
+assert_contains "Foreground fallback emits dispatch status" 'dispatched (foreground fallback)'
+assert_contains "Foreground fallback emits completion status" 'completed (foreground fallback)'
+assert_contains "Foreground fallback emits failure status" 'failed (foreground fallback)'
+assert_contains "Codex maintains an in-session task list" 'Maintain the sweep task list'
+assert_contains "Codex process analogue remains spawn-codex-wave" '`spawn-codex-wave.sh` children and their structured status file are the process-level analogue'
+assert_contains "Backgrounding preserves checkpoint timing" 'It does **not** change the one-level-deep topology, model selection, label transitions, checkpoint timing, or phase ordering'
 
 echo
 echo "--- Anti-regressions (must NOT appear) ---"
