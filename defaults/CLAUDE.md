@@ -192,6 +192,8 @@ claude -p "/loom:sweep 123" --dangerously-skip-permissions
 
 Checkpoints (#3373) under `.loom/sweep-checkpoint/issue-<N>.json` survive crashes — restarting `/loom:sweep N` resumes from the last completed phase.
 
+**Wave parallelism default (#3566, core-scaled #3693)**: when `--builders-per-wave` is omitted, `/loom:sweep` auto-resolves the wave size at Stage -1 from the chosen backend and scratch-volume disk headroom — the daemon detached-process path (isolated OS processes, not nested subagents) targets up to **10**, while the in-session subagent path **core-scales within `[3, 6]`** (`clamp(floor((cores-2)/4), 3, 6)`, #3693 — floor 3 on small/shared hosts, ceiling 6 on big ones). The `[3, 6]` band is a **width** decision (one-level-deep width is bounded by the harness concurrency cap `min(16, cores-2)`); the #3289 "one level deep" nesting rule is unchanged. The disk gate measures the **worktree-root filesystem** (`LOOM_WORKTREE_ROOT` / `worktree.root`, #3539/#3541), so a dedicated scratch volume rarely binds. Passing an explicit `--builders-per-wave N` overrides auto (as does an operator-set `LOOM_SUBAGENT_WAVE_CAP`). `--dry-run` prints the resolved size, mechanism, and gating reason. See `.claude/commands/loom/sweep.md` → "Resolve auto wave size".
+
 ### 3. Daemon Mode (`loom-daemon` + MCP tools)
 
 The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It is a single long-lived process exposing a Unix-socket IPC surface and a paired `mcp-loom` MCP server. Each IPC `Request` variant maps 1:1 to an MCP tool, so any MCP client — most commonly a Claude Code session running `/loom:sweep` — can dispatch sweeps, observe registry state, subscribe to lifecycle events, and cancel in-flight work.
@@ -224,11 +226,15 @@ The daemon **does not** poll the forge for ready issues, **does not** maintain a
 
 For the full surface — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
-> **Legacy spawn loop deprecated**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) is deprecated as of Phase E of #3449. It emits a stderr warning on every `start` / `status` / `stop` invocation and will be deleted in v0.11.0. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. Suppress the warning with `LOOM_SUPPRESS_DEPRECATION=1` while you migrate. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
+> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
 
-### Scheduled Support Roles (Phase 2a, opt-in)
+### Scheduled Support Roles (Phase 2a, opt-in; daemon-native alternative #4015)
 
 GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). The five per-role workflows are **thin callers** of one reusable workflow, `.github/workflows/loom-role.yml` (`on: workflow_call`), which holds the shared checkout → install → run logic and the 10-minute timeout. Each caller supplies its role slug and pinned model; the reusable workflow does one tick of work — no Loom-side state file, no long-running process.
+
+**Preferred when `loom-daemon` runs continuously (#4015):** enable the daemon-native periodic support-role runner (`LOOM_ROLE_RUNNER` / `autonomous.roleRunner.enabled=true`) instead of the GitHub Actions cron below. It dispatches Champion/Curator/Judge/Auditor/Guide host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps already use — so there is no separate `CLAUDE_API_KEY` secret to provision, and an exhausted/rate-limited account is skipped in favor of a healthy one instead of stalling the whole pipeline. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
+
+**Fallback for daemon-less deployments:** GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process. This is the degraded mode documented above: a single static `CLAUDE_API_KEY` secret with no rotation and no health-awareness.
 
 | Workflow | Role | Schedule (commented) | Claude model |
 |----------|------|----------------------|--------------|
@@ -384,6 +390,14 @@ Agents coordinate work through forge labels (GitHub or Gitea). This enables auto
 - **`loom:blocked`**: Implementation blocked, needs help or clarification
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
+### Issues Are Suggestions (Role Autonomy)
+
+Filed issues are the *input queue*, not mandates. In autonomous mode the **Curator, Builder, and Judge** have standing authority to **close** or **rescope** an issue — with a stated rationale — when building it is not the best outcome (obsolete, duplicate/already covered, low value vs. cost, wrong approach, better split/merged). This is what keeps the auto-picked-up backlog healthy rather than "build whatever is filed". Full mechanism + guardrails live in each role prompt's "Issues Are Suggestions — Close or Rescope With Rationale" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`). The rules in brief:
+
+- **Comment the rationale BEFORE closing**, then `gh issue close <N> --reason "not planned"`. A closed issue leaves the queue automatically (the work-finder only polls *open* `loom:issue` items), so it is not re-picked-up.
+- **Rescope** instead of closing when the core is worth keeping: edit the body / split / relabel, and **remove `loom:issue`** if the labels no longer reflect an approved scope (drop back to `loom:triage`/`loom:curated`) so it is not re-dispatched with a stale scope.
+- **Never close an issue that encodes a still-pending human decision** — route it to `loom:blocked` or `loom:operator-only` with a comment instead. Never invent new labels.
+
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work on issues.
@@ -460,12 +474,29 @@ If you need to clean up worktrees:
 # Convert a sparse worktree back to a full checkout
 ./.loom/scripts/worktree.sh 42 --full
 
+# Remove ONE managed worktree on demand (sanctioned single-worktree removal —
+# never call `git worktree remove` directly). Removes .loom/worktrees/issue-42
+# and deletes its local branch (safe `git branch -d`, refuses on unmerged
+# commits). Honors the .loom-managed sentinel (refuses user-provisioned
+# worktrees), is idempotent (clear no-op if absent), and prunes the git
+# worktree registration.
+./.loom/scripts/worktree.sh remove 42
+
+# Same, but keep the local feature branch
+./.loom/scripts/worktree.sh remove 42 --keep-branch
+
 # Check if you're in a worktree
 ./.loom/scripts/worktree.sh --check
 
 # Show help
 ./.loom/scripts/worktree.sh --help
 ```
+
+**Single vs. bulk removal**: `worktree.sh remove <N>` targets exactly one
+issue's managed worktree (e.g. a dead builder's stale checkout). `loom-clean`
+remains the bulk/stale-cleanup path across all closed issues (unchanged). Both
+are safe — you never need `git worktree remove` directly (which corrupts shell
+state when run from inside the worktree, per the warning above).
 
 **Sparse-Mode Notes**:
 - `--sparse` and `--full` are mutually exclusive
@@ -558,9 +589,12 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### As a Curator (Autonomous or Manual)
 
-1. **Find unlabeled issues**:
+1. **Find unlabeled issues** (gh ANDs `--label` values and has no `!`/`,`
+   negation syntax — a `--label="!loom:issue,..."` filter matches a literal
+   label no issue carries and always returns empty. Exclude labels with
+   `-label:` search terms instead):
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"
+   gh issue list --search "-label:loom:issue -label:loom:building -label:loom:architect -label:loom:hermit -label:loom:curated -label:loom:curating" --state open
    ```
 
 2. **Enhance issue**:
@@ -655,13 +689,67 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 | `.loom/logs/sweep-issue-<N>.log` | Per-issue child output (tailable via `mcp__loom__tail_sweep_log`) |
 | `.loom/sweep-checkpoint/issue-<N>.json` | Crash-resume checkpoint (#3373); sweep skill reads it on entry |
 
-**Issue selection** is operator-driven via `mcp__loom__dispatch_sweep` — the daemon does not autonomously claim items from the `loom:issue` queue. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.)
+**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810, `LOOM_WORK_FINDER`) and reactive main-health gate (#3812, `LOOM_MAIN_HEALTH_GATE`) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
+
+```json
+{
+  "autonomous": {
+    "perTokenConcurrency": 2,
+    "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
+    "mainHealthGate": { "enabled": true },
+    "roleRunner": { "enabled": true, "roles": ["champion", "curator", "judge", "auditor", "guide"] }
+  }
+}
+```
+
+Start/stop the **raw daemon process** (distinct from the tmux `.loom/bin/loom start|stop` pool) with dedicated wrappers that run the advisory host-sleep check (#3350), write a PID file (`.loom/.daemon.pid`), surface the singleton-guard refusal (#3806), and shut down cleanly on **SIGTERM** (not just Ctrl-C/SIGINT):
+
+```bash
+./.loom/scripts/cli/loom-daemon-start.sh                # FLAGS-OFF reliability daemon (both loops off, backgrounded)
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder  # opt in: autonomous work finder
+./.loom/scripts/cli/loom-daemon-start.sh --health-gate  # opt in: main-health gate
+./.loom/scripts/cli/loom-daemon-start.sh --from-config  # enable strictly per .loom/config.json → autonomous
+./.loom/scripts/cli/loom-daemon-stop.sh                 # SIGTERM → grace → SIGKILL (--force for immediate)
+```
+
+> **Default is FLAGS-OFF (#3911).** A bare `loom-daemon-start.sh` starts a
+> reliability daemon with **both autonomous loops OFF** — it does **not**
+> auto-dispatch sweeps — matching the ecosystem-wide opt-in / default-off
+> contract (`LOOM_WORK_FINDER` unset ⇒ off, `LOOM_MAIN_HEALTH_GATE` unset ⇒ off,
+> precedence env > config > default). Enable autonomy explicitly with
+> `--work-finder` / `--health-gate`, or hand control to committed config with
+> `--from-config`.
+
+**Daemon binary prerequisite (#3922)**: `loom-daemon-start.sh` needs a runnable
+`loom-daemon` binary. It resolves one via, in order: the `LOOM_DAEMON_BIN` env
+var → `command -v loom-daemon` (PATH) → an in-repo `target/release/loom-daemon`
+build. The Loom installer provisions this for you — it installs the freshly-built
+binary to `~/.local/bin/loom-daemon` (a machine-level, install-once-per-machine
+location shared across every repo Loom is installed into) so `command -v
+loom-daemon` resolves it with **no manual steps**. If the installer warned that
+`~/.local/bin` is not on your `PATH`, add it (`export
+PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc` / `~/.bashrc`) — otherwise point
+`LOOM_DAEMON_BIN` at any built `loom-daemon`. Verify with `command -v loom-daemon
+&& loom-daemon --version`; the provisioned binary version matches your installed
+Loom version.
+
+**Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](../docs/autonomous-mode-e2e.md).
+
+**Self-update (#3968)**: after merging a daemon fix, `./.loom/scripts/cli/loom-daemon-update.sh` is the single operator command that rebuilds (`cargo build --release`), reprovisions, and restarts — reading the flags `loom-daemon-start.sh` persisted to `.loom/.daemon.flags` at the last start and replaying them **exactly** (never wider than what was already running). Staleness is detected by comparing the commit baked into the resolved binary against the local source tree's `HEAD` (`--check` for a read-only report, `--dry-run` to preview, `--no-restart` to rebuild without touching a running daemon). A daemon that wasn't already running is never started by this script. `loom-daemon --status` also surfaces a read-only "update available" hint from the same comparison — advisory only, no auto-restart. See [Self-update](.loom/docs/daemon-reference.md#self-update-rebuild--provision--restart-3968) for the full detection strategy and provisioning rules.
+
+**Issue selection**: by default the daemon is **not a work generator** — it does not autonomously claim items from the `loom:issue` queue; work is operator-driven via `mcp__loom__dispatch_sweep`. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.) As of epics #3809 and #3842 that default can be **opted out of** — both autonomous surfaces are default-off:
+
+- The autonomous **work finder** (above, `LOOM_WORK_FINDER` / `autonomous.workFinder`), when enabled, *does* poll the forge for open, already-approved `loom:issue` items and dispatch them, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, cpu/load headroom, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE`) that halts dispatch when `main` goes red. See [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810).
+- The **epic supervisor** (#3842), when enabled, drives every open `loom:epic` issue through a derived-state fork-join lifecycle (decompose → expand → phase-join barrier → close), serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread. See [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
+- The **periodic support-role runner** (#4015, `LOOM_ROLE_RUNNER` / `autonomous.roleRunner`), when enabled, dispatches the standalone support roles (Champion, Curator, Judge, Auditor, Guide) host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps use instead of a static GitHub Actions `CLAUDE_API_KEY` secret. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
+
+**Multi-repo workspace registry + priority tiers**: the one-per-machine daemon manages a set of repos listed in `~/.loom/workspaces.json`, edited with `loom-daemon workspace add|remove|list` (hot-applied — a running daemon re-reads the file each tick). Each entry carries an optional `priority` integer (**lower = higher priority**, default `100`; a pre-#3946 entry with no `priority` parses as `100`), set via `loom-daemon workspace add <path> --priority N` or `loom-daemon workspace set-priority <path> N` (#3946). The autonomous work-finder and epic supervisor order dispatch across repos by **(workspace priority asc, `loom:urgent` first, issue age asc)** and fill the single shared concurrency budget in that order, so higher-priority tool repos drain before a deep product/canary backlog. Strict priority is intentional (v1) — a permanently-full higher tier starves lower tiers; `loom-daemon status` shows each repo's tier. See [Per-workspace priority tiers](.loom/docs/daemon-reference.md#per-workspace-priority-tiers-3946).
 
 **Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored) — the per-issue checkpoint format is owned by the sweep skill (#3373). When a sweep child crashes, the next dispatch reads the checkpoint and skips already-completed phases.
 
 **Scheduled support roles** run as separate GitHub Actions cron jobs under `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
 
-> **Legacy spawn-loop state**: the v0.9.x state file `.loom/spawn-loop-state.json` is still written by the deprecated `spawn-loop.sh` (scheduled for deletion in v0.11.0). The daemon does not consume it. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
+> **Legacy spawn-loop state (obsolete)**: the v0.9.x state file `.loom/spawn-loop-state.json` was written by `spawn-loop.sh`, which was **removed in v0.11.0**. Nothing writes it anymore. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
 
 ### Model Selection Strategy
 
@@ -696,7 +784,7 @@ The ladder is configured in `.loom/config.json`:
 
 **Precedence interaction**: escalation replaces only tier 3 (`suggestedModel`) / tier 4 (session default) resolution for the rejection-triggered Doctor. Tier 1 (explicit dispatch param) and tier 2 (`roleConfig.model` workspace pin) always win — pins are never overridden. `ladder[0]` never overrides anything either: first attempts of every role use the unmodified precedence chain, and the ladder only fires on rejection (the rejection-triggered Doctor gets `ladder[1]`).
 
-**Cap interaction**: escalation composes with — and does not extend — the single Doctor→Judge cycle cap. A second Judge rejection blocks the PR rather than dispatching another Doctor, so a configured third rung (e.g., a frontier model) is dormant until a future issue raises the cap. The sweep checkpoint's optional `attempt` field (`sweep-checkpoint.sh write N doctor-done --attempt 2`) is forward-compat bookkeeping for that future; absent means attempt 1, and legacy checkpoints without the field read cleanly.
+**Cap interaction**: escalation composes with — and does not extend — the configurable Doctor→Judge cycle cap (`sweep.max_doctor_cycles`, default 1; issue #3668). The ladder is consumed as `ladder[min(attempt - 1, len - 1)]`, so raising the cap above 1 (or granting the default-cap distinct-defect grace cycle) activates deeper rungs automatically. At the default cap of 1, a second Judge rejection blocks the PR rather than dispatching another Doctor — unless that second rejection is a demonstrably distinct defect from the first, in which case the orchestrator may grant one logged, single-use grace cycle (never on an operator-raised cap). The sweep checkpoint's optional `attempt` field (`sweep-checkpoint.sh write N doctor-done --attempt 2`) records the cycle count (2 = first Doctor cycle, 3 = second, …); absent means attempt 1, and legacy checkpoints without the field read cleanly.
 
 **Suggested models by role** (`suggestedModel`, live as the role-default tier):
 
@@ -711,6 +799,12 @@ The ladder is configured in `.loom/config.json`:
 | Champion | `sonnet` | Proposal evaluation has clear criteria |
 | Guide | `sonnet` | Triage is systematic |
 | Driver | `sonnet` | General-purpose default |
+
+> **Retuning these defaults is measurement-gated.** Whether to flip a role's
+> default `opus → sonnet` ("cheap-first") is decided by measured data, not edited
+> blind — see [`docs/model-selection-retune.md`](../docs/model-selection-retune.md)
+> for the decision inequality and the `agent-metrics.sh --by-model` (#3482) gating
+> procedure. Builder is the only real candidate; no default has been flipped.
 
 **Valid model values**: aliases (`haiku`, `sonnet`, `opus`) or pinned model IDs (e.g., `claude-sonnet-4-6`).
 
@@ -738,6 +832,149 @@ The ladder is configured in `.loom/config.json`:
   ]
 }
 ```
+
+### Session Transcript Archival (opt-in, #3726)
+
+Claude Code writes a full JSONL transcript for every session — and a per-subagent
+transcript for every Builder / Judge / Doctor Task — under
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd-slug>/`. These are the
+ground-truth record of what each agent did and what it cost (per-message `usage`
++ `model`), but they live only on the local box and are subject to Claude Code's
+own pruning. `archive-transcripts.sh` copies them to a durable location so a
+multi-day canary run can be audited / cost-harvested after the fact (serves the
+#3725 per-role cost harvest — the archived index is its `agent-<id>` join key).
+
+**Off by default. Zero behavior change unless you turn it on.** Enable via env or
+config (env-over-config precedence, matching the `guards.rmScope` string pattern):
+
+```bash
+# env wins over config; a path enables, ""/off/0/no/disabled forces off:
+LOOM_TRANSCRIPT_ARCHIVE=/Volumes/scratch/loom-transcripts \
+  ./.loom/scripts/archive-transcripts.sh
+```
+
+```json
+// .loom/config.json — new top-level "loom" block:
+{ "loom": { "transcriptArchive": { "enabled": true, "dir": "/Volumes/scratch/loom-transcripts" } } }
+```
+
+**Layout at destination** — `<dir>/<repo>/<date>/<session-uuid>/`:
+
+```
+<session-uuid>.jsonl                       the session's own transcript
+<session-uuid>/subagents/agent-*.jsonl     per-subagent transcripts
+<session-uuid>/subagents/agent-*.meta.json role+issue sidecars (copied verbatim)
+<session-uuid>/tool-results/…              large tool outputs
+index.json                                 agent-id-keyed join index (schema loom.transcript-index/v1)
+```
+
+The `index.json` is keyed by `agent-<id>` with one row per subagent; **role and
+issue are read from the existing `agent-*.meta.json` sidecars** (not re-derived),
+and the archiver adds only the loom-side context the sidecar lacks (repo, sweep
+issue, model, start/end ts, and `arm`/`attempt` when a model experiment is active).
+
+**Base path is `CLAUDE_CONFIG_DIR`-aware** — the archiver never hard-codes
+`~/.claude`. Per-agent isolated config dirs (`.loom/claude-config/<agent>/`) get a
+fresh `projects/`, so the copier resolves its source through
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` (mirrors
+`loom_tools.common.claude_config.resolve_projects_dir()`).
+
+**When it runs**: cron-friendly periodic sync (the durability backstop — the
+session's own top-level `<uuid>.jsonl` is still being appended while the session
+runs, so only a periodic + at-exit sync reliably captures the tail), plus a
+completion-time invocation from `/loom:sweep`. Idempotent (size + mtime skip), so
+re-runs copy nothing new. Cron example:
+
+```cron
+*/15 * * * * cd /path/to/repo && ./.loom/scripts/archive-transcripts.sh >> .loom/logs/archive-transcripts.log 2>&1
+```
+
+> **Guardrails — transcripts can contain secrets.** A transcript is full tool I/O
+> and may include `.env` contents or token values that scrolled through a shell.
+> The archiver treats the destination as sensitive, exactly like `.loom/tokens/`
+> and `accounts.env`: created **mode `0700`**, files **`0600`**; if the destination
+> is **inside a git repo it MUST be gitignored** or the archiver **refuses** (it
+> will not copy secret-bearing transcripts into a tracked tree); and it prints a
+> **loud one-line banner naming the destination** whenever archival is enabled.
+> As with the token pool, **you (the operator) own the security of the archive
+> location** — put it outside any repo, or gitignore it.
+
+**Out of scope (v1)**: remote / object-storage backends (`s3://`, `gcs://`,
+rsync-to-remote) are an explicit follow-on — v1 is a local filesystem destination
+only.
+
+### Model-Cost Experiment (canary A/B, #3725)
+
+`/loom:sweep` can instrument a run to produce the balanced A/B evidence the
+measurement-gated Builder `opus → sonnet` retune (#3718) needs — you cannot
+generate it by observation alone, since passive collection only ever measures
+whatever the current Builder default is. **Off by default; zero behavior change
+unless you turn it on.** Tri-state `sweep.modelExperiment` /
+`LOOM_MODEL_EXPERIMENT` (env-over-config, string-valued like `guards.rmScope`):
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No instrumentation. No `.loom/stats/` file. Byte-for-byte unchanged. |
+| `observe` | Passive: one JSONL record per phase to `.loom/stats/sweep-model-stats.jsonl`. No model forcing. Safe anywhere. |
+| `experiment` | Active A/B: Builder forced to the per-issue arm's model. **Canary-only.** |
+
+```bash
+# Observe on any sweep (no behavior change, just records the outcome-chain):
+LOOM_MODEL_EXPERIMENT=observe claude -p "/loom:sweep 123" --dangerously-skip-permissions
+
+# Experiment on a canary (must confirm the canary — else it downgrades to observe):
+LOOM_MODEL_EXPERIMENT=experiment LOOM_MODEL_EXPERIMENT_CANARY=1 \
+  claude -p "/loom:sweep 123" --dangerously-skip-permissions
+```
+
+**Two arms** map onto #3718's inequality: **Arm A = opus-first** (Builder→opus),
+**Arm B = sonnet-first + escalate-on-Judge-rejection** (Builder→sonnet, escalating
+via the `sweep.escalation` ladder). Arm assignment is a **deterministic,
+resume-safe** function of the issue number, **stratified by the Curator complexity
+marker** (#3702) so both arms see a comparable difficulty mix — a killed-and-resumed
+sweep re-lands the same arm. In `experiment` mode the tier-2.5 complexity bump is
+**suppressed** (the marker is used only as the stratification key), so a
+`complex`-marked issue on Arm B stays sonnet and the A/B is not confounded.
+
+**Guardrails:** off by default; `observe` safe anywhere; `experiment` refuses to
+run on a non-canary target and loudly downgrades to `observe` unless an
+**uncommitted** signal confirms a canary — the `LOOM_MODEL_EXPERIMENT_CANARY=1`
+env var or the gitignored `.loom/CANARY` sentinel file. The confirmation must be
+uncommitted **by design** (#3731): the committed `sweep.modelExperimentCanary`
+config flag is **no longer** an accepted confirmation (it would propagate with a
+copied config via `defaults/`, firing experiment on production). A git-tracked
+`.loom/CANARY` is likewise refused. The `sweep.modelExperiment` *mode* may still
+live in committed config — it is inert without the uncommitted confirmation. A
+loud startup banner names the active mode, the canary confirmation source, and,
+in `experiment`, the arm assigned to each issue. `.loom/stats/` and `.loom/CANARY`
+are gitignored.
+
+**Harvesting the evidence:**
+
+```bash
+./.loom/scripts/agent-metrics.sh --model-experiment --archive-dir "$LOOM_TRANSCRIPT_ARCHIVE"
+```
+
+The load-bearing signal is the **deterministic outcome-chain** (arm / model /
+attempt / Judge verdict / Doctor-cycle count / complexity) — that alone answers
+#3718's inequality (first-attempt Judge-pass rate + mean Doctor cycles × model
+price), and it is stamped into the durable store per phase.
+
+**On token fidelity — read this before trusting a cost number.** There is **no
+per-phase real-token split at the Task-result boundary** (the harness does not
+surface per-subagent `usage` when a Task returns). Instead, **exact per-role cost
+is recovered at harvest time** by parsing each role subagent's durable
+`agent-<id>.jsonl` transcript — each Builder / Judge / Doctor invocation is its own
+transcript with full per-message `usage` (input/output + cache read/creation
+split + model), so this is true per-role granularity, not a whole-process
+aggregate. Cost uses the same cache-aware per-model pricing as `loom-daemon`'s
+`resource_usage.rs`. Harvest locates transcripts through the #3726 transcript
+archive's `agent-<id>`-keyed index (`--archive-dir` = `LOOM_TRANSCRIPT_ARCHIVE`),
+joined on the agent-id stamped in each stats record. Over a **multi-day canary**,
+run harvest periodically (cron) so usage is extracted before `~/.claude/projects`
+is pruned — or rely on the #3726 archive as the durable backstop. Each record
+carries a `token_fidelity` tag (`transcript` | `sweep-aggregate-log` | `none`) so
+you know exactly what a cost figure came from.
 
 ### Custom Roles
 
@@ -904,7 +1141,410 @@ If setup fails, it's usually due to:
 
 ## Custom Guard Hooks
 
-Loom ships with built-in guard hooks (`guard-destructive.sh` for dangerous Bash commands). You can add project-specific guards to protect read-only directories from accidental edits.
+Loom ships with two built-in Bash `PreToolUse` guard hooks, both registered under the `Bash` matcher and firing independently:
+
+- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
+- **`guard-loom-workflow.sh`** — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). These two guards are specific to the Loom worktree/merge workflow and stay Loom-owned.
+
+You can also add project-specific guards to protect read-only directories from accidental edits (see below).
+
+### SQL DDL/DML Guard Opt-Out (`guards.sqlDdl` / `LOOM_GUARD_SQL`)
+
+`guard-destructive.sh` blocks SQL DDL/DML patterns — `DROP DATABASE`, `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE TABLE`, and `DELETE FROM` without a `WHERE` clause. For most repos this is a useful safety net, but for a project that is **itself a database engine** (e.g. a SQLite-compatible engine running a SQL conformance suite) those statements are the product's own dev/test vocabulary and the guard is a category error — the match is a case-insensitive substring, so it even fires when the words appear in a comment or a `--description` label.
+
+Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws s3 rb`, `aws iam delete`, etc.) fully active.
+
+The SQL guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_SQL` env var** — `0`/`false`/`no` disables the SQL guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.sqlDdl` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "sqlDdl": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Only the SQL DDL/DML blocks are affected — disabling the SQL guard does not weaken any other guard.
+
+**Examples**:
+
+```bash
+# Disable the SQL guard for a single command (e.g. a one-off dev query)
+LOOM_GUARD_SQL=0 vibesql -c "DROP TABLE t"
+
+# Persist the opt-out for the whole repo
+#   .loom/config.json  ->  { "guards": { "sqlDdl": false } }
+
+# Force the SQL guard on for one command even when the repo opts out
+LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
+```
+
+### Cloud CLI Guard Opt-Out (`guards.cloudCli` / `LOOM_GUARD_CLOUD`)
+
+`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rm`/`rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+
+Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws iam delete-*`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
+
+The cloud guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_CLOUD` env var** — `0`/`false`/`no` disables the cloud/docker ASK category; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.cloudCli` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "cloudCli": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Only the cloud/docker ASK patterns are affected — disabling the cloud guard does not weaken the catastrophic cloud denies or any other guard.
+
+Note: `aws ec2 terminate-instances` is an **ask** (not a hard deny) so a legitimate VM-teardown workflow is possible; with `guards.cloudCli:false` / `LOOM_GUARD_CLOUD=0` it passes through without prompting.
+
+**Examples**:
+
+```bash
+# Tear down a dev VM without a prompt for a single command
+LOOM_GUARD_CLOUD=0 aws ec2 terminate-instances --instance-ids i-1234
+
+# Persist the opt-out for a cloud-management repo
+#   .loom/config.json  ->  { "guards": { "cloudCli": false } }
+
+# Force the cloud guard on for one command even when the repo opts out
+LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
+```
+
+### Reversible-GitHub Ask Opt-In (`guards.reversibleGh` / `LOOM_GUARD_REVERSIBLE_GH`)
+
+`guard-destructive.sh` scopes its ask tier to **irreversibility** (#3757): a guard whose purpose is preventing catastrophic, hard-to-undo mistakes should not add confirmation friction to operations that are trivially reversed. The **reversible** GitHub state changes — `gh pr close` (undo: `gh pr reopen`), `gh issue close` (undo: `gh issue reopen`), and `gh label delete` (undo: recreate, or one `gh label sync` in a repo with `labels.yml`) — therefore **do not prompt by default**. An autonomous agent that closes its own issue/PR as part of a normal lifecycle no longer stalls on a confirmation prompt (or, in a headless run with no approver, blocks entirely).
+
+The genuinely hard-to-reverse operations stay in the ungated ask tier and are **not** affected by this toggle: `gh release delete` (deletes published artifacts/tags), and `git clean -fd` / `git checkout .` / `git restore .` (untracked / uncommitted loss). The full catastrophic deny suite (`rm -rf /`, force-push to `main`, `gh repo delete`, …) is likewise unaffected.
+
+A repo that *wants* the confirmation back on the reversible GitHub ops can **opt in**. Unlike `guards.sqlDdl` / `guards.cloudCli` (which default **on** and are opted **out**), this toggle has **inverse polarity**: it defaults **off** and is opted **in**, because enabling it *adds* friction rather than removing it.
+
+The reversible-GitHub ask is **off by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_REVERSIBLE_GH` env var** — `1`/`true`/`yes` enables the ask on `gh pr close` / `gh issue close` / `gh label delete`; `0`/`false`/`no` forces it off. Overrides the config value.
+2. **`.loom/config.json`** — `guards.reversibleGh` (default `false` when absent). Set it to `true` to opt in:
+   ```json
+   {
+     "guards": {
+       "reversibleGh": true
+     }
+   }
+   ```
+3. **Default** — `false` (no ask; the reversible GitHub ops pass through).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-**off** (the default) and never causes the hook to exit non-zero. Only the three reversible GitHub ASK patterns are affected — opting in does not touch `gh release delete`, the `git clean`/`checkout`/`restore` asks, or any deny.
+
+**Examples**:
+
+```bash
+# Default (off) — reversible GitHub ops pass through without a prompt:
+gh pr close 42          # allowed (undo: gh pr reopen 42)
+gh issue close 100      # allowed (undo: gh issue reopen 100)
+gh label delete stale   # allowed (undo: recreate the label)
+gh release delete v1.0  # STILL asks (not gated — deletes published artifacts)
+
+# Opt in to the confirmation for a whole repo:
+#   .loom/config.json  ->  { "guards": { "reversibleGh": true } }
+gh issue close 100      # ASK
+
+# Opt in for a single command:
+LOOM_GUARD_REVERSIBLE_GH=1 gh pr close 42       # ASK
+
+# Force off for one command even when the repo opts in:
+LOOM_GUARD_REVERSIBLE_GH=0 gh issue close 100   # allowed
+```
+
+### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
+
+By default (as of #3628), `guard-destructive.sh` runs in **`repo` mode**: it blocks the **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …) — **and** additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. So an outside-repo deep path like `rm -rf /Users/someone/important` is **denied** out of the box. This is the safe-by-default behaviour (ADR Option B); it is a **behaviour change** from the pre-#3628 permissive default.
+
+Repos that need the old permissive behaviour — block only catastrophic targets and **allow** every deeper subpath, including subpaths outside the repository — can **opt out** to `off` (a.k.a. `permissive`) mode. The catastrophic top-level deny stays active in both modes, so bare `/tmp` and `/` are always blocked regardless.
+
+The rm-scope guard is **repo (on) by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_RM_SCOPE` env var** — `repo` forces repo mode; `off`/`0`/`no`/`permissive` forces the permissive opt-out; unset falls through to the config/default. Overrides the config value.
+2. **`.loom/config.json`** — `guards.rmScope`. An explicit `"off"` (or its synonym `"permissive"`) opts out to permissive mode; an absent key, any other value, or malformed JSON resolves to `"repo"` (the safe default):
+   ```json
+   {
+     "guards": {
+       "rmScope": "off"
+     }
+   }
+   ```
+3. **Default** — repo (safe-by-default, outside-repo deep `rm` denied).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to **repo** (the safe default) and never causes the hook to exit non-zero. The permissive opt-out does not weaken any other guard — the catastrophic denies stay active.
+
+**In-scope targets** (allowed under `repo` mode):
+
+- Anything under the **repo root** (resolved from the command's `cwd`).
+- Anything under the **worktree root** — resolved with the same precedence as `loom_worktree_root()`: `LOOM_WORKTREE_ROOT` env → `.loom/config.json → worktree.root` → the default `<repo>/.loom/worktrees`. This admits an external scratch volume (e.g. `worktree.root: "/Volumes/scratch/wt"`).
+- The **ephemeral allowlist**: system temp roots and the Claude scratchpad.
+
+**Ephemeral allowlist prefixes**. `normalize_abs_path()` is **lexical only** — it does **not** resolve symlinks — so on macOS each temp root is listed in **both** its symlink form and its `/private` target:
+
+| Symlink form | `/private` target |
+|--------------|-------------------|
+| `/tmp/…` | `/private/tmp/…` |
+| `/var/tmp/…` | `/private/var/tmp/…` |
+| `/var/folders/…` (`$TMPDIR`) | `/private/var/folders/…` |
+
+Plus the Claude scratchpad glob `*/claude-*/*/scratchpad/*`. A **bare** temp root (`/tmp`, `/private/tmp`, …) is never admitted here — bare `/tmp` is already caught by the catastrophic top-level deny, and prefix matches carry a trailing `/` so a name-prefix sibling like `/tmpfoo/x` is **not** admitted by the `/tmp/` entry.
+
+**Examples**:
+
+```bash
+# Default (repo mode) — no config needed:
+rm -rf /Users/someone/important   # DENIED (outside repo, safe default)
+rm -rf /tmp/build-cache/x         # allowed (ephemeral allowlist)
+rm -rf ./dist                     # allowed (under repo)
+
+# Opt out to the old permissive behaviour for a whole repo:
+#   .loom/config.json  ->  { "guards": { "rmScope": "off" } }        # or "permissive"
+
+# One-off env opt-out — force permissive for a single command:
+LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (permissive)
+
+# Force repo mode for one command even when the repo opts out:
+LOOM_RM_SCOPE=repo rm -rf /Users/someone/important    # DENIED (outside repo)
+```
+
+### Force-Op Branch Scope Guard (`guards.forceScope` / `LOOM_FORCE_SCOPE`)
+
+By default `guard-destructive.sh` **asks** for confirmation on every `git push
+--force` / `-f` / `--force-with-lease` and `git reset --hard`, regardless of
+which branch is targeted. For an autonomous/background agent that cannot answer
+an interactive prompt, that stalls the agent on *routine* work — force-pushing or
+hard-resetting its own single-owner working branch is a normal part of the
+rebase/amend/reset workflow. The genuinely dangerous case is a force op against a
+**protected/shared branch** (`main`/`master` or the repo's default branch).
+
+`guards.forceScope` makes the ask branch-aware (symmetric to `guards.rmScope`):
+
+| `guards.forceScope` | Behavior |
+|---------------------|----------|
+| `"all"` (**default**) | Ask on every force op regardless of branch — current behaviour, preserved byte-for-byte. |
+| `"protected"` | Ask only when the resolved target is a **protected** branch (the repo default branch plus `main`/`master`), or the branch identity is ambiguous (detached HEAD). Force ops on the agent's own working branches pass through. Solves the autonomous-agent stall. |
+| `"off"` | Never ask/deny on force ops. |
+
+The shipped default is **`"all"`** — a zero-config install sees **no behaviour
+change**. Consumers who want the autonomous-friendly behaviour opt in explicitly
+(`guards.forceScope: "protected"` in `.loom/config.json`).
+
+**Protected set & branch resolution**:
+- Protected branches = the repo default branch (detected offline via
+  `refs/remotes/origin/HEAD`, mirroring `loom_default_branch()`, with a
+  `LOOM_DEFAULT_BRANCH` override) plus the literals `main` and `master`.
+- The target branch is resolved from the push refspec — `<src>:<dst>` → `<dst>`,
+  a bare ref → the ref with a leading `+` stripped, and `HEAD` / no refspec → the
+  **checked-out branch**. `git reset --hard` always resolves to the checked-out
+  branch. The checked-out branch is read at the command's effective cwd, honoring
+  a `git -C <path>` prefix, else the hook's `cwd`.
+- **Detached HEAD** (or any unresolved branch identity) is treated as ambiguous
+  and **asks** — it is never silently allowed.
+
+**Always-on hard denies are unaffected**. The unconditional force-push-to-main /
+force-push-to-master denies (the `ALWAYS_BLOCK` patterns) fire **in every mode,
+including `"off"`** — `forceScope` only ever downgrades the generic force-op
+*ask*, it never weakens a hard deny.
+
+The force-op guard is resolved in this order (highest precedence first):
+
+1. **`LOOM_FORCE_SCOPE` env var** (`all`/`protected`/`off`). Overrides config.
+2. **`.loom/config.json`** — `guards.forceScope`: `"protected"`/`"off"`; an
+   absent key, any other value, or malformed JSON resolves to `"all"`:
+   ```json
+   {
+     "guards": {
+       "forceScope": "protected"
+     }
+   }
+   ```
+3. **Default** — `"all"` (preserve current behaviour).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json`
+falls through to `"all"` and never causes the hook to exit non-zero.
+
+**Examples**:
+
+```bash
+# Default (all) — every force op asks, no config needed:
+git reset --hard HEAD~1                       # ASK
+git push --force origin feature/my-branch     # ASK
+
+# Opt in to branch-aware force ops for a whole repo:
+#   .loom/config.json  ->  { "guards": { "forceScope": "protected" } }
+git reset --hard HEAD~1                        # allowed (own working branch)
+git push --force origin feature/my-branch      # allowed (working branch)
+git push --force origin main                   # DENIED (ALWAYS_BLOCK, unaffected)
+
+# One-off env override — force branch-aware mode for a single command:
+LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
+
+# Force the old always-ask behaviour even when the repo opts into protected:
+LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
+```
+
+### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
+
+`guard-destructive.sh` is a `PreToolUse`/`Bash` hook, so it fires before **every** Bash tool call. In Bash-dense sessions (remote ops, benchmark drivers) nearly every call is obviously read-only — `git status`, `ls`, `grep`, `aws … describe*`, `gh … list` — yet each one otherwise runs the full deny/ask gauntlet (~37 `grep`/`awk`/`sed` forks plus a `git rev-parse`, ~179ms measured) before falling through to `allow`.
+
+The read-only fast path (issue #3687) short-circuits that overwhelmingly-common case to a **silent** `allow` (exit 0, zero stdout/stderr, no logging) using a single bash-builtin structural test — zero forks — plus, only when that test passes, one lazy `jq` config read. It runs first, before the `git rev-parse` repo-root resolution and before any deny/ask array.
+
+The fast path is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_READONLY_FASTPATH` env var** — `0`/`false`/`no` disables the fast path (every command takes the full deny/ask path, byte-for-byte as before); `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.readOnlyFastPath` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "readOnlyFastPath": false
+     }
+   }
+   ```
+3. **Default** — `true` (fast path active).
+
+**Security — the fast path is a guard bypass by construction**, so admission is purely **structural** and conservative, never content-sensitive. A command is fast-pathed only when **all** of these hold (otherwise it falls through to the full path unchanged):
+
+- The raw command contains **none** of `;` `&` `|` `<` `>` backtick `$(` or a newline — this excludes all chaining, piping, redirection, and command substitution. So `git status && git push --force origin main`, `git status; rm -rf /`, and `git status $(rm -rf /)` all take the full path and are still denied.
+- The **first token** is an exact allowlist match (never a wrapper — `bash -c`, `sh -c`, `eval`, `xargs`, `env … git status`, `sudo git status` are all excluded because their first token isn't allowlisted):
+
+| First token | Admitted form |
+|-------------|---------------|
+| `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
+| `ls`, `grep`, `rg` | any arguments |
+| `jq`, `wc`, `head`, `tail` | any arguments (pure read-only text/JSON filters — none has an in-place-mutation flag) |
+| `test`, `[`, `[[` | any arguments (boolean file/string test builtins — no mutation surface) |
+| `find` | any arguments **except** those containing a dangerous action-primary — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fls`, `-fprint`, `-fprint0`, `-fprintf` — which structurally disqualify the command and route it to the full path |
+| `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
+| `aws` | `aws <service> describe*` / `get*` / `list*`, and `aws s3 ls` |
+
+**`cat` and `ssh` are deliberately EXCLUDED** from the built-in list, even though they are read-only in spirit:
+
+- `cat` has a narrow existing `ASK` carve-out (`cat …/.ssh/…`, `cat …/.aws/credentials`); a blanket `cat` fast-path would silently skip it.
+- `ssh <host> '<cmd>'` wraps an **opaque remote command string** that the raw `ALWAYS_BLOCK` catastrophic scan still covers today; fast-pathing any `ssh …` would drop that coverage.
+
+**Optional extend-only escape hatch** — `guards.readOnlyFastPathExtra` is an array of **literal first-word commands** to add to the built-in list without hand-editing the Loom-managed `.claude/settings.json` (which the installer may overwrite). This directly answers "give operators a supported way to scope the matcher":
+
+```json
+{
+  "guards": {
+    "readOnlyFastPath": true,
+    "readOnlyFastPathExtra": ["psql"]
+  }
+}
+```
+
+> **Note**: `jq` and `wc` used to be the canonical example entries here, but as of #3772 they are part of the **built-in default** allowlist above — adding them via `readOnlyFastPathExtra` is now redundant. Use this escape hatch only for a genuinely-custom bare read-only command word (e.g. a site-specific query tool).
+
+> **Warning**: each word added here is a **guard bypass for that command word in full generality** (all arguments). Only add bare, argument-independent read-only utilities — never your own scripts or anything that could wrap a mutating call. Entries are matched as the literal first token only; no subcommand/verb parsing is applied to custom entries.
+
+The config read is best-effort and lazy: it happens only after a command has already passed the structural test, and any missing/empty/malformed `.loom/config.json` falls through to fast-path-ON. Disabling the fast path never weakens any deny/ask rule — it only makes the guard do its full work on every command again.
+
+**Examples**:
+
+```bash
+# Default: read-only commands are near-free and silent
+git status                     # fast-pathed (silent allow)
+aws ec2 describe-instances     # fast-pathed
+gh pr list                     # fast-pathed
+git status && git push --force origin main   # NOT fast-pathed → full path → DENIED
+
+# Disable the fast path for one command (restore full-path checking)
+LOOM_GUARD_READONLY_FASTPATH=0 git status
+
+# Persist the opt-out for a whole repo
+#   .loom/config.json  ->  { "guards": { "readOnlyFastPath": false } }
+
+# Extend the allowlist with a bare read-only utility (jq/wc/head/tail/find/test
+# are already built-in as of #3772 — use this for a genuinely-custom word):
+#   .loom/config.json  ->  { "guards": { "readOnlyFastPathExtra": ["psql"] } }
+```
+
+### Decision Telemetry Log (`guards.decisionLog` / `LOOM_GUARD_DECISION_LOG`)
+
+`guard-destructive.sh` **and** `guard-loom-workflow.sh` can record every **deny** and **ask** decision to a JSONL decision log (issue #3771, extended to the Loom-workflow guard in #3898), separate from `hook-errors.log`, so guard-hook friction becomes **measurable** — which patterns fire, how often, and whether a precision fix (#3755/#3756/#3757/#3898) actually cut the false-positive rate. Without it, "we keep hitting the hooks" is unquantifiable. Both guards share the **same log file, schema, and stable rule tags**, so a single reader aggregates fires across both (`guard-loom-workflow.sh`'s two denies carry the tags `loom:gh-pr-merge-redirect` and `loom:pip-install-editable-worktree`).
+
+The log is **off by default** — enabling it writes a new persistent, cross-session artifact, so like the other opt-in data-collection features (transcript archival #3726, the model-cost experiment #3725) a zero-config install sees no new file and no behaviour change. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_DECISION_LOG` env var** — `1`/`true`/`yes`/`on` enables; `0`/`false`/`no`/`off` disables. Overrides the config value.
+2. **`.loom/config.json`** — `guards.decisionLog` (default `false` when absent). Set it to `true` to enable:
+   ```json
+   {
+     "guards": {
+       "decisionLog": true
+     }
+   }
+   ```
+3. **Default** — `false` (no decision log written).
+
+When enabled, each deny/ask appends **one JSON object per line** to `.loom/logs/guard-decisions.log` (`SCRIPT_DIR`-relative, mirroring `hook-errors.log`; override the path with `LOOM_GUARD_DECISION_LOG_FILE`). **Stable schema** (the contract downstream reader tooling in #3772 depends on — field names are load-bearing):
+
+```json
+{"ts":"2026-07-22T23:17:13Z","decision":"deny","pattern":"sql-ddl","tier":"catastrophic","command":"<redacted>"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `ts` | UTC timestamp (`date -u '+%Y-%m-%dT%H:%M:%SZ'`, same as `hook-errors.log`) |
+| `decision` | `deny` or `ask` |
+| `pattern` | a short, stable rule tag (e.g. `sql-ddl`, `rm-protected-path`, `force-op:protected`, `cloud-cli:<pattern>`) — **not** the full free-text reason |
+| `tier` | `catastrophic` for a deny, `ask` for an ask |
+| `command` | the command string, **redacted** via `strip_literal_text()` so no raw `--body`/`-m`/`--title`/`--notes`/`--comment` secret value is persisted |
+
+**`allow` decisions are never logged** — the #3687 read-only fast path's zero-overhead silent-allow stays silent, and allow-logging would swamp the log with the ~99% common case. Logging is **best-effort / fail-open**: the toggle is resolved lazily (only once a deny/ask is about to fire, so it never touches the fast path's hot path), and a log-write failure (permission denied, disk full, missing dir) never changes the deny/ask decision and never causes the hook to exit non-zero. `.loom/logs/` is gitignored.
+
+Summarize fires by rule (a fuller reader/aggregation CLI is #3772's scope):
+
+```bash
+jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+```
+
+**Examples**:
+
+```bash
+# Enable for a single command (e.g. to capture one session's fires)
+LOOM_GUARD_DECISION_LOG=1 claude -p "/builder" --dangerously-skip-permissions
+
+# Persist for a whole repo
+#   .loom/config.json  ->  { "guards": { "decisionLog": true } }
+
+# Force off for one command even when the repo opts in
+LOOM_GUARD_DECISION_LOG=0 <command>
+```
+
+### Autonomous Guard Defaults + Standing Per-Trigger Review Policy (#3898)
+
+A headless sweep runs under `--dangerously-skip-permissions`, where the guard `PreToolUse` hooks **fire** but an **ASK decision has no human to answer it — so it blocks**, functionally a silent deny. Every guard ASK therefore stalls autonomous work. To converge the guard toward *dangerous-only* without ever weakening a genuine safety rule, autonomous mode combines two guard defaults with a standing feedback loop.
+
+**Autonomous guard defaults** — set by `./.loom/scripts/cli/loom-daemon-start.sh` (each env-overridable; an already-exported value always wins), inherited by every dispatched `/loom:sweep` child:
+
+| Env var | Autonomous default | Why |
+|---------|--------------------|-----|
+| `LOOM_GUARD_DECISION_LOG` | `1` (on) | Capture every DENY/ASK so the review loop below has data. |
+| `LOOM_FORCE_SCOPE` | `protected` | Let an agent force-push / hard-reset its **own** working branch without a stall; force-push to `main`/`master`/default stays a **hard DENY** via `ALWAYS_BLOCK_PATTERNS`. |
+
+`guards.forceScope: "protected"` is the **Loom-recommended default for autonomous repos** — set it in committed `.loom/config.json` for repos that run the daemon, or rely on the start-script env default. The shipped hook default remains `"all"` (byte-for-byte unchanged for non-autonomous installs).
+
+**Standing per-trigger review policy** — a periodic support role (the **Auditor**, see `.loom/roles/auditor.md`) tails `.loom/logs/guard-decisions.log`, dedups by `pattern`, and files **one issue per distinct trigger** observed in autonomous runs, proposing to either (a) **allowlist / refine** the guard for the in-scope op or (b) **confirm it stays flagged**. Over time this converges the guard to dangerous-only. The dedup + summarize one-liner:
+
+```bash
+jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+```
+
+New issues from this policy enter through normal intake (`loom:triage` → Curator → Champion/human approval); the review role never self-applies `loom:issue`.
+
+**First refinement pass (#3898):**
+- `guards.forceScope:"protected"` recommended for autonomous repos (above).
+- The catastrophic scan no longer false-positives on **documentation text** — a dangerous command merely *mentioned* inside a multi-line `--body`/`-m`/`--title`/`--notes`/`--comment` value (e.g. `gh issue create --body "…"`) is redacted as a single span and does **not** deny, while a genuinely dangerous command, or a command-substitution `$(…)` smuggled inside such a value, still DENIES.
+- `git checkout .` / `git restore .` / `git clean -fd` **stay ASK** (evaluated, kept flagged): they irreversibly discard uncommitted/untracked work, so the standing policy files a per-trigger issue rather than blanket-allowlisting them. A repo that wants them to pass headless can add the command word to an allowlist per its own risk decision.
 
 ### Protecting Read-Only Directories
 
@@ -958,7 +1598,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
    mkdir -p .loom/context/roles .loom/context/topics
    ```
 
-2. Add a universal context file (injected on every prompt):
+2. Add a universal context file (injected once per session by default):
    ```bash
    cat > .loom/context/universal.md << 'EOF'
    # Project Rules
@@ -975,7 +1615,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
 ```
 .loom/context/
 ├── config.json              # Optional configuration
-├── universal.md             # Injected on every prompt
+├── universal.md             # Injected once per session by default
 ├── roles/
 │   ├── builder.md           # Injected when LOOM_ROLE=builder
 │   ├── judge.md             # Injected when LOOM_ROLE=judge
@@ -987,11 +1627,11 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
     └── ...
 ```
 
-**Universal context** (`universal.md`): Always injected when the context directory exists. Use for project-wide rules and conventions.
+**Universal context** (`universal.md`): Injected when the context directory exists — **once per session by default** (`universal_frequency: "session"`), so the project-wide rules ride along on the first prompt of a session and are deduped on subsequent turns. Set `universal_frequency: "always"` to restore per-prompt injection. Use for project-wide rules and conventions.
 
 **Role context** (`roles/<role>.md`): Injected when the `LOOM_ROLE` environment variable matches the filename, or when a slash command (e.g., `/builder`) is detected in the prompt. Role names are case-insensitive.
 
-**Topic context** (`topics/<name>.md`): Injected when the prompt matches a keyword pattern. By default, the filename is used as the regex pattern (e.g., `security.md` matches prompts containing "security"). For custom patterns, create a sidecar `.pattern` file with a regex (e.g., `security.pattern` containing `security|auth|token|credential`).
+**Topic context** (`topics/<name>.md`): Injected when the prompt matches the topic keyword. By default the filename is matched as an **anchored** token — the topic name must appear either as a slash command (`/loom:<name>` or `/repo:<name>`) or as a standalone word that is not part of a flag or path segment. So `security.md` injects on "check the security model" or `/loom:security`, but a "release" topic does **not** inject on `cargo build --release` or `target/release`. For custom matching, create a sidecar `.pattern` file with a regex (e.g., `security.pattern` containing `security|auth|token|credential`); the sidecar overrides the filename fallback entirely.
 
 ### Configuration
 
@@ -1002,6 +1642,7 @@ Create `.loom/context/config.json` to customize behavior:
   "max_context_chars": 8000,
   "enabled": true,
   "inject_universal": true,
+  "universal_frequency": "session",
   "inject_role": true,
   "inject_topics": true
 }
@@ -1011,22 +1652,46 @@ Create `.loom/context/config.json` to customize behavior:
 |-----------|---------|-------------|
 | `max_context_chars` | 8000 | Maximum total characters injected (prevents overwhelming the context window) |
 | `enabled` | true | Set to false to disable injection without removing files |
-| `inject_universal` | true | Whether to inject `universal.md` |
+| `inject_universal` | true | Whether to inject `universal.md` at all (on/off master switch) |
+| `universal_frequency` | `"session"` | How often `universal.md` is injected: `"session"` (once per session — default) or `"always"` (every matching prompt, legacy behavior). Any missing/malformed value falls back to `"session"`. |
 | `inject_role` | true | Whether to inject role-specific context |
 | `inject_topics` | true | Whether to inject topic-matched context |
+
+> **Behavior-change note (#3758)**: `universal_frequency` defaults to `"session"`,
+> a deliberate flip from the historical always-inject behavior. Any repo that
+> already opted into `.loom/context/` **without** setting this key now gets
+> `universal.md` **once per session** instead of on every prompt. This mirrors the
+> precedent set by #3609 for `skill-router.sh` (which likewise dropped per-prompt
+> injection with no back-compat shim). To keep the old every-prompt behavior, set
+> `"universal_frequency": "always"`. The once-per-session dedup uses a session-keyed
+> marker at `.loom/logs/methodology-inject-seen/<sanitized-session-id>` (its own
+> namespace, parallel to `skill-router.sh`'s `skill-router-seen/`); a missing/empty
+> `session_id` on stdin degrades gracefully to per-turn injection. Role and topic
+> injection are unaffected — they still fire on every matching turn.
 
 ### How It Works
 
 The `methodology-inject.sh` hook runs as a `UserPromptSubmit` hook alongside `skill-router.sh`. On each prompt:
 
 1. Checks for `.loom/context/` directory -- exits silently if absent
-2. Reads `universal.md` if present
+2. Reads `universal.md` if present, **once per session** by default (`universal_frequency`) — deduped via a session-keyed marker, exactly like `skill-router.sh`'s #3609 routing-table dedup
 3. Detects the active role via `LOOM_ROLE` env var or prompt slash command
 4. Scans `topics/` files, matching prompt against filename or sidecar `.pattern` regex
 5. Concatenates matching content, capped at `max_context_chars`
 6. Returns the collected context as `additionalContext`
 
 The hook follows the same error-handling patterns as other Loom hooks: it never exits non-zero, logs errors to `.loom/logs/hook-errors.log`, and fails silently on any unexpected error.
+
+### UserPromptSubmit Hooks: Opt-In Triggers and Disabling
+
+Both `UserPromptSubmit` hooks are **opt-in by config presence** and do nothing until you add their config. Each has a one-line off switch:
+
+| Hook | Opt-in trigger | One-line disable |
+|------|----------------|------------------|
+| `methodology-inject.sh` | Presence of the `.loom/context/` directory | Delete/rename `.loom/context/`, or set `"enabled": false` in `.loom/context/config.json`, or remove the hook's entry from the `UserPromptSubmit` array in `.claude/settings.json` |
+| `skill-router.sh` | Presence of `.loom/config/skill-routes.json` | Delete `.loom/config/skill-routes.json`, or remove the hook's entry from the `UserPromptSubmit` array in `.claude/settings.json` |
+
+`skill-router.sh` is already conservative (issue #3609): it emits nothing on non-matching turns, and appends its agent routing table at most once per session (session-keyed dedup, degrading gracefully when `session_id` is missing). `methodology-inject.sh` now mirrors that once-per-session discipline for `universal.md` (see `universal_frequency` above). Neither hook blocks a prompt or exits non-zero; both fail silently on any error.
 
 ### Example Context Files
 
@@ -1054,6 +1719,25 @@ If you want to invoke the check manually:
 ./.loom/scripts/check-host-sleep.sh         # full warning (or success line)
 ./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
 ```
+
+**Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777 resync)**:
+
+The installed `.loom/hooks/` and `.loom/scripts/` copies the harness actually executes are synced from `defaults/` **at install time**. A `git pull` that merges a hook/script fix updates `defaults/` but **not** the installed copies — so a session can run stale hooks/scripts indefinitely until they are re-synced.
+
+This is a **detect → fix** pair:
+
+- **Detect (#3770)** — `check-main-freshness.sh` (run at `/loom:sweep` startup) warns, non-blocking, when local `main` is behind `origin/main` and flags any installed file that differs from its `defaults/` counterpart. It never pulls, merges, or resets.
+- **Fix (#3777)** — `resync-installed.sh` refreshes the installed `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (no-op when in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only touches files that exist in `defaults/` (repo-specific hooks with no `defaults/` counterpart are left alone).
+
+The intended flow is **"freshness warning says you're stale → run resync"**:
+
+```bash
+git merge --ff-only origin/main                  # bring defaults/ current
+./.loom/scripts/resync-installed.sh --dry-run    # preview (exits 2 when drift found)
+./.loom/scripts/resync-installed.sh              # apply
+```
+
+Pin an intentional per-repo customization by listing its relative path (e.g. `hooks/guard-destructive.sh`), one per line, in `.loom/resync-ignore` — matching files are reported `skipped` and never overwritten. A full `loom-daemon init` / installer run performs the equivalent recursive copy, so a normal reinstall also keeps the copies current.
 
 **Merging PRs from worktrees**:
 
@@ -1142,31 +1826,11 @@ which claude
 
 **Orphaned issues stuck in loom:building state**:
 
-When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Use the stale-building-check script to detect and recover these:
-
-```bash
-# Check for stale building issues (dry run)
-./.loom/scripts/stale-building-check.sh
-
-# Show detailed progress
-./.loom/scripts/stale-building-check.sh --verbose
-
-# Auto-recover stale issues (resets to loom:issue)
-./.loom/scripts/stale-building-check.sh --recover
-
-# JSON output for automation
-./.loom/scripts/stale-building-check.sh --json
-```
+When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Recover them with the orphan-recovery tool documented immediately below (there is no `stale-building-check.sh` script — the historical script was never ported; use `loom-recover-orphans` / the `loom-orphan-recovery` guidance that follows).
 
 **Configuration via environment**:
 - `STALE_THRESHOLD_HOURS=2` - Hours before issue without PR is considered stale
 - `STALE_WITH_PR_HOURS=24` - Hours before issue with stale PR is flagged
-
-**What it does**:
-- Finds issues with `loom:building` label that have been stuck
-- Checks if there's an associated PR (by branch name or body reference)
-- Issues without PRs older than threshold are flagged/recovered
-- Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
 **Orphaned task recovery (daemon dispatch crashes)**:
 
@@ -1193,11 +1857,15 @@ loom-orphan-recovery --json
 - Adds recovery comments to affected issues
 - Removes stale lock dirs
 
-The daemon's 30-second reaper task usually catches this autonomously; `loom-orphan-recovery` is the manual cross-check.
+> **Fail-safe (#3651):** the untracked-building cross-check requires an authoritative liveness source (a present `.loom/spawn-loop-state.json`, a reachable `loom-daemon` registry, or `.loom/locks/issue-<N>/` locks). When **none** is available — e.g. after `spawn-loop.sh` was removed and no daemon is running — `loom-orphan-recovery` emits **zero** `untracked_building` orphans and recovers nothing. Absent liveness data means "treat every `loom:building` claim as ALIVE", never as orphaned. This prevents tearing down a live sweep that has been building for more than the label-grace window.
+
+The daemon's 30-second reaper task usually catches genuine orphans autonomously; `loom-orphan-recovery` is the manual cross-check.
 
 ### Stuck Agent Detection
 
-`loom-stuck-detection` checks for stuck sweep children by combining the daemon registry (via `mcp__loom__list_sweeps`) with `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` checks for stuck sweep children by reading per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.
+
+> **Note (post-v0.11.0):** `spawn-loop.sh` (the sole writer of `.loom/spawn-loop-state.json`) was deleted, so this file has no writer and `loom-stuck-detection` currently reports nothing — a safe no-op (report-only, never destructive). Repointing it to the `loom-daemon` registry (`mcp__loom__list_sweeps`) plus `.loom/sweep-checkpoint/issue-<N>.json` timestamps is a tracked follow-up (see `docs/migration/daemon-state-consumers.md`).
 
 **Check for stuck agents**:
 ```bash
@@ -1544,11 +2212,11 @@ Or run the setup script to generate `.mcp.json` automatically:
 
 ## Migration: v0.10.0 shepherd/daemon deprecation
 
-Loom's orchestration architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. Epic #3449 then rebuilt the **daemon surface as a Rust binary** (`loom-daemon`) that exposes MCP tools for dispatch, monitoring, and pub/sub eventing — phases A through D have all shipped on main; phase E (this work) deprecates the v0.9.x `defaults/scripts/spawn-loop.sh` interim implementation.
+Loom's orchestration architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. Epic #3449 then rebuilt the **daemon surface as a Rust binary** (`loom-daemon`) that exposes MCP tools for dispatch, monitoring, and pub/sub eventing — phases A through D have all shipped on main; phase E deprecated the v0.9.x `defaults/scripts/spawn-loop.sh` interim implementation, and **v0.11.0 removed it**.
 
 | Phase | Issue | What shipped | Status |
 |-------|-------|-----------|--------|
-| Phase 1 | #3374 | Minimal multi-account spawn loop (`spawn-loop.sh`) | shipped (deprecated in Phase E) |
+| Phase 1 | #3374 | Minimal multi-account spawn loop (`spawn-loop.sh`) | shipped (deprecated in Phase E, removed in v0.11.0) |
 | Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
 | Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
 | Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill | shipped |
@@ -1557,7 +2225,7 @@ Loom's orchestration architecture migration (epic #3372) deleted the shepherd br
 | #3449 Phase B | #3453 | `loom-daemon`: event bus (tokio broadcast), 6 frozen topics, `publish_event` / `subscribe_to_events` IPC | shipped |
 | #3449 Phase C | #3455 | MCP tools: `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep`, `tail_event_bus`; `.loom/docs/daemon-reference.md` rewrite | shipped |
 | #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
-| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | this PR |
+| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | shipped |
 
 **v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename `docs/migration/v0.10.0-shepherd-deprecation.md` is named for the release that ships the deletions.
 
@@ -1567,16 +2235,11 @@ Loom's orchestration architecture migration (epic #3372) deleted the shepherd br
 |---------|-------------|
 | `loom-daemon` (Python entry point) | Rust `loom-daemon` binary + `mcp__loom__dispatch_sweep` + GitHub Actions schedules |
 | `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
-
-**Deprecated entry points (still functional in v0.10.x, removed in v0.11.0)**:
-
-| Deprecated | Replacement | Warning |
-|------------|-------------|---------|
-| `defaults/scripts/spawn-loop.sh` | `mcp__loom__dispatch_sweep` against `loom-daemon` | Stderr banner on every invocation (Phase E of #3449); suppressible with `LOOM_SUPPRESS_DEPRECATION=1` |
+| `defaults/scripts/spawn-loop.sh` (deprecated throughout v0.10.x, **removed in v0.11.0**) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
 
 ## Migrating off shepherd / spawn-loop (downstream consumers)
 
-If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain and Python daemon brain are already gone; the spawn-loop deprecation in this phase is your final migration step before v0.11.0 deletes it.
+If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain and Python daemon brain are already gone, and **v0.11.0 removed the spawn-loop interim implementation**; migrate any remaining spawn-loop automation to `mcp__loom__dispatch_sweep` against `loom-daemon`.
 
 ### What you can still rely on (v0.10.0)
 
@@ -1598,17 +2261,11 @@ These surfaces are **not** going away and are the supported replacements:
 
 | Deprecated surface | Status | What to do |
 |--------------------|--------|------------|
-| `defaults/scripts/spawn-loop.sh` | Deprecated in v0.10.x (Phase E of #3449), deletion in v0.11.0 | Migrate to `mcp__loom__dispatch_sweep` against `loom-daemon`. The script still works through v0.10.x but emits a stderr warning on every `start` / `status` / `stop` invocation. Suppress with `LOOM_SUPPRESS_DEPRECATION=1` if you need the noise gone during migration. |
+| `defaults/scripts/spawn-loop.sh` | **Removed in v0.11.0** (deprecated in v0.10.x, Phase E of #3449) | Migrate to `mcp__loom__dispatch_sweep` against `loom-daemon`. The script emitted a stderr deprecation warning throughout v0.10.x before removal. |
 | `loom-shepherd` Python CLI (already removed in v0.10.0) | Removed | Replace shell invocations with `claude -p "/loom:sweep <N>" --dangerously-skip-permissions`. The lifecycle phases are identical; checkpointing (#3373) is preserved. |
 | `/shepherd` slash command (already removed in v0.10.0) | Removed | Use `/loom:sweep <issue>` instead. |
 | `loom-shepherd` subagent (already removed in v0.10.0) | Removed | Stop dispatching to it from custom slash commands or hooks. |
 | `.loom/daemon-state.json` and `.loom/progress/shepherd-*.json` consumers | Producers removed | Replace reads with `mcp__loom__list_sweeps` / `mcp__loom__get_sweep_status` against the daemon, plus forge queries. See `docs/migration/daemon-state-consumers.md` for the per-consumer disposition. |
-
-**Suppression**: set `LOOM_SUPPRESS_DEPRECATION=1` to silence the deprecation warnings emitted from the deprecated shell entry points. Sphere installs and other downstream automation mid-migration can use this env var to keep their logs clean during the v0.10.x → v0.11.0 window.
-
-**Helpers**: the warning text is centralized in two places so removal in v0.11.0 is a single-PR sweep:
-
-- Shell: `defaults/scripts/spawn-loop.sh::_deprecation_warn()` — fires on every `start` / `status` / `stop` subcommand.
 
 ### Coordination and questions
 

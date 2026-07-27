@@ -26,6 +26,7 @@ mod file_ops;
 mod git;
 mod labels;
 mod post_init;
+mod retired;
 mod scaffolding;
 mod templates;
 
@@ -33,11 +34,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use serde_json::Value;
+
 use file_ops::{
     clean_managed_dir, copy_dir_with_report, verify_copied_files, verify_copied_files_filtered,
     TemplateContext,
 };
 use post_init::{find_overbroad_loom_patterns, generate_manifest, update_gitignore};
+use retired::cleanup_retired_files;
 use scaffolding::{setup_repository_scaffolding, LABELS_YML_REL_PATH};
 
 // Re-export public types and functions
@@ -175,8 +179,14 @@ pub fn initialize_workspace(
     // Create .loom directory if it doesn't exist
     fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
-    // Copy config and README files
-    copy_single_file(&defaults, &loom_path, "config.json", ".loom/config.json", &mut report)?;
+    // Copy config and README files.
+    //
+    // `config.json` is merge-aware (issue #3598): unlike the README (a
+    // Loom-owned doc that is safe to overwrite), `.loom/config.json` is
+    // committed CONSUMER configuration that may carry local overrides such as
+    // `worktree.root`. A bare `fs::copy` from the template would silently drop
+    // those keys — see `merge_config_file`.
+    merge_config_file(&defaults, &loom_path, &mut report)?;
     copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
 
     // Sync managed directories (clean stale files on reinstall, then copy fresh)
@@ -212,6 +222,20 @@ pub fn initialize_workspace(
     // source defaults — flagging them as failures is misleading and the prior
     // "rerun with --force" remediation would clobber the user's intentional edits.
     filter_preserved_from_verification_failures(&mut report);
+
+    // Content-gated cleanup of retired Loom strays (issue #3576). The daemon
+    // init sync is source-driven and never removes destination-only files, so a
+    // stray `.claude/commands/loom/release.md` (the `/loom:release` skill
+    // retired by #3563) lingers on disk for Quick-Install consumers. Remove it
+    // iff its sha256 matches a frozen shipped digest (unmodified); preserve a
+    // customized copy; no-op when absent. Mirrors the shell-side
+    // `LOOM_RETIRED_FILES` block in scripts/install-loom.sh (PR #3575).
+    //
+    // Placed after scaffolding (post-sync) and before generate_manifest so the
+    // manifest reflects on-disk state. The self-install short-circuit above
+    // (returns at ~line 147 before scaffolding) means this never runs on the
+    // Loom source repo — it must not mutate the source tree.
+    cleanup_retired_files(workspace, &mut report);
 
     // Generate installation manifest (.loom/manifest.json)
     generate_manifest(workspace);
@@ -259,6 +283,154 @@ fn copy_single_file(
         }
     }
     Ok(())
+}
+
+/// Merge-aware copy of `.loom/config.json` from defaults (issue #3598).
+///
+/// `.loom/config.json` is committed consumer configuration, not a runtime
+/// artifact. A bare `fs::copy` (as `copy_single_file` performs) would clobber
+/// consumer keys such as the documented `worktree.root` override every time the
+/// installer reran. This function instead:
+///
+/// - **Destination missing** → the template is parsed and re-emitted through
+///   the same canonical `to_string_pretty` serialize path the merge branch
+///   uses (issue #3619), recorded as `added`. Routing the fresh install through
+///   serialization (rather than a raw `fs::copy` of the hand-formatted
+///   template) makes the on-disk file canonical from the very first install, so
+///   a later reinstall merge re-emits byte-identical output and config.json is
+///   never left dirty. (If the template is not valid JSON, falls back to a raw
+///   copy.)
+/// - **Destination is a valid JSON object** → deep-merge with the shipped
+///   template as the base and the **existing consumer values winning** on
+///   conflict; keys new in the template are added, unknown consumer keys at any
+///   depth are preserved. Written with deterministic pretty serialization so
+///   repeat reinstalls are byte-idempotent. Recorded as `preserved`.
+/// - **Destination exists but is invalid JSON (or not an object)** → fall back
+///   to a template copy with a loud warning; the install does not abort.
+///   Recorded as `updated`.
+///
+/// Byte-exact preservation of consumer formatting/comments is explicitly out of
+/// scope — deterministic re-serialization is acceptable as long as keys/values
+/// survive and repeat runs are stable.
+fn merge_config_file(
+    defaults: &Path,
+    loom_path: &Path,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join("config.json");
+    let dst = loom_path.join("config.json");
+    let report_name = ".loom/config.json";
+
+    // No template shipped — nothing to do (mirrors copy_single_file's guard).
+    if !src.exists() {
+        return Ok(());
+    }
+
+    let template_str = fs::read_to_string(&src)
+        .map_err(|e| format!("Failed to read defaults config.json: {e}"))?;
+
+    // Fresh install: no existing consumer file → write the template through the
+    // SAME canonical serialize path the reinstall merge uses (issue #3619). A
+    // bare `fs::copy` of the hand-formatted template produced bytes that a later
+    // merge's `to_string_pretty` output could never match, leaving config.json
+    // permanently dirty after the first reinstall. Serializing here makes the
+    // on-disk file canonical from the very first install, so any later merge
+    // re-emits byte-identical output. With serde_json's `preserve_order`
+    // feature, template key order is retained (keys are not alphabetized).
+    if !dst.exists() {
+        match serde_json::from_str::<Value>(&template_str) {
+            Ok(template_val) => {
+                let mut serialized = serde_json::to_string_pretty(&template_val)
+                    .map_err(|e| format!("Failed to serialize config.json: {e}"))?;
+                serialized.push('\n');
+                fs::write(&dst, serialized)
+                    .map_err(|e| format!("Failed to write config.json: {e}"))?;
+            }
+            Err(e) => {
+                // Template is invalid JSON — fall back to a raw copy rather than
+                // dropping the install. (The reinstall branch handles this too.)
+                eprintln!(
+                    "Warning: defaults/config.json is not valid JSON ({e}); \
+                     copying it verbatim to .loom/config.json"
+                );
+                fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            }
+        }
+        report.added.push(report_name.to_string());
+        return Ok(());
+    }
+
+    let existing_str = fs::read_to_string(&dst)
+        .map_err(|e| format!("Failed to read existing config.json: {e}"))?;
+
+    // If the shipped template is somehow invalid JSON, do NOT clobber the
+    // consumer's file — leave it exactly as-is and record it as preserved.
+    let template_val: Value = match serde_json::from_str(&template_str) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "Warning: defaults/config.json is not valid JSON ({e}); \
+                 leaving existing .loom/config.json untouched"
+            );
+            report.preserved.push(report_name.to_string());
+            return Ok(());
+        }
+    };
+
+    // If the consumer file is missing/invalid/non-object, fall back to the
+    // template copy with a loud warning. This must not abort the install.
+    let existing_val: Value = match serde_json::from_str::<Value>(&existing_str) {
+        Ok(v) if v.is_object() => v,
+        _ => {
+            eprintln!(
+                "Warning: existing .loom/config.json is not valid JSON; overwriting \
+                 with the shipped template (previous contents were not preserved)"
+            );
+            fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            report.updated.push(report_name.to_string());
+            return Ok(());
+        }
+    };
+
+    // Deep-merge: template is the base, existing consumer values win on conflict.
+    let mut merged = template_val;
+    deep_merge_existing_wins(&mut merged, &existing_val);
+
+    let mut serialized = serde_json::to_string_pretty(&merged)
+        .map_err(|e| format!("Failed to serialize merged config.json: {e}"))?;
+    serialized.push('\n');
+    fs::write(&dst, serialized).map_err(|e| format!("Failed to write merged config.json: {e}"))?;
+    report.preserved.push(report_name.to_string());
+    Ok(())
+}
+
+/// Deep-merge `overlay` into `base` with **overlay values winning** on conflict.
+///
+/// Used by [`merge_config_file`] with `base` = shipped template and `overlay` =
+/// existing consumer config, so consumer edits are never lost while new
+/// template keys are still delivered:
+///
+/// - Two objects are merged key-by-key, recursing into nested objects.
+/// - Any non-object `overlay` value (array, scalar, null) replaces the
+///   corresponding `base` value wholesale.
+/// - Keys present only in `base` (new template keys) are retained.
+/// - Keys present only in `overlay` (unknown consumer keys) are preserved.
+fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(base_val) => deep_merge_existing_wins(base_val, overlay_val),
+                    None => {
+                        base_map.insert(key.clone(), overlay_val.clone());
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_val) => {
+            *base_slot = overlay_val.clone();
+        }
+    }
 }
 
 /// Sync a managed directory: clean stale files on reinstall, then copy fresh from defaults.
@@ -597,6 +769,49 @@ mod tests {
             "Expected missing-agents-directory issue, got: {:?}",
             validation.issues
         );
+    }
+
+    #[test]
+    fn test_self_install_skips_retired_file_cleanup() {
+        // Issue #3576: the retired-file cleanup is placed AFTER the self-install
+        // short-circuit in `initialize_workspace`, so it must never touch the
+        // Loom source tree. A stray `.claude/commands/loom/release.md` in a
+        // self-install workspace is left exactly as-is: not removed, and not
+        // even recorded in `report.preserved` (which would signal the cleanup
+        // ran and evaluated it — i.e. the call was misplaced before the early
+        // return).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::write(workspace.join(".loom-source"), "").unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("agents")).unwrap();
+        fs::write(workspace.join("CLAUDE.md"), "").unwrap();
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(workspace.join(".github").join("labels.yml"), "").unwrap();
+
+        // A retired stray on disk in the source tree.
+        let stray = workspace
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("release.md");
+        fs::write(&stray, "some release.md content\n").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), "nonexistent-defaults", false);
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        assert!(report.is_self_install);
+        // Cleanup never ran: file untouched, and it appears in neither list.
+        assert!(stray.exists(), "self-install must not remove the stray release.md");
+        let retired = ".claude/commands/loom/release.md".to_string();
+        assert!(!report.removed.contains(&retired));
+        assert!(!report.preserved.contains(&retired));
     }
 
     #[test]
@@ -1530,5 +1745,286 @@ mod tests {
         let mut sorted = missing;
         sorted.sort();
         assert_eq!(sorted, vec!["lib/a.sh".to_string(), "lib/b.sh".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // config.json merge (issue #3598)
+    // ------------------------------------------------------------------
+
+    /// Write a minimal defaults/ tree with the given config.json body and
+    /// return (workspace, defaults) paths for `initialize_workspace`.
+    fn setup_config_merge_repo(
+        temp: &TempDir,
+        template: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let workspace = temp.path().to_path_buf();
+        let defaults = workspace.join("defaults");
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), template).unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        (workspace, defaults)
+    }
+
+    #[test]
+    fn test_config_worktree_root_survives_reinstall() {
+        // The core issue #3598 repro: a committed config.json with a
+        // worktree.root override must retain that key after reinstall.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        // Pre-existing consumer config carrying a worktree.root override.
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("config.json"),
+            r#"{"version": "2", "worktree": {"root": "/Volumes/Stripe"}}"#,
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+        let report = result.unwrap();
+
+        let merged: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join(".loom").join("config.json")).unwrap(),
+        )
+        .unwrap();
+
+        // Consumer override preserved...
+        assert_eq!(merged["worktree"]["root"], Value::String("/Volumes/Stripe".to_string()));
+        // ...and a template key absent from the consumer file was added.
+        assert_eq!(merged["offlineMode"], Value::Bool(false));
+
+        // Merged (not clobbered) → reported as preserved so verification stays green.
+        assert!(
+            report.preserved.contains(&".loom/config.json".to_string()),
+            "config.json should be reported preserved, got: {:?}",
+            report.preserved
+        );
+    }
+
+    #[test]
+    fn test_config_deep_merge_preserves_unknown_keys_and_conflict_resolution() {
+        // Deep merge at any depth: unknown consumer keys survive, and on a
+        // key present in BOTH files the consumer value wins while new template
+        // keys are still delivered.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{
+          "version": "2",
+          "reflection": {"enabled": true, "categories": ["bug", "enhancement"]},
+          "newTemplateKey": "shipped"
+        }"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("config.json"),
+            r#"{
+              "version": "2",
+              "reflection": {"enabled": false, "upstream_repo": "me/fork"},
+              "worktree": {"root": "/Volumes/X"},
+              "customConsumerKey": {"nested": [1, 2, 3]}
+            }"#,
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+
+        let merged: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join(".loom").join("config.json")).unwrap(),
+        )
+        .unwrap();
+
+        // Conflict on reflection.enabled → consumer (false) wins.
+        assert_eq!(merged["reflection"]["enabled"], Value::Bool(false));
+        // Consumer-only nested key preserved.
+        assert_eq!(merged["reflection"]["upstream_repo"], Value::String("me/fork".to_string()));
+        // Template-only nested key delivered.
+        assert_eq!(merged["reflection"]["categories"], serde_json::json!(["bug", "enhancement"]));
+        // New top-level template key delivered.
+        assert_eq!(merged["newTemplateKey"], Value::String("shipped".to_string()));
+        // Unknown consumer keys (including deeply nested arrays) preserved.
+        assert_eq!(merged["worktree"]["root"], Value::String("/Volumes/X".to_string()));
+        assert_eq!(merged["customConsumerKey"]["nested"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_config_merge_is_idempotent_across_repeat_reinstalls() {
+        // A second consecutive reinstall must leave config.json byte-identical
+        // (same bar as the #3590 .gitignore fix).
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false, "terminals": []}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("config.json"),
+            r#"{"version": "2", "worktree": {"root": "/Volumes/Stripe"}}"#,
+        )
+        .unwrap();
+
+        let config_path = workspace.join(".loom").join("config.json");
+
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .expect("first reinstall");
+        let after_first = fs::read_to_string(&config_path).unwrap();
+
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .expect("second reinstall");
+        let after_second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(
+            after_first, after_second,
+            "config.json must be byte-identical across repeat reinstalls"
+        );
+        // The override still survives the second pass.
+        let merged: Value = serde_json::from_str(&after_second).unwrap();
+        assert_eq!(merged["worktree"]["root"], Value::String("/Volumes/Stripe".to_string()));
+    }
+
+    #[test]
+    fn test_config_fresh_install_is_exact_template_copy() {
+        // No existing .loom/config.json → exact byte-for-byte template copy,
+        // reported as added (fresh-install behavior unchanged).
+        let temp = TempDir::new().unwrap();
+        let template = "{\n  \"version\": \"2\",\n  \"offlineMode\": false\n}\n";
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+        let report = result.unwrap();
+
+        let installed = fs::read_to_string(workspace.join(".loom").join("config.json")).unwrap();
+        assert_eq!(installed, template, "fresh install must be an exact template copy");
+        assert!(
+            report.added.contains(&".loom/config.json".to_string()),
+            "fresh config.json should be reported added, got: {:?}",
+            report.added
+        );
+    }
+
+    #[test]
+    fn test_config_fresh_install_and_reinstall_are_byte_identical() {
+        // Issue #3619: the fresh-install write path and the reinstall-merge
+        // write path must emit BYTE-IDENTICAL output for the same logical
+        // content. Before the fix, fresh install did a raw `fs::copy` of the
+        // hand-formatted template (semantic key order, inline arrays) while the
+        // reinstall merge re-serialized via `to_string_pretty` (expanded
+        // arrays), so the first reinstall reformatted config.json and left it
+        // permanently dirty. Now both paths serialize, so a fresh install
+        // followed by a reinstall is a byte-for-byte no-op.
+        let temp = TempDir::new().unwrap();
+        // A template exercising the two axes that used to diverge: an inline
+        // array (expanded by to_string_pretty) and multiple keys in a
+        // non-alphabetical semantic order (preserved by `preserve_order`).
+        let template = r#"{
+  "version": "2",
+  "offlineMode": false,
+  "reflection": {
+    "enabled": true,
+    "categories": ["bug", "enhancement", "documentation"]
+  },
+  "terminals": []
+}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        let config_path = workspace.join(".loom").join("config.json");
+
+        // Fresh install (no existing .loom/config.json).
+        let first =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("fresh install");
+        assert!(
+            first.added.contains(&".loom/config.json".to_string()),
+            "fresh install should report config.json as added, got: {:?}",
+            first.added
+        );
+        let after_fresh = fs::read_to_string(&config_path).unwrap();
+
+        // Second run: now the file exists → the merge path runs. Its output
+        // must be byte-identical to the fresh-install output (the crux of
+        // #3619 — a reinstall over a freshly-installed config leaves it clean).
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .expect("reinstall merge");
+        let after_reinstall = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(
+            after_fresh, after_reinstall,
+            "fresh-install and reinstall-merge output must be byte-identical (#3619)"
+        );
+
+        // Sanity: the serialized form is canonical (expanded array, trailing
+        // newline, template key order preserved by `preserve_order`).
+        assert!(
+            after_fresh.ends_with("}\n"),
+            "serialized config.json should end with a single trailing newline"
+        );
+        let version_pos = after_fresh.find("\"version\"").unwrap();
+        let offline_pos = after_fresh.find("\"offlineMode\"").unwrap();
+        assert!(
+            version_pos < offline_pos,
+            "preserve_order must retain template key order (version before offlineMode)"
+        );
+    }
+
+    #[test]
+    fn test_config_invalid_existing_json_falls_back_to_template() {
+        // A corrupt existing config.json falls back to the template copy with a
+        // warning (does not abort) and is recorded as updated.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(workspace.join(".loom").join("config.json"), "{ this is not valid json ,,,")
+            .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init must not abort on invalid config: {result:?}");
+        let report = result.unwrap();
+
+        // The template must have replaced the corrupt file (valid JSON now).
+        let installed: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join(".loom").join("config.json")).unwrap(),
+        )
+        .expect("post-fallback config.json must be valid JSON");
+        assert_eq!(installed["offlineMode"], Value::Bool(false));
+        assert!(
+            report.updated.contains(&".loom/config.json".to_string()),
+            "fallback config.json should be reported updated, got: {:?}",
+            report.updated
+        );
+    }
+
+    #[test]
+    fn test_deep_merge_existing_wins_unit() {
+        // Direct unit coverage of the merge primitive.
+        let mut base = serde_json::json!({
+            "a": 1,
+            "shared": {"x": "template", "onlyTemplate": true},
+            "arr": [1, 2]
+        });
+        let overlay = serde_json::json!({
+            "shared": {"x": "consumer", "onlyConsumer": 9},
+            "arr": [9],
+            "b": 2
+        });
+        deep_merge_existing_wins(&mut base, &overlay);
+
+        // Template-only top-level key retained.
+        assert_eq!(base["a"], serde_json::json!(1));
+        // Overlay-only top-level key added.
+        assert_eq!(base["b"], serde_json::json!(2));
+        // Nested object merged; overlay wins on conflict, both-only keys kept.
+        assert_eq!(base["shared"]["x"], serde_json::json!("consumer"));
+        assert_eq!(base["shared"]["onlyTemplate"], serde_json::json!(true));
+        assert_eq!(base["shared"]["onlyConsumer"], serde_json::json!(9));
+        // Arrays are replaced wholesale by the overlay (non-object value).
+        assert_eq!(base["arr"], serde_json::json!([9]));
     }
 }

@@ -11,6 +11,12 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod capacity;
+pub mod claim_reconciliation;
+pub mod cpu_headroom;
+pub mod disk_headroom;
+pub mod epic_state;
+pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
 pub mod forge_parser;
@@ -19,11 +25,24 @@ pub mod git_utils;
 pub mod health_monitor;
 pub mod init;
 pub mod ipc;
+pub mod issue_creation_mutex;
+pub mod main_health_gate;
 pub mod metrics_collector;
+pub mod phase_join;
+pub mod pipeline_snapshot;
+pub mod role_runner;
 pub mod role_validation;
+pub mod self_update;
+pub mod sweep_journal;
 pub mod sweep_registry;
 pub mod terminal;
+pub mod token_ranking_refresh;
+pub mod tokens;
 pub mod types;
+pub mod watch_registry;
+pub mod work_finder;
+pub mod workspace_pool;
+pub mod workspace_registry;
 pub mod worktree_root;
 
 use std::collections::HashSet;

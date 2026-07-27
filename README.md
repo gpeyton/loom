@@ -54,9 +54,15 @@ Loom automation gets **unrestricted permissions by default on both runtimes** �
 
 For multi-issue autonomous batches, start the spawn loop instead:
 
+For multiple issues in one session, pass them all to sweep:
+
 ```bash
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+# In Claude Code:
+/loom:sweep 42 43 44          # waves of parallel builders
+/loom:sweep all               # the whole open backlog
 ```
+
+For continuous multi-account batches, run the `loom-daemon` (Tier 2) and enqueue with `mcp__loom__dispatch_sweep` — one detached, token-rotated sweep per issue.
 
 ## How It Works
 
@@ -67,8 +73,8 @@ LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 └─────────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────────┐
-│        Tier 2: Spawn loop + GitHub Actions cron                 │
-│  spawn-loop.sh claims ready issues, detaches per-issue sweeps   │
+│        Tier 2: loom-daemon + GitHub Actions cron                │
+│  loom-daemon dispatches per-issue sweeps (mcp__loom__*)         │
 │  .github/workflows/loom-*.yml runs support roles on cron        │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -91,6 +97,84 @@ LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 - `loom:pr` → Approved, ready to merge
 
 See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
+
+## Loom State Machine
+
+Loom coordinates its agents entirely through labels. The full label graph — four
+lanes (issue, PR, proposal, epic supervisor), the role that fires each edge, and
+the epic fork-join barriers — is modeled as an **executable specification** in
+[`loom-tools/src/loom_tools/state_machine.py`](loom-tools/src/loom_tools/state_machine.py).
+A CI test (`loom-tools/tests/test_state_machine.py`) validates the graph for
+reachability, dead-ends, label conflation, autonomy gaps, and barrier hygiene,
+and keeps the diagram below in sync with the model.
+
+The five `epic:*` states are **derived** — they all ride the single `loom:epic`
+label and are computed by the daemon-native epic supervisor, so no new labels
+are minted. Edges marked "creates issues" are the ones the #3707 issue-filing
+mutex must serialize.
+
+> Regenerate this diagram with `python -m loom_tools.state_machine --mermaid`.
+
+```mermaid
+stateDiagram-v2
+    state "Issue lane" as lane_issue {
+        s_new : new
+        s_loom_triage : loom:triage
+        s_loom_curating : loom:curating
+        s_loom_curated : loom:curated
+        s_loom_issue : loom:issue
+        s_loom_building : loom:building
+        s_closed : closed
+    }
+    state "PR lane" as lane_pr {
+        s_loom_review_requested : loom:review-requested
+        s_loom_changes_requested : loom:changes-requested
+        s_loom_pr : loom:pr
+        s_merged : merged
+    }
+    state "Proposal lane" as lane_proposal {
+        s_loom_architect : loom:architect
+        s_loom_hermit : loom:hermit
+        s_loom_auditor : loom:auditor
+    }
+    state "Epic supervisor lane (derived — loom:epic)" as lane_epic {
+        s_epic_needs_decomp : epic:needs_decomp
+        s_epic_designed : epic:designed
+        s_epic_active : epic:active
+        s_epic_phase_join : epic:phase_join
+        s_epic_done : epic:done
+    }
+    [*] --> s_new
+    s_new --> s_loom_triage : Human
+    s_loom_triage --> s_loom_curating : Curator
+    s_loom_curating --> s_loom_curated : Curator
+    s_loom_curated --> s_loom_issue : Human
+    s_loom_issue --> s_loom_building : Builder
+    s_loom_building --> s_loom_review_requested : Builder
+    s_loom_building --> s_closed : Champion
+    s_loom_review_requested --> s_loom_pr : Judge
+    s_loom_review_requested --> s_loom_changes_requested : Judge
+    s_loom_changes_requested --> s_loom_review_requested : Doctor
+    s_loom_pr --> s_merged : Champion
+    s_new --> s_loom_architect : Architect · creates issues
+    s_new --> s_loom_hermit : Hermit · creates issues
+    s_new --> s_loom_auditor : Auditor · creates issues
+    s_loom_architect --> s_loom_issue : Champion
+    s_loom_architect --> s_closed : Champion
+    s_loom_hermit --> s_loom_issue : Champion
+    s_loom_hermit --> s_closed : Champion
+    s_loom_auditor --> s_loom_issue : Champion
+    s_loom_auditor --> s_closed : Champion
+    s_new --> s_epic_needs_decomp : Architect
+    s_epic_needs_decomp --> s_epic_designed : Champion · creates issues
+    s_epic_designed --> s_epic_active : Champion
+    s_epic_active --> s_epic_phase_join : Supervisor · barrier: fork-join: current phase complete
+    s_epic_phase_join --> s_epic_active : Supervisor · barrier: advance: dispatch next phase
+    s_epic_phase_join --> s_epic_done : Supervisor · barrier: join: all phases complete
+    s_closed --> [*]
+    s_merged --> [*]
+    s_epic_done --> [*]
+```
 
 ## Features
 
@@ -116,7 +200,7 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
 - MCP integration for programmatic control (19 tools)
-- Graceful shutdown: `touch .loom/stop-spawn-loop`
+- Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support
 
@@ -208,17 +292,19 @@ claude -p "/loom:sweep 42" --dangerously-skip-permissions
 
 Sweep is self-contained — there is no separate daemon to start. Checkpoints under `.loom/sweep-checkpoint/` survive crashes; restarting the sweep resumes from the last completed phase.
 
-### Multi-Issue Mode (spawn loop)
+### Multi-Issue Mode (loom-daemon, Tier 2)
 
-For autonomous batches that claim ready issues continuously:
+For autonomous multi-account batches, run the Rust `loom-daemon` and enqueue sweeps against it from any Claude Code session:
 
-```bash
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
-./.loom/scripts/spawn-loop.sh status
-./.loom/scripts/spawn-loop.sh stop                  # or: touch .loom/stop-spawn-loop
+```text
+mcp__loom__dispatch_sweep    # detach one token-rotated sweep per issue
+mcp__loom__list_sweeps       # inspect running sweeps
+mcp__loom__cancel_sweep      # cancel a running sweep
 ```
 
-The spawn loop polls `loom:issue`, atomically claims ready items, and detaches one `/loom:sweep N` child per issue (up to `MAX_PARALLEL`, default 3). Each spawn picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The loop has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (Phase 2a, opt-in per workflow).
+Each dispatched sweep runs in its own detached process and picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The daemon has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (opt-in per workflow). See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full MCP surface.
+
+> The legacy `spawn-loop.sh` was **removed in v0.11.0** — use `loom-daemon` + `mcp__loom__dispatch_sweep` instead. See the [migration guide](docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### Individual Agent Commands
 
@@ -265,7 +351,7 @@ gh pr create --label "loom:review-requested"
 | Role | Purpose | Mode |
 |------|---------|------|
 | `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
-| `./.loom/scripts/spawn-loop.sh` | Multi-issue batch claimer (Tier 2) | Continuous, opt-in |
+| `loom-daemon` + `mcp__loom__dispatch_sweep` | Multi-issue detached dispatch (Tier 2) | Continuous, opt-in |
 | `/builder` | Implement features and fixes | Manual |
 | `/judge` | Review pull requests | Cron via GH Actions |
 | `/curator` | Enhance and organize issues | Cron via GH Actions |
@@ -293,6 +379,16 @@ cargo build --package loom-daemon --release
 ```
 
 See [DEVELOPMENT.md](docs/guides/development.md) for complete guidelines.
+
+## Releasing
+
+Releases are driven by `/repo:release` — install [repo](https://github.com/rjwalters/repo) for the release command. It runs the full methodology (pre-flight/CI gate, CHANGELOG completeness and version-drift gates, semver decision, tag, GitHub Release) and detects and honors Loom's bundled `scripts/version.sh` as its first-priority version tool:
+
+```bash
+./scripts/version.sh bump patch --tag   # underlying mechanics; /repo:release orchestrates these
+git push origin main --tags
+gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
+```
 
 ## Bootstrap New Projects
 

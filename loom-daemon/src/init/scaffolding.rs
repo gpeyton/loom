@@ -70,10 +70,15 @@ pub const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
 
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
-/// The full Loom guide is written to `.loom/CLAUDE.md` in the target repo.
-/// Claude Code auto-discovers `.loom/CLAUDE.md` when agents work in
-/// `.loom/worktrees/issue-N/` via ancestor directory traversal.
-pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration. See `.loom/CLAUDE.md` for the full guide (roles, labels, worktrees, configuration).";
+/// This block is committed to the consumer repo, so its authoritative reference
+/// is the always-present Loom repository URL — never the install-generated
+/// `.loom/CLAUDE.md`, which may be gitignored or absent in a fresh clone / CI
+/// checkout (issue #3612). Loom additionally writes a locally-substituted copy
+/// of the full guide to `.loom/CLAUDE.md` at install time; Claude Code
+/// auto-discovers that local copy when agents work in `.loom/worktrees/issue-N/`
+/// via ancestor directory traversal, so the auto-discovery behaviour is
+/// unaffected by this wording.
+pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.";
 
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
@@ -231,8 +236,8 @@ fn slice_is_discardable_legacy(slice: &str) -> bool {
 /// Load the Loom-internal skip list from `<defaults>/.loom-internal.list`.
 ///
 /// Returns a set of defaults-relative path strings (e.g.
-/// `".claude/commands/loom/release.md"`) that the installer must NOT copy
-/// into consumer repositories.
+/// `".claude/commands/loom/internal-only.md"`) that the installer must NOT
+/// copy into consumer repositories.
 ///
 /// File format:
 /// - One defaults-relative path per line.
@@ -240,7 +245,7 @@ fn slice_is_discardable_legacy(slice: &str) -> bool {
 /// - Blank lines are ignored.
 /// - Leading/trailing whitespace on each entry is stripped.
 /// - Paths are matched exactly against the defaults-relative path the
-///   copy helpers see (e.g. `.claude/commands/loom/release.md`). No
+///   copy helpers see (e.g. `.claude/commands/loom/internal-only.md`). No
 ///   globbing.
 ///
 /// Missing or unreadable files yield an empty set — the install path is
@@ -901,8 +906,8 @@ pub fn setup_repository_scaffolding(
     // instead of overwriting, so project-specific hooks are preserved.
     //
     // Issue #3464: skip files listed in `defaults/.loom-internal.list` so
-    // Loom-internal skills (e.g. `.claude/commands/loom/release.md`) are not
-    // shipped to consumer repositories. The skip list is loaded once and the
+    // Loom-internal skills (e.g. `.claude/commands/loom/internal-only.md`) are
+    // not shipped to consumer repositories. The skip list is loaded once and the
     // closure does a HashSet lookup per file. An empty list (or missing file)
     // is a no-op.
     let skip_list = load_internal_skip_list(defaults_path);
@@ -2891,8 +2896,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         // hooks key should be removed entirely since nothing remains
         assert!(
             settings.get("hooks").is_none(),
-            "hooks key should be removed when empty, got: {:?}",
-            settings
+            "hooks key should be removed when empty, got: {settings:?}"
         );
     }
 

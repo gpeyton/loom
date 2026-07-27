@@ -100,6 +100,109 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 }
 ```
 
+### This repo's configuration (polyglot backstop)
+
+Loom's own `.loom/config.json` points `buildGate.command` at a committed
+wrapper script rather than a single-language one-liner, because this repo is
+polyglot (Rust + Python + bash) and no single build tool covers it:
+
+```json
+{
+  "buildGate": {
+    "enabled": true,
+    "command": "bash .loom/scripts/build-gate.sh",
+    "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock", "*.py", "*.sh"],
+    "timeoutSeconds": 600
+  }
+}
+```
+
+The wrapper lives at [`defaults/scripts/build-gate.sh`](../scripts/build-gate.sh)
+(the installer-template source of truth; `.loom/scripts/build-gate.sh` resolves
+to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs three
+stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
+
+1. `cargo test --workspace --lib --bins` — the Rust crates' **unit tests**
+   (`loom-daemon`, `loom-api`). The integration test **targets** under
+   `loom-daemon/tests/` are deliberately excluded here — see "Local gate vs.
+   CI" below.
+2. `uv run pytest tests/ -q` in `loom-tools/`, scoped with
+   `--ignore=tests/integration` (live-network/credentials e2e) and
+   `--ignore=tests/tokens/test_agent_spawn_integration.py` (a slow real-time
+   modal-poll integration file). `uv run` is used so `loom_tools` is importable
+   from the project venv.
+3. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+
+**`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs
+`npm install`/`npm ci` in a fresh worktree (no guaranteed warm `node_modules`),
+which would add unpredictable latency to a gate that also runs once per PR. CI
+(`.github/workflows/ci.yml`) still gates the `mcp-loom` build. `timeoutSeconds:
+600` gives ~2x headroom over the measured ~210s warm-cache total to absorb a
+cold `target/` in a fresh worktree.
+
+Beyond the per-wave step-8 gate, this same command runs after **every** builder
+exit (the "Post-Builder Quality Gate" above), so it is deliberately kept fast
+and free of network/npm dependencies. This is a repo-specific,
+self-hosting-only config; `defaults/config.json` (the generic install template)
+ships with no `buildGate` block. See issue
+[#3749](https://github.com/rjwalters/loom/issues/3749).
+
+### Local gate vs. CI: the environment-sensitivity boundary (#3985)
+
+The local gate and GitHub CI run *nearly* the same Rust command, but they
+measure different things, and that difference is deliberate:
+
+| | Command | Measures |
+|---|---------|----------|
+| **CI** (`.github/workflows/ci.yml`) | `cargo test --workspace` (all targets, incl. integration) | **the commit**, in a controlled runner with a guaranteed-live tmux |
+| **Local gate** (`build-gate.sh`) | `cargo test --workspace --lib --bins` (unit tests only) | **the commit**, on whatever host is actively running Loom |
+
+The local gate runs on the machine that is *also running the sweeps* — a busy,
+sometimes headless, sometimes tmux-less host. Any assertion in the gate that
+depends on that host's configuration measures the **host**, not `main`, and so
+can go red for a reason that has nothing to do with the code being gated. That
+is inverted: a gate is supposed to be green when `main` is correct, not green
+only when the host happens to be idle and fully provisioned.
+
+Two concrete failure classes motivated the split (#3985):
+
+- **Dead tmux server.** The `loom-daemon/tests/integration_basic.rs` terminal
+  tests create real tmux sessions and assert they exist. On a host with no
+  reachable tmux server they can only fail. These live in integration test
+  **targets**, which `--lib --bins` excludes — so the gate never runs them,
+  and CI (which always has tmux) still does. As belt-and-suspenders, those
+  tests now **skip cleanly** (via a `require_tmux!()` probe) rather than fail
+  when no tmux is available, so even a full local `cargo test --workspace`
+  stays green on a tmux-less host.
+- **CPU starvation.** A few `sweep_registry` unit tests wait on a fixture child
+  with a wall-clock deadline. Under heavy host load (the gate itself, when it
+  was re-running continuously, cf. #3984) the child could miss a tight 5–10s
+  deadline purely because it was never scheduled. Those bounds are now generous
+  (`FIXTURE_CHILD_WAIT_MS`, 60s), and the whole gate runs under `nice` (below)
+  so it can never starve the very processes it is timing.
+
+**The gate runs at reduced priority.** `build-gate.sh` re-execs itself once
+under `nice -n 19` (the sentinel `LOOM_BUILD_GATE_NICED` prevents a loop) so a
+long `cargo` compile can never starve the sweeps — or the timing-sensitive
+tests — it shares a host with. Tunable via `LOOM_BUILD_GATE_NICENESS`; disable
+with `LOOM_BUILD_GATE_NICE=0`. If `nice` is unavailable the gate proceeds at
+normal priority.
+
+> **Rule of thumb:** if a check's outcome can differ between an idle host and a
+> busy one — or between a host with tmux and one without — it is
+> **environment-sensitive** and belongs in CI (which controls its
+> environment), not in the local post-builder gate. Keep the gate scoped to
+> checks that are deterministic on any host.
+
+**Forge-CI corroboration (deferred).** The curated issue's fourth acceptance
+criterion — when the local gate disagrees with a *green* forge CI result on the
+same evaluated SHA, prefer the forge signal and log the divergence loudly
+rather than halting — is a distinct, larger daemon-side feature (it belongs
+with the RED-classification work in #3974 AC4, not the test/scope hardening
+here). It is intentionally **not** implemented in this change; the scope split
++ test hardening + `nice` above already break the self-reddening loop this
+issue targets. Tracked as follow-up under #3974.
+
 ## Failure semantics
 
 A gate failure is **not** the same as a builder failure: the issue is automatically re-queued (`loom:issue`) and a future builder can take a fresh attempt. The `PhaseResult.data` block carries:

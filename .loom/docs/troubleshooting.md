@@ -294,7 +294,7 @@ claude -p "/loom:sweep 123" --dangerously-skip-permissions > /tmp/sweep-123.log 
 cat /tmp/sweep-123.log
 ```
 
-**Built-in log file** — when the spawn loop spawns a sweep child, it automatically tees all output to `.loom/logs/sweep-issue-N.log`. If output is invisible in your terminal, check this log file:
+**Built-in log file** — when a sweep child runs, it automatically tees all output to `.loom/logs/sweep-issue-N.log`. If output is invisible in your terminal, check this log file:
 
 ```bash
 cat .loom/logs/sweep-issue-123.log
@@ -356,7 +356,9 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 
 ## Stuck Agent Detection
 
-`loom-stuck-detection` (post-v0.10.0) checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` checks for stuck sweep children by reading the per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.
+
+> **Note (post-v0.11.0):** `spawn-loop.sh` — the only writer of `.loom/spawn-loop-state.json` — was deleted, so this file no longer has a writer. `loom-stuck-detection` therefore currently reports nothing (a safe no-op: it only reports, it never tears down work). Repointing it to the `loom-daemon` sweep registry (`mcp__loom__list_sweeps`) and `.loom/sweep-checkpoint/issue-<N>.json` timestamps is tracked as a follow-up (see `docs/migration/daemon-state-consumers.md`).
 
 ### Check for stuck agents
 
@@ -376,52 +378,63 @@ loom-stuck-detection check-issue 123
 | Indicator | Default Threshold | Description |
 |-----------|-------------------|-------------|
 | `stale_heartbeat` | 5 minutes | No checkpoint update for extended time |
-| `dead_pid` | (instant) | PID in spawn-loop-state.json is no longer alive |
+| `dead_pid` | (instant) | PID in the daemon sweep registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
 The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
 
-## Spawn-Loop Troubleshooting
+## Sweep Dispatch Troubleshooting
 
-The spawn loop replaces the historical daemon brain; orchestration state lives at `.loom/spawn-loop-state.json`.
+Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
 
-### Check spawn-loop state
+### Sweep MCP tools missing (stale dist bundle)
 
-```bash
-# View current spawn-loop state
-./.loom/scripts/spawn-loop.sh status
+**Symptom**: `mcp__loom__dispatch_sweep`, `mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__tail_sweep_log`, `mcp__loom__cancel_sweep`, `mcp__loom__publish_event`, `mcp__loom__subscribe_to_events`, or `mcp__loom__tail_event_bus` are **not offered** in a live session — `/loom:sweep`'s Stage -1 daemon probe can't reach them even though `loom-daemon` is running.
 
-# Or read the state file directly
-cat .loom/spawn-loop-state.json | jq
+**Cause**: the MCP client loads the **built bundle** `mcp-loom/dist/index.js`, never the TypeScript source. `dist/` is gitignored, so a checkout that predates the sweep tools (Phase A #3452 / Phase C #3455) keeps serving an old bundle. The source (`mcp-loom/src/index.ts` → `sweepTools`) is correct; the on-disk artifact is stale (#3803).
 
-# Check if loop is running
-test -f .loom/spawn-loop.pid && ps -p "$(cat .loom/spawn-loop.pid)" -o pid,etime,command
-
-# List active sweep children
-jq '.running[] | {issue, pid, started_at}' .loom/spawn-loop-state.json
-```
-
-### Graceful shutdown
+**Diagnose**:
 
 ```bash
-# Signal the spawn loop to stop accepting new work and drain in-flight children
-./.loom/scripts/spawn-loop.sh stop
-# or, equivalently:
-touch .loom/stop-spawn-loop
+# 0 means the sweep tools are absent from the built bundle -> stale
+grep -c dispatch_sweep mcp-loom/dist/index.js
+
+# Compare build vs source timestamps
+ls -la mcp-loom/dist/index.js
+find mcp-loom/src -type f -newer mcp-loom/dist/index.js   # any output => dist is stale
 ```
 
-The loop honors `SHUTDOWN_GRACE_SEC` (default 300s) before SIGKILL'ing any remaining sweep children.
-
-### Force stop (use with caution)
+**Fix** — rebuild, then **reconnect**:
 
 ```bash
-# Remove stop signal if it was set but never picked up
-rm -f .loom/stop-spawn-loop
-
-# Hard-kill the loop process
-test -f .loom/spawn-loop.pid && kill -9 "$(cat .loom/spawn-loop.pid)" || true
-rm -f .loom/spawn-loop.pid
+cd mcp-loom && npm install && npm run build
+grep -c dispatch_sweep dist/index.js   # should now be > 0
 ```
+
+`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](../../mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
+
+### Inspect running sweeps
+
+```bash
+# List all running sweeps in the daemon registry
+mcp__loom__list_sweeps
+
+# Inspect a specific sweep's state
+mcp__loom__get_sweep_status --sweep_id <id>
+
+# Tail a per-sweep log
+mcp__loom__tail_sweep_log --sweep_id <id>
+# (per-sweep logs also live at .loom/logs/sweep-issue-<N>.log)
+```
+
+### Cancel a sweep
+
+```bash
+# Cancel a running sweep (SIGTERM → grace → SIGKILL)
+mcp__loom__cancel_sweep --sweep_id <id>
+```
+
+The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
 
 ### Stuck sweep child
 
@@ -434,37 +447,37 @@ ls -la .loom/sweep-checkpoint/issue-123.json
 # Look at the child's log for errors
 tail -200 .loom/logs/sweep-issue-123.log
 
-# If you need to kill it manually:
-jq '.running[] | select(.issue==123) | .pid' .loom/spawn-loop-state.json | xargs -I{} kill {}
+# Cancel it through the daemon:
+mcp__loom__cancel_sweep --sweep_id <id>
 
-# The loop will detect the dead pid on the next tick and release the claim
-# (the checkpoint survives, so the issue will resume from its last completed phase
-# the next time the loop spawns it)
+# The checkpoint survives cancellation, so re-dispatching the issue resumes
+# from its last completed phase:
+mcp__loom__dispatch_sweep --issue 123
 ```
 
-### Spawn-loop is not picking up issues
+### Dispatch is not producing sweeps
 
-Issues need the `loom:issue` label (human-approved, ready for work) to be eligible. If the queue looks empty but the loop is idle, check:
+Issues need the `loom:issue` label (human-approved, ready for work) to be eligible for dispatch. If a dispatch isn't producing a sweep, check:
 
 ```bash
 # 1. Confirm there are ready issues
 gh issue list --label "loom:issue" --state open
 
-# 2. Confirm the claim locks aren't stale (a previous crash may have left lock dirs)
-ls -la .loom/locks/
+# 2. Confirm the daemon is reachable and running
+mcp__loom__list_sweeps
 
-# 3. Confirm the opt-in gate is set
-echo "LOOM_USE_SPAWN_LOOP=$LOOM_USE_SPAWN_LOOP"
+# 3. Confirm the multi-account token pool is bootstrapped (dispatch requires it)
+ls -la .loom/tokens/
 
-# 4. Look at recent loop activity
-tail -100 .loom/logs/spawn-loop.log
+# 4. Look at recent sweep activity on the event bus
+mcp__loom__tail_event_bus
 ```
 
-If `.loom/locks/issue-<N>/` exists for a closed/merged issue, remove it manually — the next tick will then claim that slot if a new ready issue lands.
+Note: by default the daemon does not poll the forge for `loom:issue` items — dispatch is operator-driven via `mcp__loom__dispatch_sweep`. To dispatch a ready issue, call `mcp__loom__dispatch_sweep --issue <N>` explicitly. (The opt-in autonomous work finder (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`, default-off) *does* poll and auto-dispatch open `loom:issue` items when enabled — see [daemon-reference.md](daemon-reference.md#autonomous-work-finder-3810).)
 
 ### Work generation (Architect / Hermit) not running
 
-**This is by design post-v0.10.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
+**This is by design post-v0.10.0.** The daemon does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
 
 For now, trigger them manually when the queue is empty:
 

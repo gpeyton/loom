@@ -40,6 +40,7 @@ warn() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOOM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_SCRIPT="$LOOM_ROOT/scripts/install-loom.sh"
+WRAPPER_SCRIPT="$LOOM_ROOT/install.sh"
 UNINSTALL_SCRIPT="$LOOM_ROOT/scripts/uninstall-loom.sh"
 DEFAULTS_DIR="$LOOM_ROOT/defaults"
 
@@ -346,7 +347,7 @@ echo "Test 12b: Hook commands use \${CLAUDE_PROJECT_DIR} prefix"
 SETTINGS_FILE="$INSTALL_REPO/.claude/settings.json"
 if [[ -f "$SETTINGS_FILE" ]] && command -v jq &> /dev/null; then
   HOOK_PREFIX_FAIL=0
-  for hook_name in guard-destructive.sh skill-router.sh methodology-inject.sh; do
+  for hook_name in guard-destructive.sh guard-loom-workflow.sh skill-router.sh methodology-inject.sh; do
     # Collect every command in the settings.json that ends with this hook script.
     matches=$(jq -r --arg name "$hook_name" \
       '[.. | objects | select(.command? != null) | .command | select(endswith($name))][]' \
@@ -453,6 +454,18 @@ if [[ -f "$INSTALL_REPO/.loom/hooks/guard-destructive.sh" ]]; then
   fi
 else
   fail "guard-destructive.sh missing"
+fi
+
+# Test 16b: .loom/hooks/guard-loom-workflow.sh (issue #3604)
+echo "Test 16b: Install creates .loom/hooks/guard-loom-workflow.sh"
+if [[ -f "$INSTALL_REPO/.loom/hooks/guard-loom-workflow.sh" ]]; then
+  if [[ -x "$INSTALL_REPO/.loom/hooks/guard-loom-workflow.sh" ]]; then
+    pass "guard-loom-workflow.sh exists and is executable"
+  else
+    fail "guard-loom-workflow.sh exists but is not executable"
+  fi
+else
+  fail "guard-loom-workflow.sh missing"
 fi
 
 # Test 17: .loom/config.json
@@ -1293,6 +1306,163 @@ echo ""
 
 
 # ==========================================================================
+# Section 5b: Retired-File Cleanup (#3572)
+# ==========================================================================
+# Exercises the content-gated retired-file cleanup block in install-loom.sh
+# (the "Retired-file cleanup (content-gated)" block after the stale-file
+# sweep). A file on the frozen retired-file allowlist is git-rm'd ONLY when its
+# on-disk content hashes to a shipped digest (unmodified); a consumer-modified
+# copy is preserved; an absent file is a no-op. The gate logic is mirrored
+# inline here (like find_stale_files above) so it can be verified without
+# invoking the full installer, plus a drift guard that asserts the real
+# allowlist in install-loom.sh still carries the digests this mirror expects.
+
+# Mirror of install-loom.sh's LOOM_RETIRED_FILES allowlist (#3572). Keep in
+# sync with install-loom.sh — assert_retired_allowlist_in_sync guards drift.
+RETIRED_ALLOWLIST_MIRROR=$(cat <<'RETIRED'
+.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
+.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
+.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
+.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
+.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
+.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
+.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
+.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
+.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
+.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
+.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
+RETIRED
+)
+
+# The git blob sha of the last release.md version Loom shipped (parent of the
+# #3571 deletion). Immutable + content-addressed; its sha256 is the first row
+# of the mirror above. Used to reconstruct real shipped bytes at test time.
+RETIRED_LAST_SHIPPED_BLOB="b1dac86f43dbe159b1a617b31010cdaab7b88bc5"
+RETIRED_RELEASE_PATH=".claude/commands/loom/release.md"
+
+_test_sha256() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+
+# Mirror of the install-loom.sh gate: prints REMOVE / PRESERVE / NONE for the
+# retired path under repo $1.
+retired_decision() {
+  local repo="$1" rp="$RETIRED_RELEASE_PATH"
+  [[ -f "$repo/$rp" ]] || { echo "NONE"; return 0; }
+  local fh; fh="$(_test_sha256 "$repo/$rp")"
+  local matched=false ap ah
+  if [[ -n "$fh" ]]; then
+    while read -r ap ah; do
+      [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
+      if [[ "$ap" == "$rp" && "$ah" == "$fh" ]]; then matched=true; break; fi
+    done <<< "$RETIRED_ALLOWLIST_MIRROR"
+  fi
+  if [[ "$matched" == "true" ]]; then echo "REMOVE"; else echo "PRESERVE"; fi
+}
+
+# Drift guard: every digest in the test mirror must be present in the real
+# install-loom.sh allowlist (and vice-versa for the release.md rows).
+assert_retired_allowlist_in_sync() {
+  local ok=true ap ah
+  while read -r ap ah; do
+    [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
+    if ! grep -qF "$ap $ah" "$SCRIPT_DIR/install-loom.sh"; then
+      ok=false
+      warn "mirror digest missing from install-loom.sh: $ap $ah"
+    fi
+  done <<< "$RETIRED_ALLOWLIST_MIRROR"
+  if [[ "$ok" == "true" ]]; then
+    pass "Retired-file allowlist in test mirror matches install-loom.sh"
+  else
+    fail "Retired-file allowlist drifted between test mirror and install-loom.sh"
+  fi
+}
+
+echo "--- Section 5b: Retired-File Cleanup (#3572) ---"
+echo ""
+
+# Test 44a: an unmodified (hash-matching) retired file is removed on update.
+echo "Test 44a: Unmodified retired release.md is removed"
+RETIRED_REMOVE_REPO="$TEST_DIR/retired-remove-test"
+create_temp_repo "$RETIRED_REMOVE_REPO"
+mkdir -p "$RETIRED_REMOVE_REPO/$(dirname "$RETIRED_RELEASE_PATH")"
+if git -C "$LOOM_ROOT" cat-file -e "$RETIRED_LAST_SHIPPED_BLOB" 2>/dev/null; then
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_REMOVE_REPO" add "$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_REMOVE_REPO" commit -m "Add shipped release.md" --quiet
+
+  # The reconstructed bytes must hash to the head of the allowlist — this is
+  # the real linkage between "what Loom shipped" and "what the gate removes".
+  SHIPPED_HASH="$(_test_sha256 "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH")"
+  if grep -qF "$RETIRED_RELEASE_PATH $SHIPPED_HASH" "$SCRIPT_DIR/install-loom.sh"; then
+    pass "Reconstructed shipped release.md hash is in install-loom.sh allowlist"
+  else
+    fail "Shipped release.md hash ($SHIPPED_HASH) absent from install-loom.sh allowlist"
+  fi
+
+  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "REMOVE" ]]; then
+    pass "Unmodified release.md gated for removal"
+  else
+    fail "Unmodified release.md not gated for removal"
+  fi
+  # Apply the sweep (mirrors install-loom.sh git-rm step) and verify removal.
+  git -C "$RETIRED_REMOVE_REPO" rm --quiet --force "$RETIRED_RELEASE_PATH" 2>/dev/null || true
+  if [[ ! -f "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH" ]]; then
+    pass "Unmodified release.md removed from working tree"
+  else
+    fail "Unmodified release.md still present after cleanup"
+  fi
+
+  # Test 44d: idempotency — a second run with the file already gone is a no-op.
+  echo ""
+  echo "Test 44d: Cleanup is idempotent (second run is a no-op)"
+  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "NONE" ]]; then
+    pass "Second cleanup run is a no-op (file already absent)"
+  else
+    fail "Second cleanup run did not treat absent file as no-op"
+  fi
+else
+  warn "Skipping Test 44a/44d: shipped release.md blob $RETIRED_LAST_SHIPPED_BLOB unreachable (shallow clone?)"
+fi
+echo ""
+
+# Test 44b: a consumer-modified retired file (hash matches none) is preserved.
+echo "Test 44b: Consumer-modified release.md is preserved"
+RETIRED_KEEP_REPO="$TEST_DIR/retired-keep-test"
+create_temp_repo "$RETIRED_KEEP_REPO"
+mkdir -p "$RETIRED_KEEP_REPO/$(dirname "$RETIRED_RELEASE_PATH")"
+printf '# my customized release skill\nlocal edits here\n' \
+  > "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH"
+git -C "$RETIRED_KEEP_REPO" add "$RETIRED_RELEASE_PATH"
+git -C "$RETIRED_KEEP_REPO" commit -m "Add customized release.md" --quiet
+if [[ "$(retired_decision "$RETIRED_KEEP_REPO")" == "PRESERVE" ]]; then
+  pass "Consumer-modified release.md gated for preservation"
+else
+  fail "Consumer-modified release.md not preserved (hash matched allowlist unexpectedly)"
+fi
+if [[ -f "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH" ]]; then
+  pass "Consumer-modified release.md left on disk"
+else
+  fail "Consumer-modified release.md was removed (should be preserved)"
+fi
+echo ""
+
+# Test 44c: absent retired file is a no-op (no error, no removal).
+echo "Test 44c: Absent release.md is a no-op"
+RETIRED_ABSENT_REPO="$TEST_DIR/retired-absent-test"
+create_temp_repo "$RETIRED_ABSENT_REPO"
+if [[ "$(retired_decision "$RETIRED_ABSENT_REPO")" == "NONE" ]]; then
+  pass "Absent release.md yields no cleanup action"
+else
+  fail "Absent release.md did not yield a no-op"
+fi
+echo ""
+
+# Drift guard: the test mirror's digests must match install-loom.sh.
+assert_retired_allowlist_in_sync
+echo ""
+
+
+# ==========================================================================
 # Section 8: Flag Rejection Tests (#3423 acceptance criteria)
 # ==========================================================================
 # The unknown-flag guard in install-loom.sh (lines ~120-124) fires before any
@@ -1327,6 +1497,75 @@ if echo "$STDERR_45" | grep -q 'install\.sh'; then
   pass "flag-rejection stderr contains 'install.sh' hint text"
 else
   fail "flag-rejection stderr is missing 'install.sh' hint (stderr=$STDERR_45)"
+fi
+echo ""
+
+# ==========================================================================
+# Section 8b: Wrapper Pass-Through Flags (#3650)
+# ==========================================================================
+# The top-level install.sh wrapper previously rejected --allow-non-main-source
+# and --allow-stale-target with "Unknown flag" even though it suggested the
+# former in its own delegated installer, and its delegation execs forwarded
+# only --yes/$FORCE_FLAG. These tests verify the wrapper now accepts and
+# forwards the two source/target override flags that scripts/install-loom.sh
+# already honors.
+echo "--- Section 8b: Wrapper Pass-Through Flags (#3650) ---"
+echo ""
+
+# Test 48: install.sh --allow-non-main-source is NOT rejected as an unknown flag.
+# Trailing --help makes the parser exit 0 after accumulating the pass-through
+# flag, so no real install runs. A rejected flag would error before --help.
+echo "Test 48: install.sh accepts --allow-non-main-source (no 'Unknown flag')"
+OUT_48=$("$WRAPPER_SCRIPT" --allow-non-main-source --help 2>&1 || true)
+if echo "$OUT_48" | grep -q 'Unknown flag'; then
+  fail "install.sh rejected --allow-non-main-source (out=$OUT_48)"
+elif echo "$OUT_48" | grep -q 'Usage:'; then
+  pass "--allow-non-main-source accepted (parser reached --help)"
+else
+  fail "install.sh --allow-non-main-source produced unexpected output (out=$OUT_48)"
+fi
+echo ""
+
+# Test 49: install.sh --allow-stale-target is likewise accepted.
+echo "Test 49: install.sh accepts --allow-stale-target (no 'Unknown flag')"
+OUT_49=$("$WRAPPER_SCRIPT" --allow-stale-target --help 2>&1 || true)
+if echo "$OUT_49" | grep -q 'Unknown flag'; then
+  fail "install.sh rejected --allow-stale-target (out=$OUT_49)"
+elif echo "$OUT_49" | grep -q 'Usage:'; then
+  pass "--allow-stale-target accepted (parser reached --help)"
+else
+  fail "install.sh --allow-stale-target produced unexpected output (out=$OUT_49)"
+fi
+echo ""
+
+# Test 50: a genuinely unknown flag is still rejected by install.sh.
+echo "Test 50: install.sh still rejects a genuinely unknown flag"
+OUT_50=$("$WRAPPER_SCRIPT" --bogus /tmp/fakepath 2>&1 || true)
+if echo "$OUT_50" | grep -q 'Unknown flag: --bogus'; then
+  pass "--bogus rejected with 'Unknown flag: --bogus'"
+else
+  fail "install.sh should reject --bogus with 'Unknown flag' (out=$OUT_50)"
+fi
+echo ""
+
+# Test 51: install.sh --help documents the two pass-through flags.
+echo "Test 51: install.sh --help lists the pass-through flags"
+OUT_51=$("$WRAPPER_SCRIPT" --help 2>&1 || true)
+if echo "$OUT_51" | grep -q -- '--allow-non-main-source' && echo "$OUT_51" | grep -q -- '--allow-stale-target'; then
+  pass "--help documents --allow-non-main-source and --allow-stale-target"
+else
+  fail "install.sh --help is missing pass-through flag documentation (out=$OUT_51)"
+fi
+echo ""
+
+# Test 52: both Full-Install delegation execs forward the pass-through array so
+# the accepted flags actually reach scripts/install-loom.sh.
+echo "Test 52: install.sh forwards SOURCE_OVERRIDE_FLAGS at both delegation execs"
+FORWARD_COUNT=$(grep -c 'install-loom.sh".*SOURCE_OVERRIDE_FLAGS\[@\]' "$WRAPPER_SCRIPT" || true)
+if [[ "$FORWARD_COUNT" -eq 2 ]]; then
+  pass "both delegation execs forward SOURCE_OVERRIDE_FLAGS (count=$FORWARD_COUNT)"
+else
+  fail "expected 2 delegation execs forwarding SOURCE_OVERRIDE_FLAGS, found $FORWARD_COUNT"
 fi
 echo ""
 
@@ -1758,14 +1997,13 @@ else
       pass "All defaults/.loom-internal.list entries absent from consumer tree"
     fi
 
-    # Issue #3495: release.md is now generalized and SHIPS to consumers
-    # (it discovers version files via `./scripts/version.sh list` and uses
-    # `{{workspace}}` for the project name). Pin its presence so a future
-    # regression that re-adds it to .loom-internal.list fails this test.
-    if [[ -f "$INTERNAL_REPO/.claude/commands/loom/release.md" ]]; then
-      pass "#3495: generalized .claude/commands/loom/release.md ships to consumers"
+    # Issue #3563: the /loom:release skill was retired in favor of
+    # /repo:release (rjwalters/repo). Loom no longer ships release.md; pin its
+    # absence so a future regression that re-adds it fails this test.
+    if [[ ! -f "$INTERNAL_REPO/.claude/commands/loom/release.md" ]]; then
+      pass "#3563: retired .claude/commands/loom/release.md does not ship to consumers"
     else
-      fail "#3495: .claude/commands/loom/release.md missing from consumer install"
+      fail "#3563: .claude/commands/loom/release.md should not be installed (skill retired)"
     fi
 
     # The siblings must continue to ship — pin three representative skills.
@@ -1781,7 +2019,7 @@ else
     fi
 
     # #3468 AC1: the new generic /loom:bump skill must ship to consumers.
-    # (It is the public counterpart to the Loom-internal /loom:release skill.)
+    # (It is the lightweight quick-bump; full releases use /repo:release.)
     if [[ -f "$INTERNAL_REPO/.claude/commands/loom/bump.md" ]]; then
       pass "AC1 (#3468): /loom:bump skill ships to consumers"
     else
@@ -1994,179 +2232,11 @@ echo ""
 
 
 # ==========================================================================
-# Section 11: Customized release.md migration (#3495)
+# Section 11: version.sh discovery interface (#3468)
 # ==========================================================================
-# These tests exercise the migration logic that install-loom.sh runs around
-# the loom-daemon init step: snapshot any pre-existing
-# `.claude/commands/loom/release.md`, then after init compare the snapshot
-# against the canonical defaults/ version and restore-vs-overwrite based on
-# operator flags. The block is self-contained in install-loom.sh (it uses
-# only NON_INTERACTIVE / FORCE_OVERWRITE and the snapshot path) so we
-# replay the exact shell shape here against controlled fixtures.
-
-# Helper: run the migration logic with a given pre-init disk content and
-# the given (NON_INTERACTIVE, FORCE_OVERWRITE) combination. Echoes the
-# post-migration on-disk content so the caller can assert.
-#
-# Args:
-#   $1  pre-init disk content for .claude/commands/loom/release.md
-#       (empty string means "no pre-existing file")
-#   $2  canonical defaults content (what daemon init writes after snapshot)
-#   $3  NON_INTERACTIVE  (true|false)
-#   $4  FORCE_OVERWRITE  (true|false)
-#   $5  interactive input fed via stdin (only consulted when both flags are false)
-#
-# Returns the final on-disk content via stdout.
-run_release_md_migration() {
-  local pre_init_content="$1"
-  local canonical_content="$2"
-  local non_interactive="$3"
-  local force_overwrite="$4"
-  local interactive_input="$5"
-
-  local sandbox
-  sandbox="$(mktemp -d)"
-  local loom_root_fake="$sandbox/loom-root"
-  local target="$sandbox/target"
-
-  mkdir -p "$loom_root_fake/defaults/.claude/commands/loom"
-  mkdir -p "$target/.claude/commands/loom"
-  printf '%s' "$canonical_content" > "$loom_root_fake/defaults/.claude/commands/loom/release.md"
-
-  # Replicate the "snapshot before init" step from install-loom.sh.
-  local RELEASE_MD_REL=".claude/commands/loom/release.md"
-  local RELEASE_MD_SNAPSHOT=""
-  if [[ -n "$pre_init_content" ]]; then
-    printf '%s' "$pre_init_content" > "$target/$RELEASE_MD_REL"
-    RELEASE_MD_SNAPSHOT="$(mktemp)"
-    cp "$target/$RELEASE_MD_REL" "$RELEASE_MD_SNAPSHOT"
-  fi
-
-  # Simulate loom-daemon init's overwrite-with-canonical behavior.
-  cp "$loom_root_fake/defaults/$RELEASE_MD_REL" "$target/$RELEASE_MD_REL"
-
-  # Inline the migration block from install-loom.sh against the local
-  # sandbox. The block must read identically — if it diverges from the
-  # installer, the test stops being a regression gate.
-  local NON_INTERACTIVE="$non_interactive"
-  local FORCE_OVERWRITE="$force_overwrite"
-  local LOOM_ROOT="$loom_root_fake"
-  (
-    cd "$target"
-    if [[ -n "${RELEASE_MD_SNAPSHOT:-}" ]] && [[ -f "$RELEASE_MD_SNAPSHOT" ]]; then
-      CANONICAL_RELEASE_MD="$LOOM_ROOT/defaults/$RELEASE_MD_REL"
-      if [[ -f "$CANONICAL_RELEASE_MD" ]] && ! cmp -s "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD"; then
-        PRESERVE_RELEASE_MD=true
-        if [[ "$FORCE_OVERWRITE" == "true" ]]; then
-          PRESERVE_RELEASE_MD=false
-        elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-          : # preserve silently
-        else
-          # Interactive: consume the canned answer from stdin.
-          while read -r CONFIRM_RELEASE_MD; do
-            case "$CONFIRM_RELEASE_MD" in
-              y|Y) PRESERVE_RELEASE_MD=false; break ;;
-              n|N|"") break ;;
-              d|D) continue ;;
-              *) continue ;;
-            esac
-          done
-        fi
-        if [[ "$PRESERVE_RELEASE_MD" == "true" ]]; then
-          cp "$RELEASE_MD_SNAPSHOT" "$RELEASE_MD_REL"
-        fi
-      fi
-      rm -f "$RELEASE_MD_SNAPSHOT"
-    fi
-  ) <<< "$interactive_input" >/dev/null 2>&1
-
-  cat "$target/$RELEASE_MD_REL"
-  rm -rf "$sandbox"
-}
-
-echo "--- Section 11: Customized release.md migration (#3495) ---"
-echo ""
-
-CUSTOM_RELEASE="# Custom Anvil release\nThis was forked."
-CANONICAL_RELEASE="# Release Manager\nYou are preparing a release of **{{workspace}}**."
-
-# Test 55: --yes (NON_INTERACTIVE) preserves customization silently
-echo "Test 55: --yes preserves customized release.md silently"
-RESULT_55=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "true" "false" "")
-if [[ "$RESULT_55" == "$(printf '%s' "$CUSTOM_RELEASE")" ]]; then
-  pass "--yes mode preserved customized release.md"
-else
-  fail "--yes mode should have preserved customization; got: $RESULT_55"
-fi
-
-# Test 56: --force replaces with canonical
-echo "Test 56: --force replaces customized release.md with canonical"
-RESULT_56=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "true" "")
-if [[ "$RESULT_56" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
-  pass "--force replaced customized release.md with canonical"
-else
-  fail "--force should have replaced with canonical; got: $RESULT_56"
-fi
-
-# Test 57: interactive default (empty/N) preserves customization
-echo "Test 57: Interactive default (N) preserves customization"
-RESULT_57=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "false" "")
-if [[ "$RESULT_57" == "$(printf '%s' "$CUSTOM_RELEASE")" ]]; then
-  pass "Interactive default (N) preserved customization"
-else
-  fail "Interactive default should preserve; got: $RESULT_57"
-fi
-
-# Test 58: interactive y replaces with canonical
-echo "Test 58: Interactive 'y' replaces customization with canonical"
-RESULT_58=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "false" "y")
-if [[ "$RESULT_58" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
-  pass "Interactive 'y' replaced customization with canonical"
-else
-  fail "Interactive 'y' should replace with canonical; got: $RESULT_58"
-fi
-
-# Test 59: idempotency — when pre-init matches canonical, no detection
-echo "Test 59: Identical pre-init and canonical → no migration prompt path"
-RESULT_59=$(run_release_md_migration "$CANONICAL_RELEASE" "$CANONICAL_RELEASE" "false" "false" "")
-if [[ "$RESULT_59" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
-  pass "Identical content → canonical kept (no detection path triggered)"
-else
-  fail "Identical content should be no-op; got: $RESULT_59"
-fi
-
-# Test 60: fresh install (no pre-existing) — canonical is kept
-echo "Test 60: Fresh install (no pre-existing release.md) keeps canonical"
-RESULT_60=$(run_release_md_migration "" "$CANONICAL_RELEASE" "false" "false" "")
-if [[ "$RESULT_60" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
-  pass "Fresh install keeps canonical (no snapshot path)"
-else
-  fail "Fresh install should keep canonical; got: $RESULT_60"
-fi
-
-# Test 61: the release.md skill discovers files via ./scripts/version.sh list
-echo "Test 61: release.md skill discovers version files via './scripts/version.sh list'"
-RELEASE_MD_SHIPPED="$LOOM_ROOT/defaults/.claude/commands/loom/release.md"
-if [[ -f "$RELEASE_MD_SHIPPED" ]]; then
-  if grep -q '\./scripts/version\.sh list' "$RELEASE_MD_SHIPPED"; then
-    pass "release.md uses './scripts/version.sh list' for discovery"
-  else
-    fail "release.md does not invoke './scripts/version.sh list'"
-  fi
-  if grep -q '{{workspace}}' "$RELEASE_MD_SHIPPED"; then
-    pass "release.md uses {{workspace}} for project name"
-  else
-    fail "release.md missing {{workspace}} for project name"
-  fi
-  # The Loom-specific bullets should no longer be present in the generic skill.
-  if ! grep -qE 'ForgeClient|loom-daemon binaries' "$RELEASE_MD_SHIPPED"; then
-    pass "release.md does not name Loom-specific symbols (ForgeClient, loom-daemon binaries)"
-  else
-    fail "release.md still references Loom-specific symbols"
-  fi
-else
-  fail "release.md skill not present at $RELEASE_MD_SHIPPED"
-fi
+# The /loom:release skill was retired in favor of /repo:release (#3563), but
+# scripts/version.sh is retained — /repo:release detects and honors it as its
+# first-priority version tool. These tests pin version.sh's list/check surface.
 
 # Test 62: ./scripts/version.sh list emits the expected 5 entries
 echo "Test 62: 'scripts/version.sh list' emits the 5 version-bearing files"
@@ -2195,6 +2265,408 @@ else
 fi
 echo ""
 
+
+# ==========================================================================
+# Section 12: Local-mode uninstall staging scope (#3545)
+# ==========================================================================
+
+# Test 64: Local-mode uninstall stages ONLY Loom-managed paths, never
+# unrelated user changes. Regression guard for #3545: the old bare
+# `git add -A` in Step 8 (local mode) swept in any pending user work —
+# an in-progress edit or an embedded worktree — which the install.sh
+# --quick reinstall path would then fold into its commit guidance.
+echo "Test 64: Local uninstall stages only Loom paths, not user changes (#3545)"
+SCOPE_REPO="$TEST_DIR/scoped-staging-test"
+create_temp_repo "$SCOPE_REPO"
+simulate_loom_install "$SCOPE_REPO"
+
+# Commit a baseline that includes a tracked user file alongside the Loom install.
+mkdir -p "$SCOPE_REPO/src"
+echo "original" > "$SCOPE_REPO/src/app.txt"
+git -C "$SCOPE_REPO" add -A
+git -C "$SCOPE_REPO" commit -m "loom install + user file" --quiet
+
+# Dirty the tree the way a user mid-edit would: modify a tracked file and drop
+# an untracked file (mimics the .claude/worktrees/agent-*/ near-miss in #3545).
+echo "user edit" >> "$SCOPE_REPO/src/app.txt"
+mkdir -p "$SCOPE_REPO/user-junk"
+echo "scratch" > "$SCOPE_REPO/user-junk/notes.txt"
+
+"$UNINSTALL_SCRIPT" --yes --local "$SCOPE_REPO" > /dev/null 2>&1 || true
+
+# The untracked user file must remain untracked/unstaged (?? in porcelain).
+if git -C "$SCOPE_REPO" status --porcelain -- user-junk/notes.txt | grep -q '^??'; then
+  pass "Untracked user file left unstaged by local uninstall (#3545)"
+else
+  fail "Untracked user file was staged by local uninstall (bare 'git add -A' regression, #3545)"
+fi
+
+# The modified tracked user file must remain a working-tree modification ( M).
+if git -C "$SCOPE_REPO" status --porcelain -- src/app.txt | grep -q '^ M'; then
+  pass "Modified tracked user file left unstaged by local uninstall (#3545)"
+else
+  fail "Modified tracked user file was staged by local uninstall (#3545)"
+fi
+
+# Loom file deletions MUST still be staged — that is the uninstall's job.
+if git -C "$SCOPE_REPO" diff --staged --name-only | grep -q '^\.loom/'; then
+  pass "Loom file deletions staged by local uninstall (scoped staging still works)"
+else
+  fail "Loom file deletions were not staged by local uninstall (#3545 over-scoped)"
+fi
+echo ""
+
+
+# Test 65: Reinstall preserves consumer config.json keys (worktree.root) (#3598)
+# A committed .loom/config.json carrying a `worktree.root` override must retain
+# that key when the merge-aware daemon init runs over an existing consumer file
+# (the reinstall path snapshots/restores config.json around the chained
+# uninstall so init's merge sees it). This exercises the REAL `loom-daemon init`
+# — the merge lives in loom-daemon::init::merge_config_file, which
+# simulate_loom_install's bare `cp` does not cover. Also asserts idempotency:
+# a second init leaves config.json byte-identical.
+echo "Test 65: Reinstall preserves consumer config.json worktree.root override (#3598)"
+DAEMON_BIN_65="$LOOM_ROOT/target/release/loom-daemon"
+if [[ ! -x "$DAEMON_BIN_65" ]]; then
+  warn "Skipping Test 65 — loom-daemon release binary not built at $DAEMON_BIN_65"
+else
+  CONFIG_MERGE_REPO="$TEST_DIR/config-merge-test"
+  create_temp_repo "$CONFIG_MERGE_REPO"
+
+  # Seed a committed consumer config.json with a load-bearing worktree.root
+  # override plus an unknown consumer key, before Loom is installed.
+  mkdir -p "$CONFIG_MERGE_REPO/.loom"
+  cat > "$CONFIG_MERGE_REPO/.loom/config.json" <<'CFG_EOF'
+{
+  "version": "2",
+  "worktree": { "root": "/Volumes/Stripe" },
+  "customConsumerKey": "keep-me"
+}
+CFG_EOF
+
+  if "$DAEMON_BIN_65" init --force --defaults "$LOOM_ROOT/defaults" "$CONFIG_MERGE_REPO" >/dev/null 2>&1; then
+    MERGED_CFG="$CONFIG_MERGE_REPO/.loom/config.json"
+
+    # The worktree.root override must survive the merge.
+    if grep -q '/Volumes/Stripe' "$MERGED_CFG"; then
+      pass "worktree.root override preserved through merge-aware init (#3598)"
+    else
+      fail "worktree.root override was dropped by init (#3598 regression)"
+    fi
+
+    # An unknown consumer key must survive too (deep merge, existing wins).
+    if grep -q 'customConsumerKey' "$MERGED_CFG"; then
+      pass "unknown consumer key preserved through merge-aware init (#3598)"
+    else
+      fail "unknown consumer key was dropped by init (#3598 regression)"
+    fi
+
+    # Newly shipped template keys must still be delivered on upgrade.
+    if grep -q 'health_monitoring' "$MERGED_CFG"; then
+      pass "template keys still delivered alongside preserved consumer keys (#3598)"
+    else
+      fail "template keys missing after merge (#3598)"
+    fi
+
+    # Idempotency: a second init must leave config.json byte-identical.
+    CFG_AFTER_FIRST="$(cat "$MERGED_CFG")"
+    "$DAEMON_BIN_65" init --force --defaults "$LOOM_ROOT/defaults" "$CONFIG_MERGE_REPO" >/dev/null 2>&1 || true
+    CFG_AFTER_SECOND="$(cat "$MERGED_CFG")"
+    if [[ "$CFG_AFTER_FIRST" == "$CFG_AFTER_SECOND" ]]; then
+      pass "config.json merge is idempotent across repeat reinstalls (#3598)"
+    else
+      fail "config.json changed on a second reinstall (non-idempotent merge, #3598)"
+    fi
+  else
+    fail "loom-daemon init failed against consumer repo with pre-existing config.json (#3598)"
+  fi
+fi
+echo ""
+
+
+# ==========================================================================
+# Dogfood commands scoped-symlink (issue #3682)
+# ==========================================================================
+# The dogfood block in install-loom.sh only fires when TARGET == LOOM_ROOT
+# (installing loom onto its own source repo), so the full installer cannot be
+# exercised against a temp repo. The symlink logic is extracted into
+# scripts/install/dogfood-commands.sh (`link_dogfood_commands`), which these
+# tests source and drive directly in an isolated sandbox.
+echo "=== Dogfood commands scoped-symlink (#3682) ==="
+
+DOGFOOD_HELPER="$LOOM_ROOT/scripts/install/dogfood-commands.sh"
+
+# Test 66: the helper exists and is sourceable.
+echo "Test 66: dogfood-commands.sh helper exists and defines link_dogfood_commands"
+if [[ -f "$DOGFOOD_HELPER" ]] && ( set +e; source "$DOGFOOD_HELPER"; declare -F link_dogfood_commands >/dev/null ); then
+  pass "link_dogfood_commands is defined by scripts/install/dogfood-commands.sh"
+else
+  fail "link_dogfood_commands not found in scripts/install/dogfood-commands.sh"
+fi
+
+# Test 67: install-loom.sh no longer materializes a COPY, and calls the linker.
+echo "Test 67: install-loom.sh uses the scoped symlink, not the old copy block"
+if grep -q 'link_dogfood_commands "\$TARGET_PATH"' "$INSTALL_SCRIPT" \
+   && ! grep -q 'Materialized .claude/commands/loom/ (real copy' "$INSTALL_SCRIPT"; then
+  pass "install-loom.sh calls link_dogfood_commands and dropped the copy-and-swap"
+else
+  fail "install-loom.sh still materializes a copy or does not call link_dogfood_commands"
+fi
+
+# Build an isolated sandbox that mimics a loom source repo: a defaults/ tree
+# plus a real .claude/commands/ destination dir.
+DOGFOOD_SANDBOX="$TEST_DIR/dogfood-sandbox"
+mkdir -p "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom"
+echo "builder source of truth" > "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom/builder.md"
+echo "judge source of truth" > "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom/judge.md"
+
+# Drive the helper in a subshell so its fallback logging funcs don't leak.
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX"
+) > /dev/null 2>&1
+
+CMD_LOOM_LINK="$DOGFOOD_SANDBOX/.claude/commands/loom"
+
+# Test 68: `.claude/commands/loom` is a symlink to the relative defaults path.
+echo "Test 68: .claude/commands/loom is a relative symlink into defaults/"
+if [[ -L "$CMD_LOOM_LINK" ]] && [[ "$(readlink "$CMD_LOOM_LINK")" == "../../defaults/.claude/commands/loom" ]]; then
+  pass ".claude/commands/loom -> ../../defaults/.claude/commands/loom"
+else
+  fail ".claude/commands/loom is not the expected relative symlink (got: $(readlink "$CMD_LOOM_LINK" 2>/dev/null || echo '<not a symlink>'))"
+fi
+
+# Test 69: `.claude/commands/` itself stays a REAL directory (not a symlink).
+echo "Test 69: .claude/commands parent stays a real directory"
+if [[ -d "$DOGFOOD_SANDBOX/.claude/commands" ]] && [[ ! -L "$DOGFOOD_SANDBOX/.claude/commands" ]]; then
+  pass ".claude/commands is a real directory (parent not symlinked)"
+else
+  fail ".claude/commands is missing or is itself a symlink"
+fi
+
+# Test 70: content resolves through the symlink to defaults/ (no drift possible).
+echo "Test 70: command content resolves through the symlink to defaults/"
+if [[ "$(cat "$CMD_LOOM_LINK/builder.md" 2>/dev/null)" == "builder source of truth" ]]; then
+  pass "reads through the symlink return the defaults/ source of truth"
+else
+  fail "content behind .claude/commands/loom/builder.md did not resolve to defaults/"
+fi
+
+# Test 71: #3565 safety — a co-installed tool writing a SIBLING namespace does
+# NOT pollute defaults/, and does NOT write through the loom symlink.
+echo "Test 71: sibling namespace write does not pollute defaults/ (#3565 safety)"
+mkdir -p "$DOGFOOD_SANDBOX/.claude/commands/repo"
+echo "repo lint command" > "$DOGFOOD_SANDBOX/.claude/commands/repo/lint.md"
+if [[ -f "$DOGFOOD_SANDBOX/.claude/commands/repo/lint.md" ]] \
+   && [[ ! -e "$DOGFOOD_SANDBOX/defaults/.claude/commands/repo" ]]; then
+  pass "sibling .claude/commands/repo/ is a real dir; defaults/ untouched"
+else
+  fail "sibling namespace leaked into defaults/ (#3565 regression)"
+fi
+
+# Test 72: idempotent — re-running leaves the symlink correct and unchanged.
+echo "Test 72: link_dogfood_commands is idempotent"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX"
+) > /dev/null 2>&1
+if [[ -L "$CMD_LOOM_LINK" ]] && [[ "$(readlink "$CMD_LOOM_LINK")" == "../../defaults/.claude/commands/loom" ]]; then
+  pass "second invocation keeps the symlink correct"
+else
+  fail "second invocation left the symlink in an unexpected state"
+fi
+
+# Test 73: replaces a pre-existing real (stale copy) directory with the symlink.
+echo "Test 73: a stale real copy is replaced by the symlink"
+DOGFOOD_SANDBOX2="$TEST_DIR/dogfood-sandbox2"
+mkdir -p "$DOGFOOD_SANDBOX2/defaults/.claude/commands/loom"
+echo "fresh builder" > "$DOGFOOD_SANDBOX2/defaults/.claude/commands/loom/builder.md"
+# Pre-seed a stale materialized copy (byte-different from defaults).
+mkdir -p "$DOGFOOD_SANDBOX2/.claude/commands/loom"
+echo "STALE builder copy" > "$DOGFOOD_SANDBOX2/.claude/commands/loom/builder.md"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX2"
+) > /dev/null 2>&1
+CMD_LOOM_LINK2="$DOGFOOD_SANDBOX2/.claude/commands/loom"
+if [[ -L "$CMD_LOOM_LINK2" ]] && [[ "$(cat "$CMD_LOOM_LINK2/builder.md")" == "fresh builder" ]]; then
+  pass "stale real copy replaced by symlink resolving to defaults/"
+else
+  fail "stale real copy was not replaced by the symlink"
+fi
+
+# Test 74: local-only files in the stale copy are preserved (not silently lost).
+echo "Test 74: refuses to clobber local-only files not present in defaults/"
+DOGFOOD_SANDBOX3="$TEST_DIR/dogfood-sandbox3"
+mkdir -p "$DOGFOOD_SANDBOX3/defaults/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX3/defaults/.claude/commands/loom/builder.md"
+mkdir -p "$DOGFOOD_SANDBOX3/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX3/.claude/commands/loom/builder.md"
+echo "local only" > "$DOGFOOD_SANDBOX3/.claude/commands/loom/local-only.md"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX3"
+) > /dev/null 2>&1
+CMD_LOOM_LINK3="$DOGFOOD_SANDBOX3/.claude/commands/loom"
+if [[ ! -L "$CMD_LOOM_LINK3" ]] && [[ -f "$CMD_LOOM_LINK3/local-only.md" ]]; then
+  pass "local-only file preserved; refused to replace with symlink"
+else
+  fail "local-only file lost or dir replaced despite local-only content"
+fi
+
+# Test 75: a legacy whole-dir .claude/commands symlink is removed and rebuilt.
+echo "Test 75: legacy whole-dir .claude/commands symlink is replaced"
+DOGFOOD_SANDBOX4="$TEST_DIR/dogfood-sandbox4"
+mkdir -p "$DOGFOOD_SANDBOX4/defaults/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX4/defaults/.claude/commands/loom/builder.md"
+mkdir -p "$DOGFOOD_SANDBOX4/.claude"
+# Legacy: whole .claude/commands is a symlink into defaults/.claude/commands.
+mkdir -p "$DOGFOOD_SANDBOX4/defaults/.claude/commands"
+( cd "$DOGFOOD_SANDBOX4/.claude" && ln -s "../defaults/.claude/commands" commands )
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX4"
+) > /dev/null 2>&1
+if [[ ! -L "$DOGFOOD_SANDBOX4/.claude/commands" ]] \
+   && [[ -d "$DOGFOOD_SANDBOX4/.claude/commands" ]] \
+   && [[ -L "$DOGFOOD_SANDBOX4/.claude/commands/loom" ]]; then
+  pass "legacy whole-dir symlink removed; parent real, loom/ symlinked"
+else
+  fail "legacy whole-dir .claude/commands symlink was not correctly replaced"
+fi
+
+echo ""
+
+
+# ==========================================================================
+# Test: check-phantom-labels.sh (role prompts reference only real labels, #3786)
+# ==========================================================================
+echo "Test: check-phantom-labels.sh detects phantom labels and passes the real tree"
+PHANTOM_LINT="$DEFAULTS_DIR/scripts/check-phantom-labels.sh"
+if [[ ! -x "$PHANTOM_LINT" ]]; then
+  fail "check-phantom-labels.sh missing or not executable"
+else
+  # (a) The real defaults/ tree must be clean.
+  if bash "$PHANTOM_LINT" "$LOOM_ROOT" >/dev/null 2>&1; then
+    pass "check-phantom-labels passes against the real defaults/ tree"
+  else
+    fail "check-phantom-labels flagged the real defaults/ tree (should be clean)"
+  fi
+
+  # (b) A fixture with an injected phantom label in application context must fail.
+  PHANTOM_FIX="$(mktemp -d)"
+  mkdir -p "$PHANTOM_FIX/.github" "$PHANTOM_FIX/defaults/.github" "$PHANTOM_FIX/defaults/roles"
+  printf -- '- name: loom:issue\n  color: "3B82F6"\n' > "$PHANTOM_FIX/.github/labels.yml"
+  printf -- '- name: loom:issue\n  color: "3B82F6"\n' > "$PHANTOM_FIX/defaults/.github/labels.yml"
+  printf 'Do this: gh issue edit 1 --add-label "loom:ghost-label"\n' > "$PHANTOM_FIX/defaults/roles/x.md"
+  PHANTOM_OUT="$(bash "$PHANTOM_LINT" "$PHANTOM_FIX" 2>&1)" && PHANTOM_RC=0 || PHANTOM_RC=$?
+  if [[ "$PHANTOM_RC" -ne 0 ]] && echo "$PHANTOM_OUT" | grep -q "loom:ghost-label"; then
+    pass "check-phantom-labels fails (exit $PHANTOM_RC) and names the injected phantom label"
+  else
+    fail "check-phantom-labels did not catch the injected phantom label (rc=$PHANTOM_RC)"
+  fi
+
+  # (c) The same fixture with a real label in application context must pass —
+  #     the /loom:sweep command name and a prose-only label mention (each on a
+  #     line WITHOUT a label-application flag) are structurally ignored, so
+  #     neither false-positives even though they are not in the fixture registry.
+  {
+    printf 'Run /loom:sweep for the full lifecycle.\n'
+    printf 'Mind the `loom:curating` label, which prevents Curator overlap.\n'
+    printf 'Then apply the real label: gh issue edit 1 --add-label "loom:issue"\n'
+  } > "$PHANTOM_FIX/defaults/roles/x.md"
+  if bash "$PHANTOM_LINT" "$PHANTOM_FIX" >/dev/null 2>&1; then
+    pass "check-phantom-labels passes on a real label and ignores /loom:sweep + prose"
+  else
+    fail "check-phantom-labels false-positived on a real label or command name"
+  fi
+  rm -rf "$PHANTOM_FIX"
+fi
+echo ""
+
+# ==========================================================================
+# Test: check-labels-drift.sh (root vs defaults labels.yml parity, #3896)
+# ==========================================================================
+echo "Test: check-labels-drift.sh detects drift and passes the in-sync real tree"
+DRIFT_LINT="$DEFAULTS_DIR/scripts/check-labels-drift.sh"
+if [[ ! -x "$DRIFT_LINT" ]]; then
+  fail "check-labels-drift.sh missing or not executable"
+else
+  # (a) The real tree ships the two labels.yml copies byte-identical.
+  if bash "$DRIFT_LINT" "$LOOM_ROOT" >/dev/null 2>&1; then
+    pass "check-labels-drift passes against the real (in-sync) tree"
+  else
+    fail "check-labels-drift flagged the real tree (labels.yml copies should match)"
+  fi
+
+  # (b) A fixture whose defaults/ copy is missing a label must fail.
+  DRIFT_FIX="$(mktemp -d)"
+  mkdir -p "$DRIFT_FIX/.github" "$DRIFT_FIX/defaults/.github"
+  cp "$LOOM_ROOT/.github/labels.yml" "$DRIFT_FIX/.github/labels.yml"
+  grep -v 'loom:auditor-capability-request' "$LOOM_ROOT/.github/labels.yml" \
+    > "$DRIFT_FIX/defaults/.github/labels.yml"
+  DRIFT_OUT="$(bash "$DRIFT_LINT" "$DRIFT_FIX" 2>&1)" && DRIFT_RC=0 || DRIFT_RC=$?
+  if [[ "$DRIFT_RC" -ne 0 ]] && echo "$DRIFT_OUT" | grep -q "drifted"; then
+    pass "check-labels-drift fails (exit $DRIFT_RC) when the copies diverge"
+  else
+    fail "check-labels-drift did not catch the injected drift (rc=$DRIFT_RC)"
+  fi
+
+  # (c) The same fixture with identical copies must pass.
+  cp "$LOOM_ROOT/.github/labels.yml" "$DRIFT_FIX/defaults/.github/labels.yml"
+  if bash "$DRIFT_LINT" "$DRIFT_FIX" >/dev/null 2>&1; then
+    pass "check-labels-drift passes when the two copies are identical"
+  else
+    fail "check-labels-drift false-positived on identical copies"
+  fi
+  rm -rf "$DRIFT_FIX"
+fi
+echo ""
+
+# ==========================================================================
+# Test: install-loom.sh guidance points at shipped script paths (#3923)
+#
+# The post-install "Next Steps" and the active-session refusal guidance name
+# script paths the user is told to run. The historical ./.loom/scripts/daemon.sh
+# was removed in #3432; guidance must reference only surfaces that actually ship
+# in defaults/. This smoke check extracts every ./.loom/... path named in the
+# installer's user-facing output and asserts it maps to a real file in defaults/.
+# ==========================================================================
+echo "Test: install-loom.sh guidance names only shipped ./.loom/ script paths"
+GUIDANCE_MISSING=""
+# Pull the ./.loom/... tokens the installer prints in echo/error guidance lines.
+GUIDANCE_PATHS=$(grep -oE '\./\.loom/[A-Za-z0-9._/-]+' "$INSTALL_SCRIPT" \
+  "$LOOM_ROOT/scripts/install/create-pr.sh" | sed 's/^[^:]*://' | sort -u)
+for gp in $GUIDANCE_PATHS; do
+  # Strip the leading ./ and map the installed path back to its defaults/ source:
+  #   .loom/bin/loom       -> defaults/.loom/bin/loom
+  #   .loom/scripts/foo.sh -> defaults/scripts/foo.sh
+  rel="${gp#./}"
+  case "$rel" in
+    .loom/bin/*)     src="$DEFAULTS_DIR/$rel" ;;          # defaults/.loom/bin/loom
+    .loom/scripts/*) src="$DEFAULTS_DIR/${rel#.loom/}" ;; # defaults/scripts/...
+    *)               src="$DEFAULTS_DIR/${rel#.loom/}" ;;
+  esac
+  if [[ ! -e "$src" ]]; then
+    GUIDANCE_MISSING="$GUIDANCE_MISSING\n  $gp -> $src (not shipped)"
+  fi
+done
+# Belt-and-suspenders: the removed daemon.sh must never reappear in guidance.
+if grep -qE '\./\.loom/scripts/daemon\.sh' "$INSTALL_SCRIPT" \
+  "$LOOM_ROOT/scripts/install/create-pr.sh"; then
+  GUIDANCE_MISSING="$GUIDANCE_MISSING\n  ./.loom/scripts/daemon.sh referenced (removed in #3432)"
+fi
+if [[ -z "$GUIDANCE_MISSING" ]]; then
+  pass "all ./.loom/ paths in install guidance exist in defaults/"
+else
+  fail "install guidance references non-shipped paths:$(echo -e "$GUIDANCE_MISSING")"
+fi
+echo ""
 
 # ==========================================================================
 # Summary

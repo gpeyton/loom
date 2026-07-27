@@ -27,12 +27,22 @@
 //! | `sweep.issue.{N}.crashed` | Daemon reaper | `{checkpoint_phase}` |
 //! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
+//! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
+//! | `daemon.capacity.advisory` | Work finder | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
-//! pinned. The bus accepts arbitrary topic strings (`publish` does not
-//! reject unknown topics) so the publisher side stays open for future
-//! extension, but the documented taxonomy is the contract subscribers
-//! should rely on for v0.10.0.
+//! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
+//! (epic #3842 Phase 4) for the epic supervisor's action classes
+//! (decompose / expand / join / close). The `daemon.capacity.advisory` topic
+//! was authorized by **#3902** (epic #3809) for the work finder's
+//! token-capacity backpressure advisory (fired on pressure state change). The
+//! bus accepts arbitrary topic
+//! strings (`publish` does not reject unknown topics) so the publisher side
+//! stays open for future extension, but the documented taxonomy is the
+//! contract subscribers should rely on.
 
 use crate::types::Event;
 
@@ -340,6 +350,7 @@ mod tests {
             issue,
             phase: phase.to_string(),
             pr_number: None,
+            repo: None,
         }
     }
 
@@ -427,6 +438,7 @@ mod tests {
                 issue,
                 phase,
                 pr_number: _,
+                repo: _,
             } => {
                 assert_eq!(issue, 123);
                 assert_eq!(phase, "builder");
@@ -482,6 +494,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            repo: None,
         });
         let _ = bus.publish_generic("sweep.global.dispatch", json!({"sweep_id": "x"}));
 

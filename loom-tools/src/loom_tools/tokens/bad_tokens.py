@@ -6,8 +6,8 @@ calls skip these tokens.
 
 The file is shared across concurrent bash and Python writers. We coordinate
 with a sibling ``.bad_tokens.lock`` directory, created via ``mkdir`` (POSIX
-atomic). ``flock`` is intentionally not used because it is unavailable on
-stock macOS.
+atomic) — see ``loom_tools.tokens._locking.MkdirLock``. ``flock`` is
+intentionally not used because it is unavailable on stock macOS.
 
 File format (one entry per line):
     <ISO8601 UTC timestamp> <token_name> <reason words...>
@@ -19,63 +19,21 @@ collide.
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Lock parameters
-_LOCK_TIMEOUT_SECONDS = 5.0
-_LOCK_POLL_INTERVAL = 0.1
-_STALE_LOCK_THRESHOLD_SECONDS = 30.0
+from loom_tools.tokens._locking import MkdirLock as _MkdirLock
+from loom_tools.tokens.paths import resolve_tokens_dir
 
 
-class _MkdirLock:
-    """Context manager wrapping a directory-as-lock.
+def _tokens_dir(workspace_path: Path | str) -> Path:
+    """Resolve the effective pool dir (per-repo, else shared) — issue #3938.
 
-    Acquires by creating ``lock_path``. Times out after _LOCK_TIMEOUT_SECONDS.
-    Cleans up stale locks (older than _STALE_LOCK_THRESHOLD_SECONDS) before
-    giving up.
-
-    Always releases the lock on ``__exit__`` (via rmdir). If the lock was
-    never acquired (timeout), ``__exit__`` is a no-op.
+    Routing every bad-token read/write through the shared resolver keeps the
+    ``.bad_tokens`` state file beside the ``*.token`` files that selection
+    actually picks, so it never forks between the per-repo and shared pools.
     """
-
-    def __init__(self, lock_path: Path):
-        self._lock_path = lock_path
-        self._acquired = False
-
-    def __enter__(self) -> "_MkdirLock":
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                self._lock_path.mkdir(parents=False, exist_ok=False)
-                self._acquired = True
-                return self
-            except FileExistsError:
-                # Stale-lock cleanup
-                try:
-                    age = time.time() - self._lock_path.stat().st_mtime
-                    if age > _STALE_LOCK_THRESHOLD_SECONDS:
-                        try:
-                            self._lock_path.rmdir()
-                        except OSError:
-                            pass
-                except FileNotFoundError:
-                    # Lock vanished between checks; loop and retry mkdir
-                    continue
-                time.sleep(_LOCK_POLL_INTERVAL)
-        raise TimeoutError(
-            f"Could not acquire bad_tokens lock at {self._lock_path} "
-            f"within {_LOCK_TIMEOUT_SECONDS}s"
-        )
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._acquired:
-            try:
-                self._lock_path.rmdir()
-            except OSError:
-                # Lock already gone — log-friendly silent
-                pass
+    return resolve_tokens_dir(workspace_path)
 
 
 def _bad_tokens_path(tokens_dir: Path) -> Path:
@@ -111,7 +69,7 @@ def mark_bad(workspace_path: Path | str, token_name: str, reason: str) -> None:
         FileNotFoundError: If ``.loom/tokens/`` does not exist.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    tokens_dir = _tokens_dir(workspace_path)
     if not tokens_dir.is_dir():
         raise FileNotFoundError(f"Tokens dir does not exist: {tokens_dir}")
 
@@ -136,7 +94,7 @@ def is_bad(workspace_path: Path | str, token_name: str) -> bool:
         token_name: Token basename to look up.
     """
     workspace_path = Path(workspace_path)
-    bad_file = _bad_tokens_path(workspace_path / ".loom" / "tokens")
+    bad_file = _bad_tokens_path(_tokens_dir(workspace_path))
     if not bad_file.is_file():
         return False
     try:
@@ -160,7 +118,7 @@ def cleanup_bad_tokens(
         Number of entries retained after pruning.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    tokens_dir = _tokens_dir(workspace_path)
     bad_file = _bad_tokens_path(tokens_dir)
     if not bad_file.is_file():
         return 0

@@ -134,60 +134,97 @@ assert_eq "CWD_DELETED" "$result" "cwd deleted -> CWD_DELETED"
 result=$(classify_error "" 2)
 assert_eq "RECOVERABLE" "$result" "unknown exit=2 -> RECOVERABLE"
 
-# ============================================================
-# Section 1b: provider pattern-table selection (issue #3, epic #1)
-# ============================================================
+# --- MODEL_REFUSAL vectors (issue #3702) ---
+# A model safety-classifier refusal (stop_reason "refusal") on a non-zero-exit
+# run classifies as MODEL_REFUSAL — a routing error the sweep orchestrator
+# handles by dropping one ladder rung without consuming a Doctor cycle.
 
-echo ""
-echo "Testing classify_error provider table selection..."
+# Vector #19: JSON-shaped stop_reason refusal + exit=1 → MODEL_REFUSAL
+result=$(classify_error '{"type":"message","stop_reason":"refusal"}' 1)
+assert_eq "MODEL_REFUSAL" "$result" 'stop_reason:"refusal" + exit=1 -> MODEL_REFUSAL'
 
-# Vector #19: explicit "claude" provider param is bit-identical to default
-result=$(classify_error "OAuth token has expired" 1 "claude")
-assert_eq "TOKEN_EXPIRED" "$result" "explicit provider=claude: OAuth expired -> TOKEN_EXPIRED"
+# Vector #20: spaced stop_reason = refusal + exit=1 → MODEL_REFUSAL
+result=$(classify_error "turn ended: stop_reason: refusal (safety)" 1)
+assert_eq "MODEL_REFUSAL" "$result" "spaced stop_reason refusal + exit=1 -> MODEL_REFUSAL"
 
-# Vector #20: explicit "claude" provider still honors the #3233 regression
-# guard (clean exit is SUCCESS regardless of stdout content or provider).
-result=$(classify_error "successfully merged PR #500 with status 200" 0 "claude")
-assert_eq "SUCCESS" "$result" "explicit provider=claude: exit=0 with '500' is SUCCESS (#3233 regression)"
+# Vector #21 (REGRESSION, #3233): clean exit (exit 0) whose output merely
+# contains the word "refusal" is STILL SUCCESS — exit-code-first ordering wins
+# over any substring, including the new refusal match.
+result=$(classify_error '{"stop_reason":"refusal"}' 0)
+assert_eq "SUCCESS" "$result" 'exit=0 with stop_reason:"refusal" is SUCCESS (#3233 exit-code-first)'
 
-# Vector #21: codex is a documented stub — Claude-specific CWD-deleted
-# phrasing does NOT match under the codex table (no pattern defined yet),
-# so it falls through to the RECOVERABLE catch-all instead of CWD_DELETED.
-result=$(classify_error "current working directory was deleted" 1 "codex")
-assert_eq "RECOVERABLE" "$result" "provider=codex: Claude's cwd-deleted phrase does not match stub table"
+# Vector #22: plain word "refusal" without a stop_reason on exit=1 is NOT a
+# refusal classification — the match is anchored to the stop_reason key, so an
+# unrelated failure mentioning the word falls through to the catch-all.
+result=$(classify_error "connection reset; will not retry (refusal to reconnect)" 1)
+assert_eq "RECOVERABLE" "$result" "bare 'refusal' word (no stop_reason) + exit=1 -> RECOVERABLE"
 
-# Vector #22: codex still gets the generic HTTP/network patterns (429).
-result=$(classify_error "429 Too Many Requests" 1 "codex")
-assert_eq "RECOVERABLE" "$result" "provider=codex: generic 429 pattern still applies"
+# --- Widened TOKEN_EXHAUSTED vectors (issue #3738) ---
+# The Claude CLI emits several usage/session/weekly/monthly limit phrasings.
+# A naive `hit.your.limit`-style pattern misses the multi-word-gap variants
+# ("hit your SESSION limit", "monthly usage limit", "out of extra usage") —
+# each is verified individually, not just the legacy short form (#10/#11).
 
-# Vector #23: unknown/unrecognized provider — Claude's token-expired phrase
-# does not match (no provider-specific table), falls to RECOVERABLE.
-result=$(classify_error "OAuth token has expired" 1 "some-unknown-provider")
-assert_eq "RECOVERABLE" "$result" "unknown provider: no provider-specific pattern for OAuth phrase -> RECOVERABLE"
+# Vector #23: session limit (the exact canary phrase) → TOKEN_EXHAUSTED
+result=$(classify_error "You've hit your session limit · resets 4pm" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "hit your session limit -> TOKEN_EXHAUSTED (#3738)"
 
-# Vector #24: unknown provider still gets the generic HTTP/network patterns
-# (503) — "defaults to generic HTTP/network patterns" per issue #3 AC.
-result=$(classify_error "503 Service Unavailable" 1 "some-unknown-provider")
-assert_eq "RECOVERABLE" "$result" "unknown provider: generic 503 pattern still applies"
+# Vector #24: full weekly-limit phrasing with reset suffix → TOKEN_EXHAUSTED
+result=$(classify_error "You've hit your weekly limit · resets Monday 9am" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "hit your weekly limit (full phrasing) -> TOKEN_EXHAUSTED (#3738)"
 
-# Vector #25: exit-code-first / SUCCESS short-circuit is provider-invariant —
-# even a nonsense provider name doesn't change exit=0 handling.
-result=$(classify_error "rate limit headers indicate 4500 remaining" 0 "some-unknown-provider")
-assert_eq "SUCCESS" "$result" "unknown provider: exit=0 with 'rate limit' is still SUCCESS (#3233 regression)"
+# Vector #25: org monthly usage limit → TOKEN_EXHAUSTED
+result=$(classify_error "You've hit your org's monthly usage limit" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "monthly usage limit -> TOKEN_EXHAUSTED (#3738)"
 
-# Vector #26: LOOM_WORKER env var selects the provider table when no
-# explicit 3rd argument is passed.
-result=$(LOOM_WORKER="codex" classify_error "current working directory was deleted" 1)
-assert_eq "RECOVERABLE" "$result" "LOOM_WORKER=codex env var selects codex table (cwd-deleted phrase does not match)"
+# Vector #26: out of extra usage → TOKEN_EXHAUSTED
+result=$(classify_error "You're out of extra usage · resets 4pm" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "out of extra usage -> TOKEN_EXHAUSTED (#3738)"
 
-# Vector #27: explicit 3rd-arg provider takes precedence over LOOM_WORKER.
-result=$(LOOM_WORKER="codex" classify_error "current working directory was deleted" 1 "claude")
-assert_eq "CWD_DELETED" "$result" "explicit provider arg overrides LOOM_WORKER env var"
+# Vector #27: plain "You've hit your limit" still classifies (legacy short form)
+result=$(classify_error "You've hit your limit" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "legacy 'hit your limit' still -> TOKEN_EXHAUSTED (#3738)"
 
-# Vector #28: default provider (no 3rd arg, no LOOM_WORKER set) is "claude".
-unset LOOM_WORKER 2>/dev/null || true
-result=$(classify_error "hit your weekly limit" 1)
-assert_eq "TOKEN_EXHAUSTED" "$result" "no provider arg / no LOOM_WORKER -> defaults to claude table"
+# Vector #28 (REGRESSION, #3233): exit-0 output mentioning a limit phrase in
+# prose is STILL SUCCESS — exit-code-first ordering wins over the new patterns.
+result=$(classify_error "Note: agents pause when they hit your session limit." 0)
+assert_eq "SUCCESS" "$result" "exit=0 mentioning 'hit your session limit' is SUCCESS (#3233/#3738)"
+
+# Vector #29 (REGRESSION): exit-0 with "out of extra usage" in prose → SUCCESS
+result=$(classify_error "The plan was out of extra usage headroom last week." 0)
+assert_eq "SUCCESS" "$result" "exit=0 mentioning 'out of extra usage' is SUCCESS (#3233/#3738)"
+
+# --- SESSION_LIMIT vectors (issue #3947) ---
+# A concurrent-session-limit fault is a capacity signal (per-token stacking), NOT
+# quota exhaustion, so it classifies distinctly as SESSION_LIMIT and callers must
+# NOT mark the token bad. Checked BEFORE TOKEN_EXHAUSTED so the "session limit"
+# substring is not swallowed by the exhaustion regex.
+
+# Vector #30: explicit concurrent session limit → SESSION_LIMIT
+result=$(classify_error "Error: you have reached your concurrent session limit" 1)
+assert_eq "SESSION_LIMIT" "$result" "concurrent session limit -> SESSION_LIMIT (#3947)"
+
+# Vector #31: "maximum number of concurrent sessions" → SESSION_LIMIT
+result=$(classify_error "maximum number of concurrent sessions reached" 1)
+assert_eq "SESSION_LIMIT" "$result" "maximum number of concurrent sessions -> SESSION_LIMIT (#3947)"
+
+# Vector #32: "too many concurrent" → SESSION_LIMIT
+result=$(classify_error "429: too many concurrent requests for this account" 1)
+assert_eq "SESSION_LIMIT" "$result" "too many concurrent -> SESSION_LIMIT (#3947)"
+
+# Vector #33: "another session is already running" → SESSION_LIMIT
+result=$(classify_error "another session is already active for this token" 1)
+assert_eq "SESSION_LIMIT" "$result" "another session already active -> SESSION_LIMIT (#3947)"
+
+# Vector #34 (DISAMBIGUATION): a WEEKLY "session limit" (no concurrency wording)
+# stays TOKEN_EXHAUSTED — the capacity classifier must not steal quota faults.
+result=$(classify_error "You've hit your session limit · resets 4pm" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "weekly 'session limit' stays TOKEN_EXHAUSTED (#3947 disambiguation)"
+
+# Vector #35 (REGRESSION, #3233): exit-0 output mentioning concurrent sessions in
+# prose is STILL SUCCESS — exit-code-first ordering wins over the new pattern.
+result=$(classify_error "Note: agents pause on a concurrent session limit." 0)
+assert_eq "SUCCESS" "$result" "exit=0 mentioning 'concurrent session' is SUCCESS (#3233/#3947)"
 
 # ============================================================
 # Section 2: spawn-claude.sh dispatch (with stub `claude`)
@@ -195,17 +232,6 @@ assert_eq "TOKEN_EXHAUSTED" "$result" "no provider arg / no LOOM_WORKER -> defau
 
 echo ""
 echo "Testing spawn-claude.sh dispatch..."
-
-# spawn-claude.sh enforces loom-tools' `requires-python = ">=3.10"` floor
-# (issue #72), so the dispatch tests below — which run the REAL
-# loom_tools.tokens.select — need a conforming interpreter on this host. Pin it
-# via LOOM_PYTHON; the Section 4 tests set their own LOOM_PYTHON explicitly.
-# shellcheck source=lib/require-python.sh
-source "$SCRIPT_DIR/lib/require-python.sh"
-require_python_310 || exit 1
-TEST_PYTHON="$LOOM_TEST_PYTHON"
-echo "  (using $("$TEST_PYTHON" --version 2>&1) at $TEST_PYTHON)"
-export LOOM_PYTHON="$TEST_PYTHON"
 
 # Set up a fake workspace
 TEST_WS="$(mktemp -d)"
@@ -223,6 +249,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 echo "stub-claude got token=${CLAUDE_CODE_OAUTH_TOKEN}"
 echo "stub-claude args=$*"
+echo "stub-claude ceiling=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -237,6 +264,39 @@ assert_contains "stub-claude args=-p ping" "$output" \
 assert_contains "OAuth account 'alpha'" "$output" \
     "spawn-claude logs the chosen account"
 
+# Test: spawn-claude disables the print-mode background-task wait ceiling
+# (issue #3943) so a daemon-dispatched sweep child's long-running Builder/Judge
+# subagents are not reaped at the 600s ceiling. Default = 0 (no cap).
+assert_contains "stub-claude ceiling=0" "$output" \
+    "spawn-claude exports CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 by default (#3943)"
+
+# Test: an operator-set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS is PRESERVED
+# (the `:=` default-assignment idiom only fills an unset/empty value).
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="120000" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude ceiling=120000" "$output" \
+    "spawn-claude preserves an operator-set wait ceiling (#3943)"
+
+# Test: the daemon self-claim marker's presence/value is always logged (Issue
+# #3967) — with the var unset, an interactive/manual invocation logs "unset".
+# Explicitly unset it first: this test suite may itself be running inside a
+# daemon-dispatched `/loom:sweep` session, which would otherwise leak an
+# ambient `LOOM_SWEEP_CLAIM_OWNED` into the subshell and false-fail this case.
+output=$(env -u LOOM_SWEEP_CLAIM_OWNED LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=unset" "$output" \
+    "spawn-claude logs LOOM_SWEEP_CLAIM_OWNED=unset when not daemon-dispatched (#3967)"
+
+# Test: with the var set (simulating a daemon-dispatched child, #3823), the
+# same log line echoes the exact issue number — the diagnostic this issue's
+# acceptance criteria calls for, straight from the per-sweep log.
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_SWEEP_CLAIM_OWNED="3964" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
+    "spawn-claude logs the daemon self-claim marker's value when set (#3967)"
+
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_OAUTH_TOKEN="caller-supplied" \
@@ -244,22 +304,56 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
 assert_contains "stub-claude got token=caller-supplied" "$output" \
     "explicit CLAUDE_CODE_OAUTH_TOKEN is preserved"
 
-# Test: missing tokens dir → exit 78 with helpful message
+# Test: missing tokens dir → exit 78 with helpful message.
+# LOOM_SHARED_TOKENS_DIR="" disables the #3938 shared-pool fallback so this
+# case deterministically hard-fails regardless of the host's ~/.loom/tokens.
 EMPTY_WS="$(mktemp -d)"
-output=$(LOOM_WORKSPACE="$EMPTY_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$EMPTY_WS" LOOM_SHARED_TOKENS_DIR="" \
+    PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 exit_code=$?
 assert_contains "loom-tokens bootstrap" "$output" \
     "empty pool error mentions 'loom-tokens bootstrap'"
 rm -rf "$EMPTY_WS"
 
-# Test that spawn-claude.sh exits 78 on missing tokens
+# Test that spawn-claude.sh exits 78 on missing tokens (shared fallback off).
 set +e
-LOOM_WORKSPACE="$(mktemp -d)" PATH="$STUB_DIR:$PATH" \
+LOOM_WORKSPACE="$(mktemp -d)" LOOM_SHARED_TOKENS_DIR="" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" >/dev/null 2>&1
 exit_code=$?
 set -e
 assert_eq "78" "$exit_code" "missing tokens exits 78 (EX_CONFIG)"
+
+# Test: consumer repo with NO per-repo pool falls back to the shared
+# machine-level pool (issue #3938) instead of hard-failing.
+#
+# Pin LOOM_PACKAGE_PATH at the repo-under-test's loom_tools so the assertion
+# exercises THIS checkout's selector, not any host-level editable install /
+# canary LOOM_PACKAGE_PATH the dev environment may export.
+REPO_PKG="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
+CONSUMER_WS="$(mktemp -d)"
+SHARED_POOL="$(mktemp -d)"
+echo -n "fake-token-shared" > "$SHARED_POOL/shared-acct.token"
+chmod 600 "$SHARED_POOL/shared-acct.token"
+output=$(LOOM_WORKSPACE="$CONSUMER_WS" LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" \
+    LOOM_PACKAGE_PATH="$REPO_PKG" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude got token=fake-token-shared" "$output" \
+    "spawn-claude falls back to shared pool for a repo with no pool (#3938)"
+assert_contains "OAuth account 'shared-acct'" "$output" \
+    "spawn-claude logs the shared-pool account (#3938)"
+# State must land in the shared pool, never forked into the consumer repo.
+LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" PYTHONPATH="$REPO_PKG" \
+    python3 -c "
+from loom_tools.tokens.bad_tokens import mark_bad
+mark_bad('$CONSUMER_WS', 'shared-acct', 'test')
+" 2>/dev/null || true
+if [[ -f "$SHARED_POOL/.bad_tokens" && ! -f "$CONSUMER_WS/.loom/tokens/.bad_tokens" ]]; then
+    assert_eq "ok" "ok" "shared-pool .bad_tokens written to shared dir, not consumer repo (#3938)"
+else
+    assert_eq "ok" "fail" "shared-pool .bad_tokens written to shared dir, not consumer repo (#3938)"
+fi
+rm -rf "$CONSUMER_WS" "$SHARED_POOL"
 
 # ============================================================
 # Section 3: model selection (issue #3477, Phase 1)
@@ -352,162 +446,236 @@ assert_contains "spawn-claude: model=default" "$output" \
     "structured model=default log line emitted for empty LOOM_MODEL (#3482)"
 
 # ============================================================
-# Section 4: Python interpreter resolution (issue #72)
+# Section 4: effort selection (issue #3705)
 #
-# spawn-claude.sh must NOT run loom_tools under whatever `python3` happens to
-# be on PATH — loom-tools declares `requires-python = ">=3.10"` and the engine
-# ships a conforming interpreter at <engine>/loom-tools/.venv/bin/python.
-# Scenarios covered:
-#   4a. engine venv present            -> venv interpreter is used
-#   4b. LOOM_PYTHON set                -> override beats venv and PATH
-#   4c. no venv + sub-3.10 `python3`   -> fast fail, exit 78, version error
-#   4d. no venv + >=3.10 `python3`     -> unchanged behavior (regression guard)
-#
-# Each scenario runs a COPY of spawn-claude.sh planted inside a synthetic
-# engine tree (<fake>/.loom/scripts/spawn-claude.sh) so the script-relative
-# engine root — and therefore the venv probe — is fully controlled.
+# Mirrors the model precedence chain for the `claude --effort <level>`
+# session knob, all observable cases:
+#   1. LOOM_EFFORT alone produces --effort in the exec'd args
+#   2. explicit --effort arg beats LOOM_EFFORT env
+#   3. --effort=value form also beats LOOM_EFFORT env
+#   4. no env + no arg produces NO --effort at all (session default
+#      preserved — the zero-behavior-change acceptance criterion)
+#   5. empty LOOM_EFFORT is treated as unset — no --effort emitted
 # ============================================================
 
 echo ""
-echo "Testing spawn-claude.sh Python interpreter resolution (#72)..."
+echo "Testing spawn-claude.sh effort selection (#3705)..."
 
-PYRES_TMP="$(mktemp -d)"
-trap 'rm -rf "$TEST_WS" "$STUB_DIR" "$PYRES_TMP"' EXIT
+# Case 1: LOOM_EFFORT env produces --effort in args
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort xhigh" "$output" \
+    "LOOM_EFFORT env injects --effort into claude args"
+assert_contains "spawn-claude: effort=xhigh (from LOOM_EFFORT)" "$output" \
+    "structured effort log line emitted for LOOM_EFFORT case (#3705)"
 
-# Plant a copy of spawn-claude.sh (plus lib/) in a synthetic engine root.
-# Layout mirrors a consumer install: <root>/.loom/scripts/spawn-claude.sh,
-# so the script's `<script_dir>/../..` engine probe lands on <root>.
-make_fake_engine() {
-    local root="$1"
-    mkdir -p "$root/.loom/scripts"
-    cp "$SCRIPTS_DIR/spawn-claude.sh" "$root/.loom/scripts/spawn-claude.sh"
-    cp -R "$SCRIPTS_DIR/lib" "$root/.loom/scripts/lib"
-    chmod +x "$root/.loom/scripts/spawn-claude.sh"
-}
+# Case 2: explicit --effort arg wins over LOOM_EFFORT env
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort high 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort high" "$output" \
+    "explicit --effort arg wins over LOOM_EFFORT env"
+assert_contains "spawn-claude: effort=high (from --effort arg)" "$output" \
+    "structured effort log line emitted for explicit --effort arg case (#3705)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"--effort xhigh"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_EFFORT value is not injected when explicit --effort present"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_EFFORT value is not injected when explicit --effort present"
+    echo "    In: '$output'"
+fi
 
-# Stub interpreter: logs a marker for every invocation, reports <version> for
-# `--version`, and exits <c_exit> for the `-c` version assertion (0 = "meets
-# the floor", 1 = "too old"). All other invocations exit 0 with empty stdout,
-# which makes token selection bottom out in "returned empty key" (exit 78) —
-# enough to observe WHICH interpreter ran without needing a real loom_tools.
-make_stub_python() {
-    local path="$1" version="$2" marker="$3" c_exit="$4"
-    mkdir -p "$(dirname "$path")"
-    cat > "$path" <<STUB
+# Case 3: --effort=value form also suppresses LOOM_EFFORT injection
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort=high 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort=high" "$output" \
+    "--effort=value form wins over LOOM_EFFORT env"
+assert_contains "spawn-claude: effort=high (from --effort arg)" "$output" \
+    "structured effort log line emitted for --effort=value form (#3705)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"--effort xhigh"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: --effort=value suppresses LOOM_EFFORT injection"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: --effort=value suppresses LOOM_EFFORT injection"
+    echo "    In: '$output'"
+fi
+
+# Case 4 (zero-behavior-change criterion): no env + no arg => no --effort
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--effort"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no LOOM_EFFORT + no --effort arg emits NO --effort (session default preserved)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: no LOOM_EFFORT + no --effort arg emits NO --effort (session default preserved)"
+    echo "    In: '$output'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"spawn-claude: effort="* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no effort log line emitted when nothing configured (#3705)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: no effort log line emitted when nothing configured (#3705)"
+    echo "    In: '$output'"
+fi
+
+# Case 5: empty LOOM_EFFORT is treated as unset — no --effort emitted
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--effort"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: empty LOOM_EFFORT emits NO --effort"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: empty LOOM_EFFORT emits NO --effort"
+    echo "    In: '$output'"
+fi
+
+# ============================================================
+# Section 5: claude-wrapper.sh account rotation on exhaustion (#3738)
+#
+# On a session/usage-limit fault the wrapper must mark the active account bad,
+# re-select a fresh account, and retry WITHOUT consuming a MAX_RETRIES attempt.
+# When the whole pool is exhausted it must emit a distinct sentinel (not the
+# generic "Max retries exceeded" path) and exit non-zero.
+# ============================================================
+
+echo ""
+echo "Testing claude-wrapper.sh account rotation (#3738)..."
+
+WRAPPER="$SCRIPTS_DIR/claude-wrapper.sh"
+PKG_SRC="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
+
+if [[ -z "$PKG_SRC" || ! -d "$PKG_SRC/loom_tools/tokens" ]]; then
+    echo "  (skipping rotation tests — loom_tools package not found)"
+else
+  # --- Fixture: 2-account pool; stub exhausts alpha, succeeds on beta ---
+  ROT_WS="$(mktemp -d)"
+  mkdir -p "$ROT_WS/.loom/tokens"
+  chmod 700 "$ROT_WS/.loom/tokens"
+  printf '%s' "tok-alpha" > "$ROT_WS/.loom/tokens/alpha.token"
+  printf '%s' "tok-beta"  > "$ROT_WS/.loom/tokens/beta.token"
+  chmod 600 "$ROT_WS/.loom/tokens/"*.token
+
+  ROT_STUB="$(mktemp -d)"
+  cat > "$ROT_STUB/claude" <<'STUB'
 #!/usr/bin/env bash
-echo "$marker invoked: \$*" >&2
-case "\${1:-}" in
-    --version) echo "Python $version"; exit 0 ;;
-    -c)        exit $c_exit ;;
+# Only the real prompt run (contains "-p") drives rotation; any preflight
+# subcommands (auth/mcp/version) succeed quietly.
+case " $* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
 esac
+if [[ "${CLAUDE_CODE_OAUTH_TOKEN}" == "tok-alpha" ]]; then
+    echo "You've hit your session limit · resets 4pm"
+    exit 1
+fi
+echo "stub-claude success on token=${CLAUDE_CODE_OAUTH_TOKEN}"
 exit 0
 STUB
-    chmod +x "$path"
-}
+  chmod +x "$ROT_STUB/claude"
 
-# --- 4a: engine venv is preferred over bare `python3` -------------------
-ENGINE_VENV="$PYRES_TMP/engine-with-venv"
-make_fake_engine "$ENGINE_VENV"
-make_stub_python "$ENGINE_VENV/loom-tools/.venv/bin/python" "3.12.0" "VENV-PYTHON-MARKER" 0
+  # Force the first account to alpha (as spawn-claude would). MAX_RETRIES=1:
+  # if rotation consumed a MAX_RETRIES attempt, beta would never be tried.
+  set +e
+  rot_out=$(
+    LOOM_WORKSPACE="$ROT_WS" \
+    LOOM_TOKEN_NAME="alpha" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-alpha" \
+    LOOM_PACKAGE_PATH="$PKG_SRC" \
+    LOOM_MAX_RETRIES=1 \
+    LOOM_SHEPHERD_TASK_ID="test-rotation" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$ROT_STUB:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  rot_rc=$?
+  set -e
 
-PATH_PY_DIR="$PYRES_TMP/path-python"
-make_stub_python "$PATH_PY_DIR/python3" "3.12.0" "PATH-PYTHON-MARKER" 0
+  assert_contains "stub-claude success on token=tok-beta" "$rot_out" \
+      "wrapper rotates from exhausted alpha to beta and succeeds"
+  assert_eq "0" "$rot_rc" \
+      "wrapper exits 0 after rotation (MAX_RETRIES=1 not consumed by rotation)"
 
-output=$(LOOM_PYTHON="" LOOM_WORKSPACE="$TEST_WS" PATH="$PATH_PY_DIR:$STUB_DIR:$PATH" \
-    "$ENGINE_VENV/.loom/scripts/spawn-claude.sh" -p "ping" 2>&1 || true)
-assert_contains "VENV-PYTHON-MARKER" "$output" \
-    "engine venv interpreter is used when present"
-assert_contains "python=$ENGINE_VENV/loom-tools/.venv/bin/python (source=engine-venv)" "$output" \
-    "resolution log names the venv interpreter with source=engine-venv"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [[ "$output" != *"PATH-PYTHON-MARKER"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: bare python3 on PATH is NOT used when the engine venv exists"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: bare python3 on PATH is NOT used when the engine venv exists"
-    echo "    In: '$output'"
-fi
+  bad_file="$ROT_WS/.loom/tokens/.bad_tokens"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ -f "$bad_file" ]] && grep -qw "alpha" "$bad_file" && ! grep -qw "beta" "$bad_file"; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: .bad_tokens records exhausted alpha but not beta"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: .bad_tokens records exhausted alpha but not beta"
+      echo "    .bad_tokens: $(cat "$bad_file" 2>/dev/null || echo '<missing>')"
+  fi
 
-# --- 4b: LOOM_PYTHON override wins over venv AND PATH -------------------
-OVERRIDE_DIR="$PYRES_TMP/override"
-make_stub_python "$OVERRIDE_DIR/my-python" "3.13.0" "OVERRIDE-PYTHON-MARKER" 0
+  # --- Whole-pool exhaustion: both accounts exhaust → ACCOUNT_POOL_EXHAUSTED ---
+  ROT_WS2="$(mktemp -d)"
+  mkdir -p "$ROT_WS2/.loom/tokens"
+  chmod 700 "$ROT_WS2/.loom/tokens"
+  printf '%s' "tok-a" > "$ROT_WS2/.loom/tokens/a.token"
+  printf '%s' "tok-b" > "$ROT_WS2/.loom/tokens/b.token"
+  chmod 600 "$ROT_WS2/.loom/tokens/"*.token
 
-output=$(LOOM_PYTHON="$OVERRIDE_DIR/my-python" LOOM_WORKSPACE="$TEST_WS" \
-    PATH="$PATH_PY_DIR:$STUB_DIR:$PATH" \
-    "$ENGINE_VENV/.loom/scripts/spawn-claude.sh" -p "ping" 2>&1 || true)
-assert_contains "OVERRIDE-PYTHON-MARKER" "$output" \
-    "LOOM_PYTHON override is used verbatim"
-assert_contains "python=$OVERRIDE_DIR/my-python (source=LOOM_PYTHON)" "$output" \
-    "resolution log names the override with source=LOOM_PYTHON"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [[ "$output" != *"VENV-PYTHON-MARKER"* && "$output" != *"PATH-PYTHON-MARKER"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: LOOM_PYTHON beats both the engine venv and PATH"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: LOOM_PYTHON beats both the engine venv and PATH"
-    echo "    In: '$output'"
-fi
+  ROT_STUB2="$(mktemp -d)"
+  cat > "$ROT_STUB2/claude" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
+esac
+echo "You've hit your session limit · resets 4pm"
+exit 1
+STUB
+  chmod +x "$ROT_STUB2/claude"
 
-# --- 4c: no venv + sub-3.10 python3 -> fast fail with exit 78 -----------
-ENGINE_BARE="$PYRES_TMP/engine-no-venv"
-make_fake_engine "$ENGINE_BARE"
+  set +e
+  rot2_out=$(
+    LOOM_WORKSPACE="$ROT_WS2" \
+    LOOM_TOKEN_NAME="a" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-a" \
+    LOOM_PACKAGE_PATH="$PKG_SRC" \
+    LOOM_MAX_RETRIES=1 \
+    LOOM_SHEPHERD_TASK_ID="test-rotation" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$ROT_STUB2:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  rot2_rc=$?
+  set -e
 
-OLD_PY_DIR="$PYRES_TMP/old-python"
-make_stub_python "$OLD_PY_DIR/python3" "3.9.7" "OLD-PYTHON-MARKER" 1
+  assert_contains "ACCOUNT_POOL_EXHAUSTED" "$rot2_out" \
+      "whole-pool exhaustion emits the ACCOUNT_POOL_EXHAUSTED sentinel"
+  assert_contains "Whole account pool exhausted" "$rot2_out" \
+      "whole-pool exhaustion logs a distinct (non-'Max retries') message"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$rot2_rc" -ne 0 ]]; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: whole-pool exhaustion exits non-zero"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: whole-pool exhaustion exits non-zero"
+  fi
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$rot2_out" != *"Max retries"* ]]; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: whole-pool exhaustion avoids the generic Max-retries path"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: whole-pool exhaustion avoids the generic Max-retries path"
+  fi
 
-output=$(LOOM_PYTHON="" LOOM_WORKSPACE="$TEST_WS" PATH="$OLD_PY_DIR:$STUB_DIR:$PATH" \
-    "$ENGINE_BARE/.loom/scripts/spawn-claude.sh" -p "ping" 2>&1 || true)
-assert_contains "$OLD_PY_DIR/python3" "$output" \
-    "sub-3.10 failure names the offending interpreter path"
-assert_contains "Python 3.9.7" "$output" \
-    "sub-3.10 failure reports the interpreter's version"
-assert_contains "requires >= 3.10" "$output" \
-    "sub-3.10 failure states the required floor"
-assert_contains "LOOM_PYTHON" "$output" \
-    "sub-3.10 failure names the LOOM_PYTHON remedy"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [[ "$output" != *"Token selection failed"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: sub-3.10 fails on the version check, not as a token-selection error"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: sub-3.10 fails on the version check, not as a token-selection error"
-    echo "    In: '$output'"
-fi
-
-set +e
-LOOM_PYTHON="" LOOM_WORKSPACE="$TEST_WS" PATH="$OLD_PY_DIR:$STUB_DIR:$PATH" \
-    "$ENGINE_BARE/.loom/scripts/spawn-claude.sh" -p "ping" >/dev/null 2>&1
-exit_code=$?
-set -e
-assert_eq "78" "$exit_code" "sub-3.10 interpreter exits 78 (EX_CONFIG)"
-
-# --- 4d: no venv + >=3.10 python3 -> unchanged behavior -----------------
-# Real interpreter, real loom_tools, no venv anywhere: token selection must
-# still succeed and exec the stub `claude`.
-NEW_PY_DIR="$PYRES_TMP/new-python"
-mkdir -p "$NEW_PY_DIR"
-ln -s "$TEST_PYTHON" "$NEW_PY_DIR/python3"
-REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
-
-output=$(LOOM_PYTHON="" LOOM_WORKSPACE="$TEST_WS" \
-    LOOM_PACKAGE_PATH="$REPO_ROOT/loom-tools/src" \
-    PATH="$NEW_PY_DIR:$STUB_DIR:$PATH" \
-    "$ENGINE_BARE/.loom/scripts/spawn-claude.sh" -p "ping" 2>&1 || true)
-assert_contains "python=$NEW_PY_DIR/python3 (source=PATH)" "$output" \
-    "no venv + >=3.10 python3 resolves to the PATH interpreter"
-assert_contains "stub-claude got token=fake-token-alpha" "$output" \
-    "no venv + >=3.10 python3 still selects a token and dispatches (no regression)"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [[ "$output" != *"requires >= 3.10"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: no version error emitted for a conforming PATH interpreter"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: no version error emitted for a conforming PATH interpreter"
-    echo "    In: '$output'"
+  rm -rf "$ROT_WS" "$ROT_STUB" "$ROT_WS2" "$ROT_STUB2"
 fi
 
 # ============================================================

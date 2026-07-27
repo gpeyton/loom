@@ -20,7 +20,50 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { sendDaemonRequest, sendDaemonStreamRequest } from "../shared/daemon.js";
+import {
+  resolveDaemonIpcTimeoutMs,
+  sendDaemonRequest,
+  sendDaemonStreamRequest,
+} from "../shared/daemon.js";
+
+// ============================================================================
+// Per-call IPC timeouts (issue #3945)
+// ============================================================================
+//
+// Most unary calls (publish_event, list_sweeps, get_sweep_status,
+// tail_sweep_log) are immediate acks and use the small default bound in
+// `sendDaemonRequest`. Two calls legitimately take longer than an immediate
+// ack and pass an explicit wider timeout so the bounded-timeout fix does not
+// regress them:
+//
+//   - dispatch_sweep: the daemon spawns the sweep child (token selection +
+//     spawn-claude.sh) while holding the registry mutex before it acks.
+//   - cancel_sweep: the daemon blocks for the SIGTERM -> grace -> SIGKILL
+//     window (grace_secs, default 30) before returning the completed-cancel
+//     ack.
+//
+// Each still resolves to a bounded value — never the ~1800s hang — and honors
+// a higher `LOOM_DAEMON_IPC_TIMEOUT_MS` env override via `Math.max`.
+
+/** Wider bound for `dispatch_sweep`'s spawn-under-mutex ack. */
+const DISPATCH_TIMEOUT_MS = 30_000;
+
+/** Fixed headroom added on top of a cancel's grace window. */
+const CANCEL_TIMEOUT_BUFFER_MS = 30_000;
+
+/**
+ * Bound for the read-path calls that reconcile liveness on the daemon side
+ * (issue #3973). `ListSweeps` / `GetSweepStatus` run `reap_liveness` before
+ * responding, which best-effort shells out to `gh` for label reconciliation.
+ * Each `gh` call is now individually bounded on the daemon (default 5s,
+ * `LOOM_REAP_GH_TIMEOUT_SECS`), but a burst of newly-exited children can chain
+ * a few bounded calls, so the bridge gives these reads generous headroom over
+ * the small fire-and-forget default while still killing the 15-minute hang
+ * class the incident exposed. Comfortably below the 120s tool ceiling and the
+ * ~1800s MCP idle timeout; honors a higher `LOOM_DAEMON_IPC_TIMEOUT_MS` via
+ * `Math.max`.
+ */
+const READ_PATH_TIMEOUT_MS = 30_000;
 
 // ============================================================================
 // Wire types
@@ -77,6 +120,24 @@ export interface SweepInfo {
    * inherited the session/CLI default; render as "default".
    */
   model?: string;
+  /**
+   * Reasoning-effort level requested at dispatch (issue #3716). Mirrors
+   * `model`: absent/undefined means no explicit effort was supplied — the
+   * child inherited the session-default effort; render as "default".
+   */
+  effort?: string;
+  /**
+   * Single parent issue this sweep is stacked on (issue #3729, stacked-PR
+   * v1). Absent/undefined means an independent sweep; when set, the child
+   * branched its worktree/PR off `feature/issue-<depends_on>`.
+   */
+  depends_on?: number;
+  /**
+   * Owning managed-workspace root (issue #3929). Two managed repos can each
+   * have an issue #42; this field disambiguates repo A's sweep from repo B's.
+   * Absent/undefined on pre-#3929 entries.
+   */
+  repo?: string;
 }
 
 interface DispatchResponse {
@@ -141,6 +202,51 @@ interface EventPublishedResponse {
   };
 }
 
+/**
+ * `WatchKind` mirrors the Rust enum in `loom-daemon/src/watch_registry.rs`
+ * (serde `rename_all = "snake_case"`): `"issue"` or `"pr"`.
+ */
+export type WatchKind = "issue" | "pr";
+
+/**
+ * `WatchSpec` mirrors the Rust struct of the same name (issue #3971): one
+ * durable operator watch on an issue's or PR's terminal state, persisted
+ * machine-level so it survives the registering session's death and a daemon
+ * restart.
+ */
+export interface WatchSpec {
+  id: string;
+  kind: WatchKind;
+  number: number;
+  repo?: string;
+  workspace_root?: string;
+  note?: string;
+  registered_at: string;
+}
+
+interface WatchRegisteredResponse {
+  type: "WatchRegistered";
+  payload: {
+    watch: WatchSpec;
+    already_present: boolean;
+  };
+}
+
+interface WatchListResponse {
+  type: "WatchList";
+  payload: {
+    watches: WatchSpec[];
+  };
+}
+
+interface WatchRemovedResponse {
+  type: "WatchRemoved";
+  payload: {
+    id: string;
+    was_present: boolean;
+  };
+}
+
 type DaemonResponse =
   | DispatchResponse
   | ListResponse
@@ -148,6 +254,9 @@ type DaemonResponse =
   | SweepLogTailResponse
   | SweepCancelledResponse
   | EventPublishedResponse
+  | WatchRegisteredResponse
+  | WatchListResponse
+  | WatchRemovedResponse
   | ErrorResponse
   | StructuredErrorResponse
   | { type: string; payload?: unknown };
@@ -170,6 +279,17 @@ function extractError(response: DaemonResponse): string | null {
 
 function isStateTag(s: string): s is SweepState["state"] {
   return s === "Pending" || s === "Running" || s === "Exited" || s === "Crashed";
+}
+
+/**
+ * Extract an optional `workspace_root` tool argument (issue #3929). Empty
+ * strings are treated as unset so the daemon receives `null` (default
+ * workspace) rather than a spurious empty root.
+ */
+function extractWorkspaceRoot(args?: Record<string, unknown>): string | undefined {
+  return typeof args?.workspace_root === "string" && args.workspace_root.length > 0
+    ? (args.workspace_root as string)
+    : undefined;
 }
 
 function buildStateFilter(stateArg: unknown): SweepState | null {
@@ -226,6 +346,9 @@ async function dispatchSweep(args: {
   kind: SweepKind;
   idempotency_key?: string;
   model?: string;
+  effort?: string;
+  depends_on?: number;
+  workspace_root?: string;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -237,8 +360,21 @@ async function dispatchSweep(args: {
         // default) means the daemon emits NO --model flag and the spawned
         // child inherits the session/CLI default.
         model: args.model ?? null,
+        // Issue #3716: optional reasoning-effort override, mirroring `model`.
+        // `null` (the default) means the daemon emits NO --effort flag and
+        // the spawned child inherits the session-default effort.
+        effort: args.effort ?? null,
+        // Issue #3729 (stacked-PR v1): optional single parent issue. `null`
+        // (the default) means the daemon emits NO --depends-on flag and the
+        // child branches off the default branch as usual. When set, the child
+        // branches its worktree/PR off `feature/issue-<depends_on>`.
+        depends_on: args.depends_on ?? null,
+        // Issue #3929: optional target managed-workspace root. `null` (the
+        // default) dispatches into the daemon's default workspace, exactly as
+        // before; a value routes the sweep into that managed repo's registry.
+        workspace_root: args.workspace_root ?? null,
       },
-    })) as DaemonResponse;
+    }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
     if (response.type === "SweepDispatched") {
       const payload = (response as DispatchResponse).payload;
@@ -254,14 +390,24 @@ async function dispatchSweep(args: {
 
 async function listSweeps(args: {
   state_filter?: SweepState | null;
+  workspace_root?: string;
 }): Promise<{ success: true; sweeps: SweepInfo[] } | { success: false; error: string }> {
   try {
-    const response = (await sendDaemonRequest({
-      type: "ListSweeps",
-      payload: {
-        state_filter: args.state_filter ?? null,
+    const response = (await sendDaemonRequest(
+      {
+        type: "ListSweeps",
+        payload: {
+          state_filter: args.state_filter ?? null,
+          // Issue #3929: optional target managed-workspace root. `null` lists the
+          // default workspace's sweeps, exactly as before.
+          workspace_root: args.workspace_root ?? null,
+        },
       },
-    })) as DaemonResponse;
+      // Issue #3973: read path reconciles liveness (may chain bounded `gh`
+      // calls) before responding — give it headroom but keep it bounded so a
+      // wedged daemon fails fast instead of hanging ~15 minutes.
+      Math.max(READ_PATH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs())
+    )) as DaemonResponse;
 
     if (response.type === "SweepList") {
       const payload = (response as ListResponse).payload;
@@ -276,17 +422,92 @@ async function listSweeps(args: {
 }
 
 // ---------------------------------------------------------------------------
+// Durable watch registry helpers (Issue #3971)
+// ---------------------------------------------------------------------------
+
+async function registerWatch(args: {
+  kind: WatchKind;
+  number: number;
+  repo?: string;
+  workspace_root?: string;
+  note?: string;
+}): Promise<
+  { success: true; watch: WatchSpec; already_present: boolean } | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "RegisterWatch",
+      payload: {
+        kind: args.kind,
+        number: args.number,
+        repo: args.repo ?? null,
+        workspace_root: args.workspace_root ?? null,
+        note: args.note ?? null,
+      },
+    })) as DaemonResponse;
+
+    if (response.type === "WatchRegistered") {
+      const payload = (response as WatchRegisteredResponse).payload;
+      return { success: true, watch: payload.watch, already_present: payload.already_present };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error registering watch: ${error}` };
+  }
+}
+
+async function listWatches(): Promise<
+  { success: true; watches: WatchSpec[] } | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({ type: "ListWatches" })) as DaemonResponse;
+    if (response.type === "WatchList") {
+      return { success: true, watches: (response as WatchListResponse).payload.watches };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error listing watches: ${error}` };
+  }
+}
+
+async function removeWatch(args: {
+  id: string;
+}): Promise<{ success: true; was_present: boolean } | { success: false; error: string }> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "RemoveWatch",
+      payload: { id: args.id },
+    })) as DaemonResponse;
+    if (response.type === "WatchRemoved") {
+      return { success: true, was_present: (response as WatchRemovedResponse).payload.was_present };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error removing watch: ${error}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase C: monitoring + subscription helpers (Issue #3455)
 // ---------------------------------------------------------------------------
 
 async function getSweepStatus(args: {
   sweep_id: string;
+  workspace_root?: string;
 }): Promise<{ success: true; info: SweepInfo | null } | { success: false; error: string }> {
   try {
-    const response = (await sendDaemonRequest({
-      type: "GetSweepStatus",
-      payload: { sweep_id: args.sweep_id },
-    })) as DaemonResponse;
+    const response = (await sendDaemonRequest(
+      {
+        type: "GetSweepStatus",
+        payload: { sweep_id: args.sweep_id, workspace_root: args.workspace_root ?? null },
+      },
+      // Issue #3973: read path reconciles liveness before responding — same
+      // bounded headroom as list_sweeps.
+      Math.max(READ_PATH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs())
+    )) as DaemonResponse;
 
     if (response.type === "SweepStatus") {
       return { success: true, info: (response as SweepStatusResponse).payload.info };
@@ -301,6 +522,7 @@ async function getSweepStatus(args: {
 async function tailSweepLog(args: {
   sweep_id: string;
   lines: number;
+  workspace_root?: string;
 }): Promise<
   | { success: true; payload: SweepLogTailResponse["payload"] }
   | { success: false; error: string }
@@ -308,7 +530,7 @@ async function tailSweepLog(args: {
   try {
     const response = (await sendDaemonRequest({
       type: "TailSweepLog",
-      payload: { sweep_id: args.sweep_id, lines: args.lines },
+      payload: { sweep_id: args.sweep_id, lines: args.lines, workspace_root: args.workspace_root ?? null },
     })) as DaemonResponse;
 
     if (response.type === "SweepLogTail") {
@@ -324,15 +546,22 @@ async function tailSweepLog(args: {
 async function cancelSweep(args: {
   sweep_id: string;
   grace_secs: number;
+  workspace_root?: string;
 }): Promise<
   | { success: true; payload: SweepCancelledResponse["payload"] }
   | { success: false; error: string }
 > {
   try {
-    const response = (await sendDaemonRequest({
-      type: "CancelSweep",
-      payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs },
-    })) as DaemonResponse;
+    const response = (await sendDaemonRequest(
+      {
+        type: "CancelSweep",
+        payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs, workspace_root: args.workspace_root ?? null },
+      },
+      Math.max(
+        args.grace_secs * 1000 + CANCEL_TIMEOUT_BUFFER_MS,
+        resolveDaemonIpcTimeoutMs()
+      )
+    )) as DaemonResponse;
 
     if (response.type === "SweepCancelled") {
       return { success: true, payload: (response as SweepCancelledResponse).payload };
@@ -450,6 +679,39 @@ export const sweepTools: Tool[] = [
             "Omit to preserve the session/CLI default (no --model flag is " +
             "emitted at all).",
         },
+        effort: {
+          type: "string",
+          description:
+            "Optional reasoning-effort level for the spawned sweep child " +
+            "(issue #3716), e.g. `low|medium|high|xhigh|max`. Mirrors " +
+            "`model`: forwarded to the child as `--effort <level>` (the " +
+            "highest-precedence tier, beating any ambient LOOM_EFFORT). " +
+            "Omit (or pass an empty string) to preserve the session-default " +
+            "effort (no --effort flag is emitted at all). Level validation " +
+            "is owned by the `claude` CLI, not the daemon.",
+        },
+        depends_on: {
+          type: "number",
+          description:
+            "Optional single parent issue number this sweep is stacked on " +
+            "(issue #3729, stacked-PR v1). When set, the daemon appends " +
+            "`--depends-on <N>` to the `/loom:sweep` argv so the child " +
+            "branches its worktree/PR off `feature/issue-<N>` instead of the " +
+            "default branch, and the reaper blocks the child's subtree if the " +
+            "parent ends in `loom:blocked`. A single optional parent (not a " +
+            "list) makes diamonds / multi-parent stacks unrepresentable. Omit " +
+            "for an independent sweep (no --depends-on flag is emitted).",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "dispatch into the daemon's default workspace (unchanged behavior). " +
+            "Provide a registered repo root to dispatch the sweep into that " +
+            "repo's working tree / sweep registry — required to address a " +
+            "managed repo other than the default when two repos share issue " +
+            "numbers.",
+        },
       },
       required: ["kind"],
     },
@@ -471,6 +733,16 @@ export const sweepTools: Tool[] = [
           enum: ["Pending", "Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "list the default workspace's sweeps (unchanged behavior). Provide " +
+            "a registered repo root to list the sweeps tracked by that repo's " +
+            "registry — the way to observe sweeps the daemon autonomously " +
+            "dispatched into a managed repo other than the default. Each " +
+            "returned SweepInfo also carries a `repo` field naming its owner.",
         },
       },
     },
@@ -498,6 +770,14 @@ export const sweepTools: Tool[] = [
             "SweepInfo. Defaults to 10. The bus is in-memory and transient " +
             "— this is a best-effort recent-history sample, not a replay log.",
         },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "look the sweep up in the default workspace (unchanged behavior). " +
+            "Provide a registered repo root to resolve the sweep against that " +
+            "repo's registry.",
+        },
       },
       required: ["sweep_id"],
     },
@@ -520,6 +800,14 @@ export const sweepTools: Tool[] = [
         lines: {
           type: "number",
           description: "Number of trailing lines to return. Defaults to 100.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "resolve the log against the default workspace (unchanged " +
+            "behavior). Provide a registered repo root to resolve it against " +
+            "that repo's registry.",
         },
       },
       required: ["sweep_id"],
@@ -616,6 +904,15 @@ export const sweepTools: Tool[] = [
             "of 0 escalates to SIGKILL immediately after the first poll " +
             "iteration (~100ms).",
         },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "cancel a sweep tracked by the default workspace (unchanged " +
+            "behavior). Provide a registered repo root to cancel a sweep " +
+            "tracked by that repo's registry — required to cancel a sweep the " +
+            "daemon autonomously dispatched into a non-default managed repo.",
+        },
       },
       required: ["sweep_id"],
     },
@@ -649,6 +946,73 @@ export const sweepTools: Tool[] = [
       },
     },
   },
+  {
+    name: "register_watch",
+    description:
+      "Register a DURABLE watch on an issue's or PR's terminal state (issue " +
+      "#3971). Unlike an in-session background poll — which dies when the " +
+      "operator's Claude Code session crashes — this watch is persisted by the " +
+      "long-lived loom-daemon (`~/.loom/watches.json`), so it survives both the " +
+      "registering session AND a daemon restart. The daemon polls the forge and, " +
+      "when the target reaches a terminal state (closed / merged / blocked) or " +
+      "the expiry window elapses, appends a result line to " +
+      "`~/.loom/logs/watch-results.log` — a file a later session can trivially " +
+      "read. Works cross-repo: pass `repo` (a forge slug `owner/name`) to watch " +
+      "an issue in a repo this machine may not even manage. Idempotent — " +
+      "re-registering the same target returns the existing watch.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        number: { type: "number", description: "The issue or PR number to watch." },
+        kind: {
+          type: "string",
+          enum: ["issue", "pr"],
+          description: "Whether `number` is an issue or a pull request. Defaults to `issue`.",
+        },
+        repo: {
+          type: "string",
+          description:
+            "Forge slug `owner/name` (preferred — works cross-repo). Omit to " +
+            "resolve from `workspace_root` or the daemon's own cwd.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Managed-workspace root the `gh` query runs in when `repo` is " +
+            "absent (mirrors the `workspace_root` param on dispatch_sweep / " +
+            "list_sweeps).",
+        },
+        note: {
+          type: "string",
+          description: "Optional note surfaced in the recorded result line.",
+        },
+      },
+      required: ["number"],
+    },
+  },
+  {
+    name: "list_watches",
+    description:
+      "List the durable watches currently registered with the loom-daemon " +
+      "(issue #3971). Returns a JSON array of WatchSpec records. Resolved " +
+      "watches are removed from this list and recorded in " +
+      "`~/.loom/logs/watch-results.log`.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "remove_watch",
+    description:
+      "Remove a registered durable watch by its id (issue #3971), as printed " +
+      "by `register_watch` / `list_watches`. Removing an unknown id is a no-op " +
+      "success.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The watch id to remove." },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 // ============================================================================
@@ -669,12 +1033,17 @@ function formatSweepLine(info: SweepInfo): string {
     `  Token:      ${info.token_name}`,
     // Issue #3482 (Phase 3a): absent model renders as "default".
     `  Model:      ${info.model ?? "default"}`,
+    // Issue #3716: absent effort renders as "default".
+    `  Effort:     ${info.effort ?? "default"}`,
     `  Log:        ${info.log_path}`,
     `  Started:    ${info.started_at}`,
   ];
   if (info.latest_phase) parts.push(`  Phase:      ${info.latest_phase}`);
   if (info.pr_number !== undefined && info.pr_number !== null)
     parts.push(`  PR:         #${info.pr_number}`);
+  // Issue #3929: name the owning managed-workspace root when present so two
+  // repos' identically-numbered issues are distinguishable in the listing.
+  if (info.repo) parts.push(`  Repo:       ${info.repo}`);
   if (info.idempotency_key)
     parts.push(`  Idem. key:  ${info.idempotency_key}`);
   return parts.join("\n");
@@ -731,8 +1100,31 @@ export async function handleSweepTool(
         typeof args?.model === "string" && args.model.length > 0
           ? (args.model as string)
           : undefined;
+      // Issue #3716: optional reasoning-effort override, mirroring `model`.
+      // Empty strings are treated as unset so the daemon never receives
+      // `--effort ""`.
+      const effort =
+        typeof args?.effort === "string" && args.effort.length > 0
+          ? (args.effort as string)
+          : undefined;
+      // Issue #3729 (stacked-PR v1): optional single parent issue. Only a
+      // positive integer is forwarded; anything else is treated as unset so
+      // the daemon never receives a spurious `--depends-on`.
+      const dependsOn =
+        typeof args?.depends_on === "number" &&
+        Number.isInteger(args.depends_on) &&
+        args.depends_on > 0
+          ? (args.depends_on as number)
+          : undefined;
 
-      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey, model });
+      const result = await dispatchSweep({
+        kind: normalized,
+        idempotency_key: idempotencyKey,
+        model,
+        effort,
+        depends_on: dependsOn,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -749,6 +1141,9 @@ export async function handleSweepTool(
         // is attributable from the dispatch transcript alone. "default"
         // means no --model flag was emitted (session/CLI default).
         `Model:      ${model ?? "default"}`,
+        // Issue #3716: echo the dispatched effort alongside the model.
+        // "default" means no --effort flag was emitted (session default).
+        `Effort:     ${effort ?? "default"}`,
         `Log:        ${result.result.log_path}`,
       ].join("\n");
       return [
@@ -763,7 +1158,10 @@ export async function handleSweepTool(
       const stateArg = args?.state_filter;
       const stateFilter = stateArg === undefined ? null : buildStateFilter(stateArg);
 
-      const result = await listSweeps({ state_filter: stateFilter });
+      const result = await listSweeps({
+        state_filter: stateFilter,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -807,7 +1205,10 @@ export async function handleSweepTool(
           ? Math.max(0, Math.floor(recentEventsArg))
           : 10;
 
-      const statusResult = await getSweepStatus({ sweep_id: sweepId });
+      const statusResult = await getSweepStatus({
+        sweep_id: sweepId,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!statusResult.success) {
         return [
           {
@@ -884,7 +1285,11 @@ export async function handleSweepTool(
           ? Math.max(0, Math.floor(linesArg))
           : 100;
 
-      const result = await tailSweepLog({ sweep_id: sweepId, lines });
+      const result = await tailSweepLog({
+        sweep_id: sweepId,
+        lines,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -1015,7 +1420,11 @@ export async function handleSweepTool(
           ? Math.floor(graceArg)
           : 30;
 
-      const result = await cancelSweep({ sweep_id: sweepId, grace_secs: graceSecs });
+      const result = await cancelSweep({
+        sweep_id: sweepId,
+        grace_secs: graceSecs,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -1096,6 +1505,97 @@ export async function handleSweepTool(
           text: `=== Tail Event Bus ===\n\n${summary}\n\nFrames:\n${body}`,
         },
       ];
+    }
+
+    case "register_watch": {
+      const number =
+        typeof args?.number === "number" && Number.isInteger(args.number) && args.number > 0
+          ? (args.number as number)
+          : undefined;
+      if (number === undefined) {
+        return [
+          {
+            type: "text",
+            text: "=== Register Watch ===\n\nFailed\n\nError: `number` is required (a positive integer issue/PR number).",
+          },
+        ];
+      }
+      const kind: WatchKind = args?.kind === "pr" ? "pr" : "issue";
+      const repo =
+        typeof args?.repo === "string" && args.repo.length > 0 ? (args.repo as string) : undefined;
+      const note =
+        typeof args?.note === "string" && args.note.length > 0 ? (args.note as string) : undefined;
+
+      const result = await registerWatch({
+        kind,
+        number,
+        repo,
+        workspace_root: extractWorkspaceRoot(args),
+        note,
+      });
+      if (!result.success) {
+        return [{ type: "text", text: `=== Register Watch ===\n\nFailed\n\n${result.error}` }];
+      }
+      const w = result.watch;
+      const where = w.repo ?? w.workspace_root ?? "default workspace";
+      const status = result.already_present ? "Already watching (no-op)" : "Registered";
+      const body = [
+        `Watch ID:   ${w.id}`,
+        `Target:     ${w.kind} #${w.number} in ${where}`,
+        w.note ? `Note:       ${w.note}` : null,
+        "Terminal state will be recorded to ~/.loom/logs/watch-results.log",
+      ]
+        .filter((l): l is string => l !== null)
+        .join("\n");
+      return [{ type: "text", text: `=== Register Watch ===\n\n${status}\n\n${body}` }];
+    }
+
+    case "list_watches": {
+      const result = await listWatches();
+      if (!result.success) {
+        return [{ type: "text", text: `=== List Watches ===\n\nFailed\n\n${result.error}` }];
+      }
+      if (result.watches.length === 0) {
+        return [
+          {
+            type: "text",
+            text: "=== List Watches ===\n\nSuccess\n\nNo durable watches registered.",
+          },
+        ];
+      }
+      const body = result.watches
+        .map((w) => {
+          const where = w.repo ?? w.workspace_root ?? "default workspace";
+          const note = w.note ? ` — ${w.note}` : "";
+          return `* ${w.id}\n  ${w.kind} #${w.number} in ${where}${note}`;
+        })
+        .join("\n");
+      return [
+        {
+          type: "text",
+          text: `=== List Watches ===\n\nSuccess (${result.watches.length})\n\n${body}`,
+        },
+      ];
+    }
+
+    case "remove_watch": {
+      const id = typeof args?.id === "string" && args.id.length > 0 ? (args.id as string) : undefined;
+      if (id === undefined) {
+        return [
+          {
+            type: "text",
+            text: "=== Remove Watch ===\n\nFailed\n\nError: `id` is required.",
+          },
+        ];
+      }
+      const result = await removeWatch({ id });
+      if (!result.success) {
+        return [{ type: "text", text: `=== Remove Watch ===\n\nFailed\n\n${result.error}` }];
+      }
+      const msg = result.was_present
+        ? `Removed watch ${id}.`
+        : `No watch with id ${id} — nothing to remove (no-op).`;
+      return [{ type: "text", text: `=== Remove Watch ===\n\nSuccess\n\n${msg}` }];
     }
 
     default:

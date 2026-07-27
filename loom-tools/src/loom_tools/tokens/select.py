@@ -1,16 +1,30 @@
 """Token selection algorithm — 3-tier priority.
 
 Selection order:
-    1. Ranking file (.ranking, <10 min old): a JSON document written by
-       ``loom_tools.tokens.check.write_ranking_atomic`` shaped as
-       ``{"ranked_at": ..., "accounts": [{"name", "status", ...}, ...]}``.
-       Pick the first non-exhausted/non-blocked account in the
-       ``accounts`` list order (the writer already sorts by rank),
-       skipping bad tokens.
+    1. Ranking file (.ranking, <10 min old): rotate one-per-account across the
+       accounts whose probe status is an allowlisted known-good status (issue
+       #3991 — ``available``/unflagged, and never bad-marked) using a
+       persistent rotation cursor, so a burst of N concurrent dispatches spreads
+       across ``min(N, available)`` distinct accounts rather than stacking on the
+       single best-ranked (issue #3909, superseding the earlier random top-N
+       spread of #3736). The rotation window spans *all* available accounts by
+       default; ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN`` optionally
+       caps it to the top-N most-available (N=1 = greedy first-eligible).
     2. Allowlist file (.allowlist): random pick from allowed accounts.
     3. Random pick from all .token files.
 
 In all tiers, tokens marked bad (via bad_tokens.is_bad) are skipped.
+
+Stale-ranking fail-safe (issue #3894): when ``.ranking`` exists but is older
+than the freshness window, tier-1 declines — but rather than discarding the
+ranking entirely and degrading to *fully-random* selection into accounts a
+recent probe already flagged non-healthy (which wedges sweeps at startup), the
+stale ranking's non-healthy entries (allowlist-based, issue #3991: everything
+not positively ``available``/unflagged) are carried forward as an **advisory
+exclusion set** applied to the allowlist and random tiers. If the
+exclusions would empty the pool (e.g. a stale "everything exhausted" ranking),
+selection retries ignoring them so a live pool can never hard-fail on stale
+advice.
 
 This module is import-safe: no I/O occurs at import time. Both the daemon
 (via ``import``) and the bash wrapper (via ``python3 -m``) call
@@ -30,24 +44,55 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from loom_tools.common.config import env_int
 from loom_tools.tokens.bad_tokens import is_bad
-from loom_tools.tokens.providers import (
-    DEFAULT_PROVIDER,
-    KNOWN_PROVIDERS,
-    env_var_for_provider,
-    load_provider_map,
-    provider_of,
-)
+from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
+from loom_tools.tokens.rotation import next_rotation_index
 
 # Ranking file is considered fresh for this many seconds.
 _RANKING_FRESH_SECONDS = 600  # 10 min
 
 # Exit code when no token is available (matches sysexits.h EX_CONFIG)
 EX_CONFIG = 78
+
+# Rotation window cap for the ranked tier. ``None`` (the default) means "rotate
+# across *all* available accounts" — issue #3909: distributing concurrent
+# dispatches one-per-account across every available account (not just a top-N
+# slice) is what lets the pool run at full speed and drain evenly. A positive
+# ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN`` optionally caps the window
+# to the top-N most-available accounts (N=1 = greedy first-eligible, the
+# historical behavior); a value <= 0 also means unbounded.
+_DEFAULT_SPREAD_TOP_N: int | None = None
+
+# Ranking-status handling is an *allowlist of known-good statuses*, not a
+# denylist of known-bad ones (issue #3991). The account probe assigns one of
+# (see CLAUDE.md → token health probe): ``available`` (utilizations < 95%),
+# ``exhausted`` (7d utilization >= 95%), ``rate_limited`` (currently 429),
+# ``blocked`` (401 auth failure). A denylist silently treats any *new* or
+# unrecognized status as eligible (fail-open) — which is exactly how
+# ``rate_limited`` leaked through: it was the probe's most severe live verdict
+# yet the one status tier-1 selection did not skip, handing sweeps a dead token
+# that died instantly on the weekly limit. An allowlist fails *safe*: a status
+# not positively known to be good is excluded from the preferred pass by
+# default, so a future probe status can never be silently dispatched into.
+#
+# The empty string is included because a ranking line with no status field
+# (``name|``) means "probe recorded no adverse signal" — the historical
+# convention for a healthy/unflagged account — not a named bad status.
+_HEALTHY_STATUSES = frozenset({"available", ""})
+
+# Statuses hard-excluded from tier-1 in *every* pass, even the empty-pool
+# fallback: the probe positively flagged the account as dead (over the 7d
+# quota, or a 401 auth failure). ``rate_limited`` is deliberately *not* here —
+# a 429 can be a genuinely transient limit, so it is excluded from the
+# preferred (healthy-only) pass but allowed back in the fallback pass when it
+# is all that is left, so a fully-rate-limited pool can still dispatch rather
+# than hard-failing.
+_TIER1_HARD_EXCLUDED = frozenset({"exhausted", "blocked"})
 
 
 class TokenSelectionError(Exception):
@@ -66,7 +111,18 @@ class SelectedToken:
     file: Path  # absolute path to .token file
     key: str  # token contents (whitespace-stripped)
     mode: str  # "ranked" | "allowlist" | "random"
-    provider: str = DEFAULT_PROVIDER  # account provider (from index.json)
+
+
+def _shared_pool_hint() -> str:
+    """Return a parenthetical naming the shared pool that was also checked.
+
+    Empty when the shared fallback is disabled (``LOOM_SHARED_TOKENS_DIR=``),
+    so the error message stays accurate in both configurations (issue #3938).
+    """
+    shared = shared_tokens_dir()
+    if shared is None:
+        return ""
+    return f" (shared machine-level pool {shared} also checked)"
 
 
 def _read_token_file(token_path: Path) -> str:
@@ -95,51 +151,59 @@ def _strip_comment(line: str) -> str:
 
 
 def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
-    """Yield (name, status) pairs from the ranking file, in ranked order.
+    """Yield (name, status) pairs from the ranking file, soonest-reset first.
 
-    The ranking file is the JSON document written by
-    ``loom_tools.tokens.check.write_ranking_atomic``:
-
-    .. code-block:: json
-
-        {
-          "ranked_at": "2026-...Z",
-          "accounts": [
-            {"name": "...", "status": "available|exhausted|...", ...},
-            ...
-          ]
-        }
-
-    ``accounts`` is already sorted by rank (best account first) by the
-    writer, so this simply walks the list in order and yields
-    ``(name, status)`` for each entry, skipping entries missing a
-    ``name``. Missing files, invalid JSON, or an unexpected top-level
-    shape (not a dict, or no ``accounts`` list) are treated as "no
-    ranking data" — this degrades gracefully to tier-2/tier-3 selection
-    rather than raising, since a corrupt or stale-format ``.ranking``
-    file should never crash the CLI.
+    Two formats are accepted:
+      * JSON (current probe-tokens.sh output): ``{"accounts": [{"name",
+        "status", "7d_reset", ...}]}`` — accounts are already sorted by
+        soonest reset; ``status`` "available" maps to "" (usable), others
+        (exhausted/blocked) pass through so the caller skips them.
+      * Legacy ``name|status`` per line (``#`` comments skipped).
     """
     try:
-        raw = ranking_file.read_text(encoding="utf-8")
+        text = ranking_file.read_text(encoding="utf-8")
     except OSError:
         return
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return
-    if not isinstance(payload, dict):
-        return
-    accounts = payload.get("accounts")
-    if not isinstance(accounts, list):
-        return
-    for entry in accounts:
-        if not isinstance(entry, dict):
+    if text.lstrip().startswith("{"):
+        try:
+            accts = json.loads(text).get("accounts", [])
+            # WATERFALL FILL (Graham 2026-07-22): keep ranked order (soonest
+            # weekly reset first — expiring capacity is use-it-or-lose-it) but
+            # skip accounts already loaded past the sustainable-5h threshold;
+            # overflow cascades to the next-soonest. Uniform spreading is
+            # explicitly NOT wanted (it strands expiring capacity); pure
+            # concentration is not either (mass 5h stalls). The launcher's
+            # synthetic per-spawn bump makes in-burst load visible here.
+            def _load(a):
+                try:
+                    return float(a.get("5h_utilization") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            _THRESH = 0.70
+            under = [a for a in accts if _load(a) < _THRESH]
+            over = [a for a in accts if _load(a) >= _THRESH]
+            # ranked order preserved within each tier; loaded accounts remain
+            # eligible as last resort rather than failing the pool.
+            accts = under + over
+            for acct in accts:
+                name = (acct.get("name") or "").strip()
+                status = (acct.get("status") or "").strip()
+                if status == "available":
+                    status = ""
+                if name:
+                    yield name, status
+            return
+        except (ValueError, AttributeError):
+            pass  # fall through to legacy parse
+    for raw in text.splitlines():
+        stripped = _strip_comment(raw)
+        if not stripped:
             continue
-        name = entry.get("name")
-        if not name:
-            continue
-        status = entry.get("status") or ""
-        yield name, status
+        parts = stripped.split("|", 1)
+        name = parts[0].strip()
+        status = parts[1].strip() if len(parts) > 1 else ""
+        if name:
+            yield name, status
 
 
 def _read_allowlist(allowlist_file: Path) -> list[str]:
@@ -155,35 +219,168 @@ def _read_allowlist(allowlist_file: Path) -> list[str]:
     return out
 
 
+def _resolve_spread_top_n(workspace_path: Path) -> int | None:
+    """Resolve the rotation-window cap for the ranked strategy.
+
+    Precedence (highest first), mirroring the nested-key + env-override
+    precedent in ``common/paths.py`` and ``common/gitea.py``:
+
+        1. ``LOOM_TOKEN_SPREAD_TOP_N`` env var.
+        2. ``.loom/config.json`` -> ``tokens.spreadTopN`` (soft-fail read).
+        3. Default (``_DEFAULT_SPREAD_TOP_N`` = ``None`` = unbounded).
+
+    Returns the positive cap, or ``None`` meaning "rotate across all available
+    accounts" (issue #3909). A configured value ``<= 0`` also means unbounded.
+    ``N == 1`` restores the historical greedy first-eligible behavior exactly
+    (back-compat escape hatch).
+    """
+    # 1. Env var override (highest precedence).
+    if os.environ.get("LOOM_TOKEN_SPREAD_TOP_N") is not None:
+        n = env_int("LOOM_TOKEN_SPREAD_TOP_N", default=0)
+        return n if n >= 1 else None
+
+    # 2. Config key — .loom/config.json -> tokens.spreadTopN (soft-fail read).
+    config_n = _read_config_spread_top_n(workspace_path)
+    if config_n is not None:
+        return config_n if config_n >= 1 else None
+
+    # 3. Default (unbounded).
+    return _DEFAULT_SPREAD_TOP_N
+
+
+def _read_config_spread_top_n(workspace_path: Path) -> int | None:
+    """Read ``.loom/config.json`` -> ``tokens.spreadTopN``, soft-failing to ``None``.
+
+    Missing file, parse error, missing key, or a non-int value all resolve to
+    ``None`` (never a hard error), mirroring the soft-fail config reads in
+    ``common/paths.py``.
+    """
+    # Imported lazily to keep this module import-safe (no I/O / heavy deps at
+    # import time — see module docstring).
+    from loom_tools.common.state import read_json_file
+
+    config_path = workspace_path / ".loom" / "config.json"
+    data = read_json_file(config_path, default={})
+    if not isinstance(data, dict):
+        return None
+    tokens_cfg = data.get("tokens")
+    if not isinstance(tokens_cfg, dict):
+        return None
+    value = tokens_cfg.get("spreadTopN")
+    # Reject bool (a subclass of int) and non-int values.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _try_ranking(
     tokens_dir: Path,
     ranking_file: Path,
     workspace_path: Path,
     rng: random.Random,
-    eligible: set[str],
 ) -> SelectedToken | None:
-    """Strategy 1: read .ranking, return first non-exhausted/non-blocked entry."""
+    """Strategy 1: read .ranking, rotate one-per-account across eligible entries.
+
+    Historically this returned the *first* non-exhausted/non-blocked entry, so
+    every concurrent spawner reading a fresh ranking picked the identical
+    account, serializing load onto one account (issue #3736). #3736 mitigated
+    this with a random pick among the top-N; but a burst of N concurrent
+    dispatches still stacked several onto the same account, exhausting its 5h
+    limit while others idled (issue #3909).
+
+    We now collect the eligible ranked entries (allowing only known-good
+    statuses, skipping bad/missing/empty tokens, preserving most-available-first
+    ranking order) and select via a persistent rotation cursor, so consecutive
+    selections — whether sequential or concurrent — round-robin one-per-account
+    across all available accounts, in rotating order. The window spans every
+    eligible account by default; ``_resolve_spread_top_n`` optionally caps it to
+    the top-N most-available (``N == 1`` restores the greedy first-eligible
+    behavior).
+
+    Status handling is an *allowlist* of known-good statuses
+    (``_HEALTHY_STATUSES``), not a denylist (issue #3991). The preferred pass
+    selects only accounts positively flagged healthy, so a status not known to
+    be good — ``rate_limited`` (a live 429), or any *future* probe status — is
+    excluded by default rather than silently treated as eligible. Only if that
+    pass yields nothing does a fallback pass admit the non-hard-excluded rest
+    (``rate_limited`` and unknown statuses, but never ``exhausted``/``blocked``
+    per ``_TIER1_HARD_EXCLUDED``), so a fully rate-limited pool can still
+    dispatch rather than hard-failing.
+    """
     age = _file_age_seconds(ranking_file)
     if age is None or age >= _RANKING_FRESH_SECONDS:
         return None
-    for name, status in _read_ranking(ranking_file):
-        if status in ("exhausted", "blocked"):
-            continue
-        if name not in eligible:
-            continue
-        token_file = tokens_dir / f"{name}.token"
-        if not token_file.is_file():
-            continue
-        if is_bad(workspace_path, name):
-            continue
-        try:
-            key = _read_token_file(token_file)
-        except OSError:
-            continue
-        if not key:
-            continue
-        return SelectedToken(name=name, file=token_file, key=key, mode="ranked")
-    return None
+
+    cap = _resolve_spread_top_n(workspace_path)
+
+    def _collect(*, healthy_only: bool) -> list[SelectedToken]:
+        out: list[SelectedToken] = []
+        for name, status in _read_ranking(ranking_file):
+            # Hard-excluded in every pass: the probe flagged the account dead.
+            if status in _TIER1_HARD_EXCLUDED:
+                continue
+            # Preferred pass: allowlist — only positively-healthy statuses.
+            # Fallback pass admits the rest (rate_limited / unknown statuses).
+            if healthy_only and status not in _HEALTHY_STATUSES:
+                continue
+            token_file = tokens_dir / f"{name}.token"
+            if not token_file.is_file():
+                continue
+            if is_bad(workspace_path, name):
+                continue
+            try:
+                key = _read_token_file(token_file)
+            except OSError:
+                continue
+            if not key:
+                continue
+            out.append(
+                SelectedToken(name=name, file=token_file, key=key, mode="ranked"),
+            )
+            if cap is not None and len(out) >= cap:
+                break
+        return out
+
+    eligible = _collect(healthy_only=True)
+    if not eligible:
+        eligible = _collect(healthy_only=False)
+
+    if not eligible:
+        return None
+    index = next_rotation_index(tokens_dir, len(eligible), rng)
+    return eligible[index]
+
+
+def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
+    """Advisory exclusion set sourced from a *stale* ``.ranking`` (issue #3894).
+
+    When ``.ranking`` is older than the freshness window, tier-1 (``_try_ranking``)
+    declines and selection would otherwise degrade to fully-random — repeatedly
+    handing out accounts a recent probe already flagged non-healthy, wedging
+    sweeps at startup. Rather than discard the stale ranking, exclude every
+    account *not* positively flagged healthy from the lower tiers.
+
+    Like tier-1 (``_try_ranking``), this is an *allowlist* of known-good
+    statuses (``_HEALTHY_STATUSES``), not a denylist (issue #3991): an account
+    is advisory-excluded unless its stale status is positively healthy, so
+    ``exhausted``/``blocked``/``rate_limited`` *and any future probe status* are
+    all excluded rather than a hardcoded bad-status list silently leaking new
+    ones through. The caller's existing fail-safe already retries without
+    exclusions if they would empty the pool, so this can only ever prefer a
+    healthier account, never hard-fail one.
+
+    Returns an empty set when the ranking is fresh (tier-1 owns that case) or
+    missing/unreadable — so callers get exclusions *only* in the stale-but-present
+    window, and the pre-#3894 behavior is preserved everywhere else.
+    """
+    age = _file_age_seconds(ranking_file)
+    if age is None or age < _RANKING_FRESH_SECONDS:
+        return set()
+    return {
+        name
+        for name, status in _read_ranking(ranking_file)
+        if status not in _HEALTHY_STATUSES
+    }
 
 
 def _try_allowlist(
@@ -191,23 +388,27 @@ def _try_allowlist(
     allowlist_file: Path,
     workspace_path: Path,
     rng: random.Random,
-    eligible: set[str],
+    exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
-    """Strategy 2: random pick from allowlist."""
+    """Strategy 2: random pick from allowlist.
+
+    ``exclude`` is an advisory set of account names to skip (stale-ranking
+    exhausted/blocked entries, issue #3894).
+    """
     if not allowlist_file.is_file():
         return None
     names = _read_allowlist(allowlist_file)
-    candidates: list[Path] = []
+    eligible: list[Path] = []
     for name in names:
-        if name not in eligible:
+        if name in exclude:
             continue
         token_file = tokens_dir / f"{name}.token"
         if token_file.is_file() and not is_bad(workspace_path, name):
-            candidates.append(token_file)
-    if not candidates:
+            eligible.append(token_file)
+    if not eligible:
         return None
-    rng.shuffle(candidates)
-    for token_file in candidates:
+    rng.shuffle(eligible)
+    for token_file in eligible:
         try:
             key = _read_token_file(token_file)
         except OSError:
@@ -227,13 +428,17 @@ def _try_random(
     tokens_dir: Path,
     workspace_path: Path,
     rng: random.Random,
-    eligible: set[str],
+    exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
-    """Strategy 3: random pick from all tokens."""
+    """Strategy 3: random pick from all tokens.
+
+    ``exclude`` is an advisory set of account names to skip (stale-ranking
+    exhausted/blocked entries, issue #3894).
+    """
     candidates = [
         p
         for p in _list_token_files(tokens_dir)
-        if p.stem in eligible and not is_bad(workspace_path, p.stem)
+        if not is_bad(workspace_path, p.stem) and p.stem not in exclude
     ]
     if not candidates:
         return None
@@ -257,7 +462,6 @@ def _try_random(
 def select_token(
     workspace_path: Path | str,
     *,
-    provider: str = DEFAULT_PROVIDER,
     rng: random.Random | None = None,
 ) -> SelectedToken:
     """Select an OAuth token using the 3-tier algorithm.
@@ -266,53 +470,40 @@ def select_token(
         workspace_path: Repo root containing ``.loom/tokens/``. When called
             from a worktree, pass the canonical (main checkout) root, not
             the worktree path.
-        provider: Only consider accounts belonging to this provider
-            (default ``anthropic`` — unchanged behavior for existing
-            callers). Accounts absent from ``index.json``, or recorded
-            without a provider field, are treated as ``anthropic``.
         rng: Optional random.Random instance for deterministic testing.
             Defaults to a module-level Random seeded from os.urandom.
 
     Returns:
-        SelectedToken with name, absolute file path, key, selection mode,
-        and provider.
+        SelectedToken with name, absolute file path, key, and selection mode.
 
     Raises:
         EmptyTokenPoolError: When ``.loom/tokens/`` is missing, contains no
-            ``.token`` files, no token belongs to *provider*, or every
-            eligible token is marked bad.
+            ``.token`` files, or every token is marked bad.
             The bash wrapper hard-fails (exit 78) and prompts the user to
             run ``loom-tokens bootstrap`` — never silently falls back.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    # Resolve the effective pool dir (issue #3938): the per-repo pool when it
+    # holds tokens, else the shared machine-level pool (~/.loom/tokens, override
+    # LOOM_SHARED_TOKENS_DIR), else the per-repo path for a sensible error. All
+    # pool-state files (.bad_tokens/.ranking/.allowlist/.failure_counts) are
+    # keyed off this same resolution, so they never fork per repo.
+    tokens_dir = resolve_tokens_dir(workspace_path)
 
     if not tokens_dir.is_dir():
         raise EmptyTokenPoolError(
-            f"Token directory does not exist: {tokens_dir}. "
-            f"Run `loom-tokens bootstrap` to populate it.",
+            f"Token directory does not exist: {tokens_dir}"
+            f"{_shared_pool_hint()}. "
+            f"Run `loom-tokens bootstrap` to populate it "
+            f"(or `loom-tokens bootstrap --shared` for the machine-level pool).",
         )
 
     all_tokens = _list_token_files(tokens_dir)
     if not all_tokens:
         raise EmptyTokenPoolError(
-            f"No .token files in {tokens_dir}. Run `loom-tokens bootstrap`.",
-        )
-
-    # Provider filter (#12). With no index.json (or entries without a
-    # provider field) every account resolves to the default provider, so
-    # the default-provider call sees the identical candidate set as
-    # before provider-awareness existed.
-    pmap = load_provider_map(tokens_dir)
-    eligible = {
-        p.stem for p in all_tokens if provider_of(p.stem, pmap) == provider
-    }
-    if not eligible:
-        raise EmptyTokenPoolError(
-            f"No tokens for provider '{provider}' in {tokens_dir} "
-            f"({len(all_tokens)} token(s) belong to other providers). "
-            f"Add ACCOUNT_PROVIDER_N={provider} accounts to .env and run "
-            f"`loom-tokens bootstrap`.",
+            f"No .token files in {tokens_dir}{_shared_pool_hint()}. "
+            f"Run `loom-tokens bootstrap` "
+            f"(or `loom-tokens bootstrap --shared` for the machine-level pool).",
         )
 
     if rng is None:
@@ -321,21 +512,40 @@ def select_token(
     ranking_file = tokens_dir / ".ranking"
     allowlist_file = tokens_dir / ".allowlist"
 
-    selected = _try_ranking(
-        tokens_dir, ranking_file, workspace_path, rng, eligible
-    )
-    if selected is None:
-        selected = _try_allowlist(
-            tokens_dir, allowlist_file, workspace_path, rng, eligible
-        )
-    if selected is None:
-        selected = _try_random(tokens_dir, workspace_path, rng, eligible)
+    selected = _try_ranking(tokens_dir, ranking_file, workspace_path, rng)
     if selected is not None:
-        return replace(selected, provider=provider)
+        return selected
+
+    # Tier-1 declined: .ranking is absent or stale. If a stale ranking exists,
+    # carry its exhausted/blocked entries forward as an advisory exclusion set
+    # so the lower tiers don't degrade to random selection into known-bad
+    # accounts (issue #3894). A fresh/missing ranking yields no exclusions.
+    exclude = _stale_ranking_exclusions(ranking_file)
+
+    selected = _try_allowlist(
+        tokens_dir, allowlist_file, workspace_path, rng, exclude=exclude,
+    )
+    if selected is not None:
+        return selected
+
+    selected = _try_random(tokens_dir, workspace_path, rng, exclude=exclude)
+    if selected is not None:
+        return selected
+
+    # Fail-safe: the advisory exclusions emptied the pool (e.g. a stale
+    # "everything exhausted" ranking). Retry ignoring them so a live pool can
+    # never hard-fail on stale advice — better to spawn into a possibly-tired
+    # account than to refuse all work.
+    if exclude:
+        selected = _try_allowlist(tokens_dir, allowlist_file, workspace_path, rng)
+        if selected is not None:
+            return selected
+        selected = _try_random(tokens_dir, workspace_path, rng)
+        if selected is not None:
+            return selected
 
     raise EmptyTokenPoolError(
-        f"All {len(eligible)} '{provider}' tokens in {tokens_dir} are "
-        f"marked bad or empty. "
+        f"All {len(all_tokens)} tokens in {tokens_dir} are marked bad or empty. "
         f"Inspect .bad_tokens or run `loom-tokens bootstrap --force`.",
     )
 
@@ -349,32 +559,19 @@ def _main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="python -m loom_tools.tokens.select",
-        description="Select an account token from .loom/tokens/.",
+        description="Select a Claude Code OAuth token from .loom/tokens/.",
     )
     parser.add_argument(
         "--workspace",
         required=True,
         help="Repo root containing .loom/tokens/.",
     )
-    parser.add_argument(
-        "--provider",
-        choices=KNOWN_PROVIDERS,
-        default=DEFAULT_PROVIDER,
-        help=(
-            "Only select accounts for this provider "
-            f"(default: {DEFAULT_PROVIDER})."
-        ),
-    )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="Emit JSON (default).")
     fmt.add_argument(
         "--export",
         action="store_true",
-        help=(
-            "Emit shell `export <VAR>=...` lines. The variable is "
-            "provider-specific: CLAUDE_CODE_OAUTH_TOKEN for anthropic, "
-            "OPENAI_API_KEY for openai."
-        ),
+        help="Emit shell `export CLAUDE_CODE_OAUTH_TOKEN=...` lines.",
     )
     parser.add_argument(
         "--no-key",
@@ -384,38 +581,23 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        sel = select_token(args.workspace, provider=args.provider)
+        sel = select_token(args.workspace)
     except EmptyTokenPoolError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EX_CONFIG
 
     if args.export:
-        env_var = env_var_for_provider(sel.provider)
-        if env_var is None:  # pragma: no cover — choices= prevents this
-            print(
-                f"error: no export env var known for provider "
-                f"'{sel.provider}'",
-                file=sys.stderr,
-            )
-            return EX_CONFIG
         if args.no_key:
-            print(
-                f"# selected={sel.name} mode={sel.mode} "
-                f"provider={sel.provider} file={sel.file}"
-            )
+            print(f"# selected={sel.name} mode={sel.mode} file={sel.file}")
         else:
-            print(f"export {env_var}={sel.key!r}")
-            print(
-                f"# selected={sel.name} mode={sel.mode} "
-                f"provider={sel.provider} file={sel.file}"
-            )
+            print(f"export CLAUDE_CODE_OAUTH_TOKEN={sel.key!r}")
+            print(f"# selected={sel.name} mode={sel.mode} file={sel.file}")
         return 0
 
     payload = {
         "name": sel.name,
         "file": str(sel.file),
         "mode": sel.mode,
-        "provider": sel.provider,
     }
     if not args.no_key:
         payload["key"] = sel.key

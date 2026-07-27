@@ -29,8 +29,13 @@ succeeds on plain API keys).
 Status assignment:
 
 * ``available`` — utilizations < 95 percent
-* ``exhausted`` — 7d_utilization >= 0.95
-* ``rate_limited`` — current 429 (transient, distinct from exhausted)
+* ``exhausted`` — 7d_utilization >= 0.95 (checked on **both** the 2xx and
+  429 response paths, issue #3988 — a weekly-exhausted account very often
+  answers the probe with 429 rather than 200, and previously only the 2xx
+  path applied this test, so such accounts were mislabelled
+  ``rate_limited`` and stayed eligible for selection forever)
+* ``rate_limited`` — current 429 with 7d_utilization below the exhausted
+  threshold (a genuine transient rate limit, distinct from exhaustion)
 * ``blocked`` — 401 auth failure or token listed in ``.bad_tokens``
 
 The CLI command writes ``.loom/tokens/.ranking`` atomically when
@@ -40,7 +45,6 @@ partial file is ever visible mid-write).
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import time
@@ -310,6 +314,18 @@ def _build_headers(token: str) -> dict[str, str]:
     return base
 
 
+def _status_from_utilization(s7d_util: float | None, *, default: str) -> str:
+    """Return ``"exhausted"`` when *s7d_util* clears the threshold, else *default*.
+
+    Shared by both the 2xx and 429 probe-response branches (issue #3988) so
+    the ``EXHAUSTED_THRESHOLD`` test is applied uniformly regardless of which
+    HTTP status the probe happened to receive.
+    """
+    if s7d_util is not None and s7d_util >= EXHAUSTED_THRESHOLD:
+        return "exhausted"
+    return default
+
+
 def probe_account(
     name: str,
     token: str,
@@ -366,11 +382,18 @@ def probe_account(
         return AccountResult(name=name, status="blocked", error="auth_401")
 
     if code == 429:
-        # Even a 429 may include rate-limit headers; capture them.
+        # Even a 429 may include rate-limit headers; capture them. A weekly-
+        # exhausted account frequently answers with 429 (not 200), so the
+        # exhausted-threshold test must apply here too (issue #3988) — else
+        # such accounts are mislabelled "rate_limited" forever and the
+        # selector keeps rotating dispatches into a dead account.
         parsed = parse_rate_limit_headers(resp.headers)
+        status = _status_from_utilization(
+            parsed["7d_utilization"], default="rate_limited"
+        )
         return AccountResult(
             name=name,
-            status="rate_limited",
+            status=status,
             s5h_utilization=parsed["5h_utilization"],
             s7d_utilization=parsed["7d_utilization"],
             s7d_reset=parsed["7d_reset"],
@@ -395,11 +418,7 @@ def probe_account(
 
     parsed = parse_rate_limit_headers(resp.headers)
     s7d_util = parsed["7d_utilization"]
-
-    if s7d_util is not None and s7d_util >= EXHAUSTED_THRESHOLD:
-        status = "exhausted"
-    else:
-        status = "available"
+    status = _status_from_utilization(s7d_util, default="available")
 
     return AccountResult(
         name=name,
@@ -566,8 +585,25 @@ def build_report(results: Iterable[AccountResult]) -> ProbeReport:
     return ProbeReport(ranked_at=ranked_at, accounts=sorted_results)
 
 
+def format_ranking_lines(report: ProbeReport) -> str:
+    """Serialize a probe report to the selector's ``name|status`` format.
+
+    This is the format ``select.py:_read_ranking`` consumes (pipe-delimited
+    ``name|status``, one account per line, already ordered by
+    :func:`build_report`). A trailing newline is included so the file ends
+    cleanly; an empty report yields an empty string.
+    """
+    lines = [f"{a.name}|{a.status}" for a in report.accounts]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
-    """Write *report* to *ranking_path* atomically.
+    """Write *report* to *ranking_path* atomically in the selector's format.
+
+    Emits the pipe-delimited ``name|status`` format that
+    ``select.py:_read_ranking`` consumes — byte-compatible with the monitor
+    path's ``write_monitor_ranking_atomic`` — so a probe-written ``.ranking``
+    drives tier-1 (ranking-based) selection identically to any other source.
 
     Writes to ``<path>.tmp`` in the same directory (so the rename is on
     the same filesystem and uses ``rename(2)``), then ``Path.replace``s
@@ -576,7 +612,7 @@ def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
     """
     ranking_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = ranking_path.with_suffix(ranking_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
+    tmp.write_text(format_ranking_lines(report))
     tmp.replace(ranking_path)
 
 
@@ -585,9 +621,56 @@ def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_monitor_check(
+    tokens_dir: Path,
+    *,
+    write_ranking: bool,
+) -> ProbeReport | None:
+    """Build a ProbeReport from claude-monitor's ``ranking.json`` (#3697).
+
+    Returns ``None`` when no usable, fresh monitor data is available (the
+    caller then probes under ``auto`` or emits nothing under ``monitor``).
+    When data is available and ``write_ranking`` is set, emits ``.ranking``
+    in the selector's pipe format via the monitor writer (byte-compatible
+    with what ``select.py:_read_ranking`` consumes).
+
+    Imported lazily to avoid an import cycle (``monitor`` imports
+    ``_STATUS_RANK`` from this module).
+    """
+    from loom_tools.tokens import monitor as monitor_mod
+
+    accounts = monitor_mod.build_monitor_accounts(tokens_dir)
+    if accounts is None:
+        return None
+
+    ranked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    results = [
+        AccountResult(
+            name=a.name,
+            status=a.status or "available",
+            s5h_utilization=a.util_5h,
+            s7d_utilization=a.util_7d,
+        )
+        for a in accounts
+    ]
+    report = ProbeReport(ranked_at=ranked_at, accounts=results)
+
+    if write_ranking:
+        ranking_path = tokens_dir / ".ranking"
+        monitor_mod.write_monitor_ranking_atomic(accounts, ranking_path)
+        logger.info(
+            "wrote monitor-sourced ranking to %s (%d accounts)",
+            ranking_path,
+            len(accounts),
+        )
+
+    return report
+
+
 def run_check(
     tokens_dir: Path,
     *,
+    source: str = "probe",
     write_ranking: bool = False,
     probe_prompt: str = DEFAULT_PROBE_PROMPT,
     model: str = DEFAULT_PROBE_MODEL,
@@ -595,6 +678,19 @@ def run_check(
     session: requests.Session | None = None,
 ) -> ProbeReport:
     """Probe all accounts and (optionally) write ``.ranking``.
+
+    ``source`` selects where the ranking comes from (#3697):
+
+    * ``"probe"`` (default, unchanged) — live-probe rate-limit headers.
+    * ``"monitor"`` — consume claude-monitor's ``ranking.json`` only; do
+      **not** probe. Yields an empty report when no fresh monitor data is
+      available.
+    * ``"auto"`` — use claude-monitor when a fresh ``ranking.json`` is
+      present, else fall back to probing.
+
+    Under the ``monitor``/``auto`` branch, when ``write_ranking`` is set the
+    monitor-sourced ``.ranking`` is emitted in the selector's pipe format
+    (``name|status``) — the format ``select.py`` actually consumes.
 
     Probes are issued sequentially with 0.5-1.5s jitter between them
     (lean-genius pattern) when *stagger* is true. Tests can pass
@@ -605,6 +701,22 @@ def run_check(
     recorded provider are probed as ``anthropic`` (pre-#12 behavior).
     The ranking always includes accounts from every provider.
     """
+    if source in ("auto", "monitor"):
+        monitor_report = _run_monitor_check(
+            tokens_dir, write_ranking=write_ranking
+        )
+        if monitor_report is not None:
+            return monitor_report
+        if source == "monitor":
+            # monitor-only: no probe fallback. Return an empty report and
+            # leave any existing .ranking untouched.
+            logger.warning(
+                "check --source monitor: no fresh claude-monitor ranking.json; "
+                "nothing to rank (not probing)."
+            )
+            return build_report([])
+        # source == "auto": fall through to probing.
+
     pairs = discover_tokens(tokens_dir)
     if not pairs:
         logger.warning("no tokens found in %s", tokens_dir)

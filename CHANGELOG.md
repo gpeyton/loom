@@ -7,6 +7,248 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-24
+
+### Summary
+
+Minor release headlined by **multi-repo daemon support** — one `loom-daemon` per machine now manages many repos (epic #3835, #3926 phases a–d): a machine-level workspace registry with CLI + IPC surface, work-finder + epic-supervisor fan-out across all registered workspaces, `(repo, issue)`-aware sweep visibility over IPC/MCP, and a per-repo status breakdown with a per-repo main-health gate. Also lands sweep detect-and-warn for out-of-set dependency references and consumer-install fixes for the machine-level daemon binary.
+
+### Added
+
+- **Machine-level workspace registry** (#3926 phase a, #3931) — `~/.loom/workspaces.json` with `loom-daemon workspace add|remove|list` CLI + IPC surface and `WorkspaceRegistry::effective_roots()` (empty registry ⇒ the daemon's own cwd workspace, unchanged).
+- **Multi-repo work-finder + epic supervisor** (#3928, #3932) — both autonomous loops fan out over every registered workspace via a new `WorkspacePool` (one `SweepRegistry` per repo root; unified in-flight dedup + reaper), dispatching each sweep into the correct repo's working tree, with a **single global concurrency budget** (occupancy summed across repos) and per-repo error isolation; workspace `add`/`remove` is hot-applied each tick.
+- **`(repo, issue)`-aware sweep visibility** (#3929, #3933) — optional `workspace_root` on the five sweep IPC/MCP tools (`dispatch_sweep`, `list_sweeps`, `get_sweep_status`, `tail_sweep_log`, `cancel_sweep`; omitted ⇒ today's default-workspace behavior), a `repo` field on `SweepInfo` and the four `sweep.issue.{N}.*` event payloads (frozen topic strings untouched), and `WorkspacePool::evict()` wired to workspace deregistration (reaper aborted, default workspace guarded).
+- **Per-repo status breakdown + per-repo main-health gate** (#3930, #3934) — `loom-daemon status` enumerates all managed repos (`DaemonStatusReport.per_repo`: workspaces, in-flight per repo, per-repo gate state), and the main-health gate evaluates each registered repo's `main` independently so a red repo halts only its own dispatch (its in-flight sweeps still count against the shared global budget). Opt-in semantics unchanged (`LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`, env > config > default).
+- **Sweep: detect-and-warn for out-of-set dependency references** (#3747 v2 item 4, #3927) — advisory warnings when a candidate's body declares `Depends on`/`Requires`/`Part of` against an open issue outside the sweep's candidate set; detection-only, never auto-expands the set.
+
+### Fixed
+
+- **Consumer installs provision the machine-level `loom-daemon` binary** (#3922, #3925) — autonomous daemon mode can start post-install in consumer repos.
+- **Post-install guidance names shipped daemon surfaces** (#3923, #3924) — no longer points at the removed `daemon.sh`.
+
+## [0.14.0] - 2026-07-23
+
+### Summary
+
+Major release headlined by **fully autonomous daemon mode** — label an issue and the daemon builds it in the background. The `loom-daemon` gains a forge-polling work-finder, work-driven concurrency scaling, a reactive main-health backstop, and operability controls (epic #3809), plus a **daemon-native epic supervisor** that drives `loom:epic` fork-joins conformant to an executable state-machine spec (epic #3842) — all **opt-in / default-off**. Backed by **token-capacity backpressure** (slow-down / alert / auto-recover), **self-healing dispatch** (2s stagger + startup watchdog + mid-build recovery), and token-ranking robustness. Also lands **stacked-PR mode**, an **executable state-machine spec** of the Loom label graph, installer **`--local` mode**, **guard-hook autonomy**, and **doc-lint robustness**. 88 commits since v0.13.0.
+
+### Added
+
+- **Autonomous daemon (epic #3809)** — the daemon can generate and drive its own work, opt-in:
+  - Forge-polling **work-finder** (`LOOM_WORK_FINDER=1`) that auto-dispatches sweeps for open `loom:issue` items, with registry-dedup + idempotency-key + atomic-claim-lock protection against double-dispatch (Phase A, #3880).
+  - **Work-driven concurrency scaling** bounded by `min(healthy tokens, disk headroom, configured max)`, fails-closed, no thrash (Phase B, #3881).
+  - Reactive **main-health backstop** — runs `buildGate` against `origin/main`, halts new dispatch on red (never auto-reverts, never kills in-flight), panic-safe (`LOOM_MAIN_HEALTH_GATE=1`) (Phase C, #3883).
+  - **Operability** — config surface, safe SIGINT/SIGTERM start/stop scripts, E2E playbook (Phase D, #3890).
+  - **Daemon-native status view** — `loom-daemon status` + IPC `DaemonStatus` (in-flight sweeps, dynamic cap, health-gate, capacity) (#3899).
+- **Daemon-native epic supervisor (epic #3842)** — drives `loom:epic` fork-joins (`LOOM_EPIC_SUPERVISOR=1`): derived-state computation (#3852), global issue-creation mutex + phase-join barrier (#3867), supervisor loop on a dedicated off-runtime thread (#3870, #3875), and a conformance test that parses the Python state-machine model + event topics (#3876).
+- **Token-capacity backpressure** (#3907) — slow down toward the healthy-account count, advise adding capacity, auto-recover as 5h/7d limits reset; never stalls while ≥1 account has capacity.
+- **Self-healing dispatch** — 2s dispatch stagger + startup watchdog that auto-recovers a hung spawn once (#3892); mid-build death detection + bounded recovery (#3903); reaper reap-on-read so `ListSweeps`/status don't over-report `Running` (#3905).
+- **Token-ranking robustness** — a stale ranking is advisory and still skips `exhausted`/`blocked` accounts instead of falling back to fully-random selection (#3900).
+- **Stacked-PR mode** — operator `--depends-on` dispatch (#3742), auto-reconcile children on parent merge (#3752), pre-merge merge-ordering guard (#3794), rebase-on-parent-amend (#3849).
+- **Executable state-machine spec** of the Loom label graph in `loom-tools`, with README diagram + CI conformance guard (#3844).
+- **Installer `--local`/`--gitignore` mode** to keep installed Loom files uncommitted in consumer repos (#3839), and **`resync-installed.sh`** to refresh `.loom/` from `defaults/` after a pull (#3851).
+- **Guard-hook autonomy** — deny/ask decision logging, `forceScope:protected` (own-branch force-push allowed; main/master stays hard-deny), doc-text false-positive fix (#3908); read-only fast-path broadened (jq/wc/head/tail/test/find) (#3798).
+
+### Fixed
+
+- **Doc-lint robustness** — de-brittled the sweep/bump doc-lint tests (prose asserted structurally, contract identifiers kept exact) so legitimate doc edits stop red-manning `main` (#3878, #3834, #3863).
+- **labels.yml drift** between root and `defaults/` reconciled + CI drift check added (#3904).
+- 39 fixes total across daemon, sweep, guards, and docs.
+
+## [0.13.0] - 2026-07-22
+
+### Summary
+
+Minor release headlined by the **model-cost experiment infrastructure** — the tooling to answer the opus→sonnet Builder-default question with real, balanced canary data: a tri-state `sweep.modelExperiment` mode with deterministic A/B arm assignment, opt-in durable session-transcript archival, exact per-role cache-aware cost harvesting, and a production-safety guardrail that requires an *uncommitted* canary confirmation. Also lands **effort-aware escalation** (the `model@effort` rung grammar plus `LOOM_EFFORT`/daemon-dispatch effort plumbing), a batch of **`merge-pr.sh` hardening** fixes, and **multi-account token sourcing** (claude-monitor-first three-source merge).
+
+### Added
+
+- **`/sweep`: experiment-mode model-cost instrumentation** — tri-state `sweep.modelExperiment` (`off`/`observe`/`experiment`) + `LOOM_MODEL_EXPERIMENT` env, deterministic resume-safe per-issue A/B arm assignment (Arm A opus-first vs Arm B sonnet-first + escalate-on-Judge-rejection) stratified by the curator complexity marker, tier-2.5 complexity-bump suppression on Arm B, a durable gitignored `.loom/stats/sweep-model-stats.jsonl` outcome-chain store, and an `agent-metrics.sh --model-experiment` harvest computing exact per-role cache-aware cost from subagent-transcript `usage` blocks. Canary-only (guarded, off by default). (#3725, #3728)
+- **Opt-in session-transcript archival** — `loom.transcriptArchive` / `LOOM_TRANSCRIPT_ARCHIVE` copies session + subagent transcripts to a durable location with a per-session `agent-<id>` manifest join key, `CLAUDE_CONFIG_DIR`-aware base resolution, and `0700`/`0600` + gitignore-or-refuse guardrails. The retention substrate for the cost harvest and general audit. (#3726, #3727)
+- **Effort-aware escalation ladder** — `model@effort` rung grammar for `sweep.escalation` (e.g. `"sonnet@xhigh"`), a top `fable` rung with refusal-aware fallback, a Curator complexity marker, and graceful degradation when per-dispatch effort plumbing is unavailable. (#3702, #3703)
+- **`LOOM_EFFORT` → `claude --effort` passthrough** on `spawn-claude.sh`, and **per-dispatch effort through `mcp__loom__dispatch_sweep`** — the daemon forwards an optional `effort` to the spawned child mirroring the `--model` plumbing. (#3705, #3715; #3716, #3722)
+- **`fix(daemon)`: experiment env + workspace cwd propagated to detached sweep children** — `spawn_child` forwards an explicit allowlist (`LOOM_MODEL_EXPERIMENT`, `LOOM_MODEL_EXPERIMENT_CANARY`, `LOOM_TRANSCRIPT_ARCHIVE`) and pins `current_dir` to the workspace root, so env-based experiment enablement reaches the canary path. (#3730, #3732)
+- **Multi-account token sourcing** — a claude-monitor-first additive three-source account merge (claude-monitor master → repo-local → opt-in home master), an optional claude-monitor ranking consumer with email-derived token files, and a home-dir master account pool with per-repo override. (#3695, #3696; #3697, #3699; #3700)
+
+### Changed
+
+- **`~/.loom/accounts.env` retired as a default account source** — it is no longer auto-read; consult it only via explicit `LOOM_ACCOUNTS_ENV=<path>` / `--home-env`. Default resolution is now claude-monitor master → repo-local `.env`. (#3704, #3708)
+- **Experiment-mode canary confirmation must come from an uncommitted signal** — committed `sweep.modelExperimentCanary` config is no longer accepted; confirmation requires the `LOOM_MODEL_EXPERIMENT_CANARY` env var or a gitignored `.loom/CANARY` sentinel, closing the accidental-production-fire vector (a copied config can never confirm canary status). Fail-safe downgrade to `observe` preserved. (#3731, #3733)
+
+### Fixed
+
+- **`merge-pr.sh --auto` falls back to immediate merge when a repo has no required status checks** — a self-gating no-required-checks fallback (empty required-context set + `mergeable`) precedes the CLEAN/UNSTABLE greps, preserving the #3664 required-check gating by construction. (#3720, #3724)
+- **`merge-pr.sh` never removes the primary/main worktree** — a guard at the single `_remove_loom_worktree` funnel refuses to remove the first `git worktree list --porcelain` entry regardless of `.loom-managed` sentinel, branch, or `worktree.root`. (#3710, #3714)
+- **`merge-pr.sh` worktree porcelain parsing is space-safe** — all four `awk '$2'` sites strip the literal `worktree ` prefix (`substr`) so worktree paths containing spaces are preserved; `branch` ref lines keep `$2`. (#3721)
+- **Probe-path `.ranking` emits the pipe format the selector reads** — `check.py::write_ranking_atomic` now writes the `name|status` format `select.py::_read_ranking` consumes (matching the monitor path), so probe-based tier-1 token selection is no longer inert. (#3709, #3713)
+- **`/sweep` builder cwd-reset contamination backstop locked in** — a regression test exercises the `check-main-clean.sh --baseline` detection for a tracked/staged stray write, with hardened step-4 prose; the env-injection prevention path is documented as mechanically impossible on the Task-subagent path. (#3719, #3723)
+- Dropped extraneous f-string prefixes in `_cmd_unblock` (F541). (#3701)
+
+### Documentation
+
+- **Only Builders parallelize; issue-creating agents (architect/curator/champion) must be serialized** — documented across the sweep/architect/curator/champion skills to prevent the `gh issue create` number-race cross-contamination. (#3707, #3711)
+- **Measurement-gated cheap-first model retune procedure** — `docs/model-selection-retune.md` captures the decision inequality and `agent-metrics.sh --by-model` gating that must be satisfied before any `suggestedModel` default flip (no shipped defaults changed). (#3706, #3712)
+
+## [0.12.0] - 2026-07-21
+
+### Summary
+
+Minor release from two full autonomous `/loom:sweep all` passes over the backlog. Headlined by **guard ergonomics for autonomous agents** — a branch-aware `guards.forceScope` toggle, a read-only fast path that makes the per-Bash-call guard ~8× cheaper on obviously-safe commands, and an end to false denies on force-push strings merely *quoted* in PR-comment bodies — plus **sweep orchestration upgrades**: a configurable Doctor-cycle cap, a core-scaled default wave size, partial-increment (`Part of #N`) lifecycle correctness on both the label and probe sides, and a documented recovery rule for role subagents killed mid-phase by rate limits.
+
+### Added
+
+- **`guards.forceScope` — branch-aware force-operation guard toggle** (symmetric to `guards.rmScope`): `"all"` (shipped default, current behaviour), `"protected"` (ask only when the resolved push/reset target is a protected branch — every positional refspec is resolved, not just the first), or `"off"`. Branch resolution handles explicit refspecs (`+main`, `HEAD:main`), `git -C <path>`, and detached HEAD (→ ask); the main/master ALWAYS_BLOCK hard-denies stay unconditional in every mode. Lets autonomous agents rebase/amend their own working branches without interactive asks, replacing downstream hook forks. (#3674, #3676)
+- **Read-only fast path for `guard-destructive.sh`** (`guards.readOnlyFastPath`, default on; `LOOM_GUARD_READONLY_FASTPATH` env override; extend-only `guards.readOnlyFastPathExtra`): trivially read-only commands (`git status|log|diff|show`, `ls`, `grep`, `rg`, `gh … view|list`, `aws … describe*|get*|list*`) short-circuit to a silent zero-fork allow (~20ms vs ~156ms) before the full deny/ask gauntlet. Admission is purely structural — any chaining/piping/redirection/substitution metacharacter routes to the full path, so `git status && git push --force …` still denies; `cat`/`ssh` are deliberately excluded to preserve their existing carve-outs. (#3687, #3692)
+- **`/sweep`: configurable Doctor-cycle cap** — `sweep.max_doctor_cycles` in `.loom/config.json` (default 1, the historical single-cycle behaviour) generalizes the hardcoded Doctor→Judge cap, composing with the #3481 model-escalation ladder and checkpoint `attempt` bookkeeping; at the default cap the orchestrator may grant exactly one logged grace cycle when a second Judge rejection is a demonstrably *distinct* defect (forward progress) rather than same-defect thrash. (#3668, #3673)
+- **`/sweep`: core-scaled subagent-path auto wave size** — the in-session auto wave target scales `clamp(floor((cores-2)/4), 3, 6)` instead of a flat 3 (new `loom_detect_cores` / `loom_subagent_target_from_cores` helpers, `LOOM_CORES_OVERRIDE` for determinism); the explicit-override warning threshold moves N≥4 → N≥7. The #3289 one-level-deep nesting rule and the daemon path's target of 10 are unchanged — width scales, nesting never. (#3693, #3694)
+- **`/sweep`: mid-phase-death recovery rule** — when a role subagent dies mid-phase (rate limit, crash), the orchestrator re-verifies forge state (pushed commits, labels, comments) against the phase's expected exit state and completes only the missing steps, preferring resuming the same agent; rate-limit terminations get a distinct `rate-limited (resumed/unresumable)` status token in the sweep summaries. (#3683, #3691)
+
+### Fixed
+
+- **`install.sh --quick` no longer strands user changes when the update edits a co-edited file** — the #3588 HEAD-reset-then-reapply stash-restore pattern is generalized beyond `.gitignore` to every Loom-owned dirty file with a reapply strategy, including a block-aware `CLAUDE.md` marker-block splice; genuine in-block conflicts still surface with the specific conflicting file(s) named. (#3663, #3670)
+- **`merge-pr.sh --auto` handles UNSTABLE (checks-still-running) PRs** — instead of hard-failing on "Pull request is in unstable status", the script polls bounded by `LOOM_AUTO_MERGE_POLL_INTERVAL`/`LOOM_AUTO_MERGE_TIMEOUT`: required-check failures refuse immediately, pending checks wait, informational-only failures keep the #3486 immediate-merge path. (#3664, #3669)
+- **`merge-pr.sh` UNSTABLE poll no longer misreads a transient check-runs fetch failure as "resolved green"** — the fetch exit status is captured separately (one retry, then the bounded pending-wait path); the immediate-merge and unknown-gap branches are reachable only after a successful fetch. (#3678, #3685)
+- **`Part of #N` partial-increment PRs no longer orphan `loom:building`** — on merge of a non-closing partial-slice PR, `merge-pr.sh` verifies the referenced issue is still open and still claimed, then swaps `loom:building` → `loom:issue` with an audit comment, so the next sweep can pick up the remaining scope. Mutations are repo-scoped (`--repo "$REPO_NWO"`) to match the reads. (#3667, #3672; #3681, #3688)
+- **`/sweep` existing-PR probe now sees non-closing `Part of #N` PRs** — the pre-flight probe unions GitHub timeline `cross-referenced` events (same-repo, open PRs only) with `closedByPullRequestsReferences`, closing the duplicate-builder hazard for partial-slice PRs without reintroducing body-grep (#3267). (#3677, #3684)
+- **`guard-destructive.sh` no longer denies force-push strings quoted inside text-carrying flags** — quoted values of `--body`/`-m`/`--message`/`--title`/`--notes` are redacted (same-length placeholder) before the catastrophic substring scan, but never when the span contains `$(`/backtick, so command-substitution smuggling and `bash -c` payloads still deny. Judges can finally quote the commands they're reviewing. (#3679, #3686)
+- **Champion post-merge worktree cleanup no longer prints a duplicated path** — the two porcelain-parsing awk helpers in `merge-pr.sh` had the classic `exit`-triggers-`END` double-print; a `found`-flag guard makes each emit exactly one path. Cosmetic only — the `.loom-managed` safety sentinel was never affected. (#3671, #3675)
+- **`disk-headroom.sh` is sourceable under zsh** — `${BASH_SOURCE[0]:-$0}` replaces the bash-only idiom so `/sweep`'s Stage -1 wave-size resolution works from zsh sessions; `loom-tools.sh` hardened likewise, with a zsh regression test. (#3680, #3689)
+- **Loom-on-Loom dogfood drift eliminated structurally** — the installer's dogfood mode now materializes `.claude/commands/loom` as a *scoped symlink* into `defaults/.claude/commands/loom` (the parent `.claude/commands/` stays a real directory, so co-installed tools' namespaces are untouched — the #3565 hazard does not reapply). Stale dogfood copies caused a false bug report (#3665); the class is now impossible. (#3682, #3690)
+
+### Documentation
+
+- CLAUDE.md files gain a Custom Guard Hooks section covering the full guard-toggle catalog (`sqlDdl`, `cloudCli`, `rmScope`, `forceScope`, `readOnlyFastPath`); sweep.md's cap/wave-size/limitations prose reconciled with the new configurable defaults. (#3673, #3676, #3691, #3692, #3694)
+
+## [0.11.0] - 2026-07-20
+
+> **MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
+
+### Summary
+
+Minor release headlined by a **safe-by-default rm guard** (the `guards.rmScope` default flips `off`→`repo`) and the **deletion of the deprecated `spawn-loop.sh`**, completing the v0.10.0 orchestration-architecture migration. Also lands a batch of installer / worktree / guard hardening fixes, two safety fixes to the `/sweep` orchestration itself (fail-safe orphan recovery and intra-wave collision revalidation), and broad doc reconciliation.
+
+### Changed
+
+- **BREAKING (behaviour): `guards.rmScope` now defaults to `repo` instead of `off`** — `guard-destructive.sh` runs the repo-scoped `rm` guard by default: an outside-repo recursive `rm` (e.g. `rm -rf /Users/someone/important`) is now **denied** out of the box, while the `/tmp` + Claude-scratchpad ephemeral allowlist and in-repo/worktree paths stay allowed. The catastrophic top-level denies (bare `/tmp`, `/`, `$HOME`) are unchanged. This reverses #3617's "existing installs see zero behaviour change" guarantee as a deliberate, signed-off ADR decision (Option B). Consumers who relied on the old permissive default must opt out with `guards.rmScope: "off"` (synonym: `"permissive"`) in `.loom/config.json` or `LOOM_RM_SCOPE=off`. (#3628)
+- **`/sweep` revalidates overlapping PRs within a wave before merging** — after each in-wave merge, a PR that touches files the just-merged PR changed is rebased onto the freshly-merged `main` and re-Judged (or Doctored) before it merges; a post-wave `buildGate`-against-`main` backstop catches semantic collisions across disjoint file paths. Prevents individually-green parallel-builder PRs from colliding and breaking `main`. (#3647)
+
+### Fixed
+
+- **Installer: worktree-safe git-repo detection** — `install.sh`, `scripts/install/validate-target.sh`, and `scripts/uninstall-loom.sh` no longer misdetect a linked git worktree (whose `.git` is a file, not a directory) as a non-repo and offer a destructive `git init`. (#3649)
+- **Installer: `--allow-non-main-source` / `--allow-stale-target` accepted and forwarded** — the top-level `install.sh` wrapper now accepts the override flags it previously suggested but rejected as "Unknown flag", and forwards them to the delegated installer. (#3650)
+- **Uninstall no longer clobbers co-installed tool symlinks** — the empty-directory cleanup counts symlinks and subdirs (`\( -type f -o -type l \)`), so a `.claude/` dir holding another tool's symlinks (e.g. Repo Skills) is preserved instead of `rm -rf`'d. (#3634)
+- **`worktree.sh` guards `core.hooksPath` on `.githooks/` existence** — no longer points git at a dangling hooks path in repos without a `.githooks/` directory. (#3638)
+- **Managed `.gitignore` block covers `.loom/sweep-checkpoint/` and `.loom/locks/`** runtime dirs, matching their sibling runtime paths. (#3635)
+- **`check-main-clean.sh` no longer false-positives on pre-existing working-tree changes** — the `/sweep` builder-contamination backstop now takes a baseline snapshot before the wave and flags only newly-introduced changes; the no-argument invocation stays byte-for-byte back-compatible. (#3648)
+- **Guard performance check is warn-not-fail** — the load-dependent ~200ms perf assertion in `test-guard-destructive.sh` no longer produces spurious CI failures; a hard gate remains opt-in via `LOOM_GUARD_PERF_STRICT=1` against an env-overridable `LOOM_GUARD_PERF_MAX_MS`. (#3653)
+- **Repointed remaining broken `WORKFLOWS.md` links** to `docs/workflows.md`. (#3627)
+
+### Security
+
+- **Judge tooling can no longer silently empty the main-checkout git index** — judge guidance now forbids index-mutating git plumbing (bare `git read-tree`, `git reset`) in the main checkout and prescribes the index-free `git merge-tree --write-tree` / `GIT_INDEX_FILE` isolation; a new `ask`-tier `guard-destructive.sh` pattern catches a bare `git read-tree`. Closes a footgun that left thousands of phantom staged deletions in the main worktree. (#3637)
+- **Fail-safe orphan recovery** — `orphan_recovery.py` (and the `loom-clean` sibling) now emit zero orphans when no authoritative liveness source is present, so a live `loom:building` claim can never be reclaimed mid-flight now that this release removes the `spawn-loop-state.json` writer. (#3651)
+
+### Removed
+
+- **Deprecated `defaults/scripts/spawn-loop.sh` and its deprecation-warning shims** (v0.11.0 deletion target of the #3372 / #3449 orchestration-architecture migration). The v0.9.x minimal multi-account spawn loop was soft-deprecated throughout v0.10.x with a stderr banner on every invocation; v0.11.0 deletes the script, its smoke test (`defaults/scripts/tests/test-spawn-loop.sh`), the now-orphaned centralized deprecation-warning helpers (`defaults/scripts/lib/deprecation.sh`, `loom-tools/src/loom_tools/common/deprecation.py` and its test), and the Rust doc-lint that pinned the deprecation banner in place (`loom-daemon/tests/spawn_loop_deprecation_doc_lint.rs`). The replacement is `mcp__loom__dispatch_sweep` against `loom-daemon`. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md). (#3631)
+- **Dead `loom-check-completions` CLI and stale `spawn-loop.sh` operator advice** — removed the no-op completions module (its only input was the now-unwritten spawn-loop state) and the runnable advice strings pointing operators at the deleted script. (#3633)
+- **Three orphaned scripts with no live callers** — `clean-log.sh`, `test-plan-metrics.sh`, and `enable-skill-routing.sh` (they otherwise shipped downstream as dead copies). (#3639)
+
+### Documentation
+
+- **README front door repointed off the deprecated spawn loop** to the current `loom-daemon` Tier 2 surface. (#3623)
+- **Reconciled stale spawn-loop / `daemon.sh` references** across `CLAUDE.md`, `defaults/CLAUDE.md`, `docs/agents.md`, `docs/philosophy/loom-intelligence.md`, the v0.10.0 migration guides, and `validate-toolchain.sh` / `check-host-sleep.sh` header comments; fixed several broken internal doc links (`LABEL_WORKFLOW.md`, `loom-daemon/README.md`, `.loom/CLAUDE.md` anchors). (#3636, #3652)
+
+### Dependencies
+
+- Bumped the cargo `all-dependencies` group (5 updates) and `actions/setup-node` 6→7. (#3640, #3641)
+
+## [0.10.10] - 2026-07-18
+
+### Summary
+
+Patch release hardening installer idempotency across reinstall/upgrade paths and refining the destructive-command guards. The `--quick` reinstall and config-merge paths now round-trip byte-stably (`.gitignore`, `.loom/config.json`, install metadata, the committed `CLAUDE.md` pointer), so repeated installs no longer strand edits or clobber consumer keys. Guards gain an opt-in repo-scoped `rm` mode with an ephemeral allowlist and a dedicated Loom-workflow guard module, while cloud-delete ASK prompts narrow to mutating verbs. Broken docs links in the vendored templates are corrected.
+
+### Added
+
+- **Opt-in `guards.rmScope=repo` mode with ephemeral allowlist** — per-project setting scoping `rm` guarding to the repo; ships off by default (byte-for-byte compatible). (#3617)
+- **`cloudCli` toggle for cloud-delete guarding** — narrows the cloud ASK to mutating verbs and adds a per-project toggle; `ec2-terminate` downgraded from block to ask. (#3595)
+
+### Fixed
+
+- **Installer preserves an existing tuned guard hook on the quick-install path** — `install.sh` no longer unconditionally overwrites a consumer's customized hook on `--quick` reinstall, mirroring `install-loom.sh`'s preserve-unless-`--clean` semantics. (#3626)
+- **`.loom/config.json` merge is idempotent from first install** and preserves consumer keys on reinstall. (#3621, #3602)
+- **`--quick` reinstall no longer strands uncommitted `.gitignore` edits**; the install/uninstall round-trip is byte-idempotent. (#3589, #3591)
+- **`--quick` reinstall preserves the staged split on pop and reconciles `install-metadata.json`.** (#3618)
+- **Committed root `CLAUDE.md` pointer is self-sufficient.** (#3620)
+- **Legacy `.gitignore` migration is byte-stable** and orphan markers normalized. (#3594)
+- **`verify-install` scopes its manifest to Loom-owned files** and region-hashes `CLAUDE.md`. (#3603)
+- **Reinstall stash guard scoped to Loom-owned paths.** (#3601)
+- **Skill-router table gated on a route match and deduplicated per session**; machine-generated turns skipped, the methodology topic fallback anchored. (#3616, #3615)
+- **Broken `WORKFLOWS.md` link corrected in the `CONFIGURATION.md` copies**; the vendored `.claude/README.md` migration link is now absolute. (#3614, #3613)
+
+### Changed
+
+- **Loom-workflow guards extracted into `guard-loom-workflow.sh`.** (#3607)
+- **Role docs gain a partial-increment carve-out** so family/epic PRs don't auto-close their parent issue. (#3599)
+
+## [0.10.9] - 2026-07-16
+
+### Summary
+
+Patch release hardening the destructive-command lifecycle guard against prose false-positives.
+
+### Fixed
+
+- **Lifecycle guard resolves the command word past `env NAME=value` assignments** so leading environment assignments no longer mask the guarded command. (#3587)
+- **Lifecycle and cloud-delete patterns are segment-parsed** to stop prose from triggering false-positive denials. (#3585)
+
+## [0.10.8] - 2026-07-15
+
+### Summary
+
+Patch release redefining `/sweep all` as an aggressive build-everything sentinel and fixing label creation on Quick installs.
+
+### Changed
+
+- **`/sweep all` redefined as an aggressive build-everything sentinel** — resolves the entire open backlog and drives each item toward a merged PR. (#3580)
+
+### Fixed
+
+- **Quick installs can create labels** — `sync-labels.sh` is now shipped in the install payload. (#3583)
+- **`.claude/skills` ignored for co-install hygiene.** (#3579)
+
+## [0.10.7] - 2026-07-15
+
+### Summary
+
+Patch release retiring the in-repo `/loom:release` skill in favor of the shared `/repo:release` command, expanding `/loom:sweep` with the `all` actionable-backlog sentinel and a resource-gated automatic wave-size default, and clearing a batch of worktree, hook, guard, and installer correctness bugs.
+
+### Added
+
+- **`/loom:sweep all` actionable-backlog sentinel** — resolves the open backlog and drives each issue through the lifecycle. (#3569)
+- **Resource-gated automatic wave-size default for `/loom:sweep`** — an omitted `--builders-per-wave` resolves to a backend- and disk-aware wave size. (#3567)
+- **Per-project opt-out for SQL DDL/DML guard blocking.** (#3562)
+- **Content-gated cleanup of the retired `release.md` stray** on install and daemon init. (#3575, #3577)
+
+### Fixed
+
+- **Guard false-positive denials reduced** by replacing unanchored substring matching. (#3564)
+- **Worktree default-branch detection** instead of hardcoding `origin/main`. (#3561)
+- **`.loom-managed` sentinel written on all worktree re-invocation paths.** (#3560)
+- **`worktree.sh --json` stdout kept pure via an fd-swap contract.** (#3556)
+- **PreToolUse guard decisions include the required `hookEventName`.** (#3559)
+- **`--quick` reinstall reconciles the index and scopes uninstall staging.** (#3557)
+- **`merge-pr.sh` stops passing the gh-cached `--no-cache` flag to plain `gh`.** (#3555)
+- **Dogfood: `.claude/commands` materialized as a real copy, not a symlink into `defaults/`.** (#3570)
+
+### Changed
+
+- **Retired `/loom:release` in favor of the repo's `/repo:release`.** (#3571)
+- **Added the `/loom:help` command** describing the installed Loom commands. (#3558)
+- **Recorded the LOOM-EXTENSION-POINT release-seams audit finding.** (#3574)
+- **Dependency maintenance** — bump the all-dependencies group (2 updates). (#3544)
+
 ## [0.10.6] - 2026-07-11
 
 ### Summary

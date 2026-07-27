@@ -1,6 +1,18 @@
 {
   "version": "2",
   "offlineMode": false,
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["curator", "champion"]
+    }
+  },
+  "buildGate": {
+    "enabled": true,
+    "command": "bash .loom/scripts/build-gate.sh",
+    "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock", "*.py", "*.sh"],
+    "timeoutSeconds": 600
+  },
   "terminals": [
     {
       "id": "terminal-1",

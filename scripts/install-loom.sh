@@ -43,6 +43,8 @@ DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
 ALLOW_NON_MAIN_SOURCE=false
 ALLOW_STALE_TARGET=false
 SKIP_TARGET_CI=false  # When true, install PR carries `[skip ci]` (issue #3333)
+LOCAL_MODE=false      # --local/--gitignore: keep Loom impl out of repo history (#3836)
+UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +85,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_TARGET_CI=true
       shift
       ;;
+    --local|--gitignore)
+      LOCAL_MODE=true
+      shift
+      ;;
+    --untrack)
+      UNTRACK=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
@@ -95,7 +105,7 @@ while [[ $# -gt 0 ]]; do
       echo "                             the target (daemon running, recent state file, or"
       echo "                             active issue worktrees). Required to override the"
       echo "                             pre-flight active-session guard."
-      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
+      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents and .claude/commands/loom into defaults/"
       echo "                             (auto-detected when installing into the Loom source repo itself)"
       echo "  --no-dogfood               Disable dogfood mode even when installing into the Loom source repo"
       echo "  --allow-non-main-source    Proceed even if the Loom source checkout is not on a clean main"
@@ -106,6 +116,16 @@ while [[ $# -gt 0 ]]; do
       echo "                             target repository's CI does not run on the install PR. Use only when"
       echo "                             the target's required-checks rulesets do not depend on CI completing"
       echo "                             (the universal GitHub-native skip directive)."
+      echo "  --local, --gitignore       Local (uncommitted) mode: instead of the full copy-into-worktree +"
+      echo "                             PR install, append a Loom-managed block of the installed"
+      echo "                             implementation paths (.loom/, .claude/commands/loom/,"
+      echo "                             .claude/agents/loom-*.md, .loom-local/) to the target repo's"
+      echo "                             .gitignore (idempotent) so the Loom files are never committed. If any"
+      echo "                             of those paths are already tracked, the exact 'git rm -r --cached'"
+      echo "                             commands to untrack them are printed. Does NOT run loom-daemon init."
+      echo "  --untrack                  With --local: actually run the 'git rm -r --cached' untrack commands"
+      echo "                             (staged as deletions; files stay on disk) instead of just printing"
+      echo "                             them. No effect without --local."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
@@ -167,6 +187,17 @@ header() {
 # installer (which has argv-parsing side effects).
 # shellcheck source=scripts/install/manifest.sh
 source "$LOOM_ROOT/scripts/install/manifest.sh"
+
+# Source the machine-level loom-daemon provisioning helper (#3922). Kept in its
+# own file so the test suite can exercise it without sourcing the full
+# installer.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
+# Dogfood command-dir linker (issue #3682) — extracted so the test suite can
+# exercise the scoped-symlink logic without running the full installer.
+# shellcheck source=scripts/install/dogfood-commands.sh
+source "$LOOM_ROOT/scripts/install/dogfood-commands.sh"
 
 # Check the state of the Loom *source* checkout (the directory that contains
 # this script). We refuse to install from a feature branch, a stale main, or
@@ -294,6 +325,85 @@ fi
 
 # Export for sub-scripts
 export NON_INTERACTIVE
+
+# --untrack is meaningless without --local (it modifies which files the local-mode
+# untrack step acts on). Fail loudly rather than silently ignoring it.
+if [[ "$UNTRACK" == "true" ]] && [[ "$LOCAL_MODE" != "true" ]]; then
+  error "--untrack requires --local (it controls the local-mode untrack step)"
+fi
+
+# ============================================================================
+# LOCAL MODE (--local / --gitignore) short-circuit (issue #3836)
+# ============================================================================
+# In local mode we deliberately do NOT run the full copy-into-worktree + PR
+# install. Instead we keep the installed Loom implementation out of the consumer
+# repo's git history:
+#   1. Append a Loom-managed block of the implementation paths to the target's
+#      .gitignore (idempotent — re-running refreshes the block in place).
+#   2. For any of those paths that are already tracked, print the exact
+#      `git rm -r --cached` commands to untrack them (gitignore alone does not
+#      stop tracking already-committed files), or run them when --untrack is set.
+#
+# This is a self-contained operation that runs BEFORE the source-state guard and
+# every heavy dependency/build step: no daemon build, no worktree, no PR. The
+# default committed-install path is completely unchanged unless --local is passed.
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  # shellcheck source=scripts/install/local-mode.sh
+  source "$LOOM_ROOT/scripts/install/local-mode.sh"
+
+  LOCAL_TARGET="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
+    error "Target path does not exist: $TARGET_PATH"
+  if ! git -C "$LOCAL_TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+    error "Target path is not a git repository: $LOCAL_TARGET"
+  fi
+
+  # Resolve to the main worktree root so .gitignore lands at the repo root, not
+  # inside a linked worktree.
+  LOCAL_MAIN_WT=$(git -C "$LOCAL_TARGET" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+  if [[ -n "$LOCAL_MAIN_WT" ]] && [[ "$LOCAL_TARGET" != "$LOCAL_MAIN_WT" ]]; then
+    info "Target is inside a worktree; resolving to main repository root: $LOCAL_MAIN_WT"
+    LOCAL_TARGET="$LOCAL_MAIN_WT"
+  fi
+
+  header "Loom Local Mode (gitignore + untrack)"
+  echo ""
+  info "Target: $LOCAL_TARGET"
+  echo ""
+
+  if loom_local_apply_gitignore "$LOCAL_TARGET"; then
+    success "Wrote Loom-managed local-mode block to .gitignore (idempotent)"
+  else
+    error "Failed to update .gitignore in $LOCAL_TARGET"
+  fi
+  echo ""
+
+  # Collect the implementation paths git still tracks (bash 3.2: no mapfile).
+  LOCAL_TRACKED=()
+  while IFS= read -r _tracked_path; do
+    [[ -n "$_tracked_path" ]] && LOCAL_TRACKED+=("$_tracked_path")
+  done < <(loom_local_tracked_paths "$LOCAL_TARGET")
+
+  if [[ ${#LOCAL_TRACKED[@]} -eq 0 ]]; then
+    success "No installed Loom implementation paths are tracked — nothing to untrack"
+  elif [[ "$UNTRACK" == "true" ]]; then
+    info "Untracking ${#LOCAL_TRACKED[@]} Loom implementation path(s)..."
+    loom_local_run_untrack "$LOCAL_TARGET"
+    success "Untracked Loom implementation paths (staged as deletions — commit to finalize)"
+    info "The files remain on disk; only their git tracking was removed."
+  else
+    warning "These installed Loom implementation paths are still tracked:"
+    printf '    %s\n' "${LOCAL_TRACKED[@]}"
+    echo ""
+    info "Run these commands to untrack them (or re-run with --untrack):"
+    loom_local_untrack_commands "$LOCAL_TARGET" | sed 's/^/    /'
+  fi
+  echo ""
+  success "Local mode complete"
+
+  # Disable the error/cleanup trap and exit cleanly — no worktree was created.
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
 
 # Source-state guard (#3327): before doing any heavy work, verify that the
 # Loom source checkout is on a clean main. Refuse / prompt / continue based
@@ -485,7 +595,8 @@ if [[ -x "$ACTIVE_SESSION_CHECK" ]]; then
       error "Refusing to install: an active Loom session was detected in the target.
 
 To proceed:
-  • Stop the running daemon:   cd '$TARGET_PATH' && ./.loom/scripts/daemon.sh stop
+  • Stop the autonomous daemon: cd '$TARGET_PATH' && ./.loom/scripts/cli/loom-daemon-stop.sh
+  • Stop the tmux agent pool:   cd '$TARGET_PATH' && ./.loom/bin/loom stop
   • Wait for in-flight builders to finish, OR
   • Pass --allow-active-session to override this guard (use with caution).
 
@@ -527,15 +638,30 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
   if [[ -d "$TARGET_PATH/.loom" ]]; then
     # Preserve uncommitted user changes before uninstall
     # The uninstall --local mode runs 'git add -A' which would stage user changes
-    # along with uninstall deletions, and our cleanup would discard them
+    # along with uninstall deletions, and our cleanup would discard them.
+    #
+    # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+    # `git stash push` swept sibling installers' uncommitted tracked changes
+    # into the stash (and the cleanup's `git checkout -- .` would otherwise
+    # revert them outright). Restrict to dirty ∩ (Loom ownership set +
+    # .gitignore); empty intersection → no stash.
+    # shellcheck source=scripts/install/stash-scope.sh
+    source "$LOOM_ROOT/scripts/install/stash-scope.sh"
     STASHED_USER_CHANGES=false
-    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
-       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
-      warning "Working tree has uncommitted changes"
-      info "Stashing user changes to preserve them during clean install..."
-      if git -C "$TARGET_PATH" stash push -m "loom-install: preserving user changes before --clean" 2>/dev/null; then
+    CLEAN_OWNED_DIRTY=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEAN_OWNED_DIRTY+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+    if [[ ${#CLEAN_OWNED_DIRTY[@]} -gt 0 ]]; then
+      warning "Working tree has uncommitted Loom-owned changes"
+      info "Stashing Loom-owned changes to preserve them during clean install..."
+      if git -C "$TARGET_PATH" stash push \
+           -m "loom-install: preserving user changes before --clean" \
+           -- "${CLEAN_OWNED_DIRTY[@]}" 2>/dev/null; then
         STASHED_USER_CHANGES=true
-        success "User changes stashed"
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1)"
+        success "Loom-owned changes stashed → ${CLEAN_STASH_REF:-stash@{0}}"
+        info "  Stashed ${#CLEAN_OWNED_DIRTY[@]} Loom-owned path(s): ${CLEAN_OWNED_DIRTY[*]}"
       else
         warning "Failed to stash changes - uncommitted changes may be lost during --clean install"
         warning "Consider committing your changes first, then retry"
@@ -568,14 +694,26 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
     CLEANUP_FAILED=false
 
-    if ! git -C "$TARGET_PATH" restore --staged . 2>/dev/null; then
-      warning "Failed to unstage changes from uninstall"
-      CLEANUP_FAILED=true
-    fi
+    # Issue #3597: scope the unstage/checkout to Loom-owned dirty paths so
+    # sibling installers' uncommitted tracked changes (which were NOT stashed
+    # above) are never reverted. The uninstall only stages Loom-managed paths
+    # (#3450), so this intersection is exactly the set of staged deletions to
+    # undo and restore.
+    CLEANUP_PATHS=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEANUP_PATHS+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
 
-    if ! git -C "$TARGET_PATH" checkout -- . 2>/dev/null; then
-      warning "Failed to restore files from uninstall"
-      CLEANUP_FAILED=true
+    if [[ ${#CLEANUP_PATHS[@]} -gt 0 ]]; then
+      if ! git -C "$TARGET_PATH" restore --staged -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to unstage changes from uninstall"
+        CLEANUP_FAILED=true
+      fi
+
+      if ! git -C "$TARGET_PATH" checkout -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to restore files from uninstall"
+        CLEANUP_FAILED=true
+      fi
     fi
 
     # Also clean any untracked files left by the uninstall process
@@ -590,9 +728,10 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     # for the clean to do.
     git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .agents/ 2>/dev/null || true
 
-    # Verify the working tree is clean
-    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
-       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+    # Verify no Loom-owned path is still dirty. Scoped to the ownership set so
+    # legitimately-preserved sibling changes don't trip a false "not clean"
+    # warning (issue #3597).
+    if [[ -n "$(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")" ]]; then
       CLEANUP_FAILED=true
     fi
 
@@ -611,13 +750,24 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     fi
 
     # Restore stashed user changes
+    #
+    # Issue #3597: surface pop conflicts instead of silencing them with
+    # `2>/dev/null`. A conflicting pop (e.g. a Loom-managed file `init` also
+    # rewrote) previously hid the conflict and stranded the stash silently.
     if [[ "$STASHED_USER_CHANGES" == "true" ]]; then
       info "Restoring stashed user changes..."
-      if git -C "$TARGET_PATH" stash pop 2>/dev/null; then
+      if CLEAN_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"; then
         success "User changes restored"
       else
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
+        [[ -z "$CLEAN_STASH_REF" ]] && CLEAN_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
-        warning "Run 'git stash pop' in $TARGET_PATH to recover your changes"
+        echo ""
+        echo "  git stash pop reported:"
+        printf '%s\n' "$CLEAN_POP_OUTPUT" | sed 's/^/    /'
+        echo ""
+        echo "  Your changes are preserved in the stash ($CLEAN_STASH_REF)."
+        echo "  Recover with: cd $TARGET_PATH && git stash pop"
       fi
     fi
 
@@ -918,22 +1068,18 @@ success "loom-daemon binary ready"
 DAEMON_VERSION=$("$LOOM_ROOT/target/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
 info "loom-daemon binary: $DAEMON_VERSION"
 
+# Provision a machine-level loom-daemon binary for the consumer (issue #3922).
+# The consumer repo ships loom-daemon-start.sh but no binary; install the
+# freshly-built one to ~/.local/bin (on PATH) so `command -v loom-daemon`
+# resolves it post-install with no manual steps. Best-effort: a soft failure
+# (e.g. ~/.local/bin unwritable) is logged but never aborts the install — the
+# consumer can still point LOOM_DAEMON_BIN at the source build.
+info "Provisioning machine-level loom-daemon binary..."
+provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || \
+  warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
-
-# Issue #3495: snapshot any pre-existing .claude/commands/loom/release.md
-# before `loom-daemon init` overwrites it. The generalized skill replaces
-# the historical Loom-internal one — but consumers (e.g. anvil) may have
-# hand-customized their fork. We restore the snapshot below the stale-file
-# sweep if the operator declines the migration. RELEASE_MD_SNAPSHOT stays
-# empty when there's no pre-existing file (greenfield install) or when no
-# customization is detectable.
-RELEASE_MD_REL=".claude/commands/loom/release.md"
-RELEASE_MD_SNAPSHOT=""
-if [[ -f "$RELEASE_MD_REL" ]]; then
-  RELEASE_MD_SNAPSHOT="$(mktemp)"
-  cp "$RELEASE_MD_REL" "$RELEASE_MD_SNAPSHOT"
-fi
 
 # Use --force to overwrite existing installation when requested (--force or --clean flags)
 # Otherwise, use merge mode to preserve custom project roles/commands
@@ -1007,6 +1153,19 @@ if [[ "$DOGFOOD_MODE" == "true" ]]; then
       success "Created .claude/agents symlink -> $DOGFOOD_LINK_TARGET"
     fi
   fi
+  echo ""
+
+  # Dogfood mode (issue #3682): symlink loom's live `.claude/commands/loom/`
+  # to the shipped source-of-truth at `defaults/.claude/commands/loom/`, scoped
+  # to the `loom/` subdir only. A symlink cannot drift the way the previous
+  # copy (issue #3565) did — the stale copies produced a false bug report
+  # (#3665). Scoping the link to `loom/` keeps `.claude/commands/` itself a real
+  # directory, so #3565's failure mode (a co-installed tool writing a sibling
+  # namespace THROUGH a symlinked parent into loom's `defaults/` artifact) does
+  # not recur: no tool other than loom's own installer writes the `loom/`
+  # namespace. Full rationale lives in scripts/install/dogfood-commands.sh.
+  info "Dogfood mode: linking .claude/commands/loom -> defaults/ in $TARGET_PATH..."
+  link_dogfood_commands "$TARGET_PATH"
   echo ""
 fi
 
@@ -1223,64 +1382,129 @@ if (( ${#STALE_FILES[@]} > 0 )); then
 fi
 # --- End stale-file sweep ---
 
-# --- Customized release.md migration (#3495) ---
-# Detect a pre-init customized .claude/commands/loom/release.md and offer to
-# preserve it. The skill was previously Loom-internal (kept out of consumer
-# trees via .loom-internal.list) so anvil and similar repos hand-forked it.
-# As of #3495 the canonical defaults/ version is generic and SHIPS to every
-# consumer. This step compares the pre-init snapshot against the canonical
-# and, on mismatch, prompts the operator before letting the freshly-copied
-# canonical version stand.
+# --- Retired-file cleanup (content-gated) ---
+# A handful of files Loom once shipped were later RETIRED outright (deleted
+# upstream, not renamed). The generic stale-file sweep above deliberately will
+# NOT remove them:
+#   * The #3492 ownership-boundary intersection preserves any stale-manifest
+#     entry that is no longer in the current defaults/ ownership set — a
+#     retired path is by definition not owned, so it lands in
+#     PRESERVED_NOT_OWNED and is never git-rm'd. That defense-in-depth is
+#     correct (it protects consumer-authored files captured by pre-#3450
+#     over-broad manifests) and must stay.
+#   * A retired file that was never in the previous manifest at all is never
+#     even a sweep candidate.
+# So a retired file lingers on disk in every consumer that installed before the
+# retirement. This block removes such strays narrowly and safely.
 #
-# Defaults:
-#   - Interactive: prompt [y/N/d=show diff], default N (preserve customization)
-#   - --yes (NON_INTERACTIVE): preserve silently
-#   - --force (FORCE_OVERWRITE): replace silently with a warning
-#   - Idempotent: if snapshot matches canonical (no customization), no-op
-if [[ -n "${RELEASE_MD_SNAPSHOT:-}" ]] && [[ -f "$RELEASE_MD_SNAPSHOT" ]]; then
-  CANONICAL_RELEASE_MD="$LOOM_ROOT/defaults/$RELEASE_MD_REL"
-  if [[ -f "$CANONICAL_RELEASE_MD" ]] && ! cmp -s "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD"; then
-    # Customization detected (pre-init disk content differs from canonical).
-    PRESERVE_RELEASE_MD=true
-    if [[ "$FORCE_OVERWRITE" == "true" ]]; then
-      PRESERVE_RELEASE_MD=false
-      warning "Replaced customized release.md with generalized version (--force)"
-    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-      info "Preserved customized release.md (--yes default; pass --force to replace)"
-    else
-      echo ""
-      info "Customized release.md detected. The generalized Loom version now"
-      info "ships out of the box and should work for any project."
-      while true; do
-        read -r -p "Replace customized release.md with the generalized version? [y/N/d=show diff] " CONFIRM_RELEASE_MD
-        case "$CONFIRM_RELEASE_MD" in
-          y|Y)
-            PRESERVE_RELEASE_MD=false
-            break
-            ;;
-          d|D)
-            echo ""
-            diff -u "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD" || true
-            echo ""
-            ;;
-          n|N|"")
-            break
-            ;;
-          *)
-            echo "Please answer y, N, or d."
-            ;;
-        esac
-      done
-    fi
-    if [[ "$PRESERVE_RELEASE_MD" == "true" ]]; then
-      cp "$RELEASE_MD_SNAPSHOT" "$RELEASE_MD_REL"
-      info "Preserved customized release.md (re-run with --force to replace next time)"
-    fi
+# Gate: a frozen allowlist of (retired path -> sha256 of every version Loom
+# ever shipped at that path). A file is removed ONLY when it exists AND its
+# content hash matches a shipped digest — i.e. it is byte-identical to
+# something Loom shipped and therefore unmodified. A consumer who customized
+# the file (hash matches none) is left untouched with an informational line.
+# Absent -> no-op. Idempotent by construction (once removed, the existence
+# check is false on every subsequent run).
+#
+# Issue #3572: retire the stray `.claude/commands/loom/release.md` left behind
+# by #3563 (which deleted the shipped `/loom:release` skill but deliberately
+# did not sweep existing consumer copies). release.md's only placeholder is the
+# Claude-Code *runtime* token {{workspace}} — it is NOT install-time
+# substituted (see substitute_template_variables in
+# loom-daemon/src/init/templates.rs), so the shipped bytes are identical across
+# all consumers and a content-hash gate is exact. The digest set is frozen:
+# release.md will never ship again, so no maintenance burden accrues.
+_loom_sha256() {
+  # Portable sha256 -> bare hex digest (shasum on macOS, sha256sum on Linux).
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else
+    echo ""
   fi
-  rm -f "$RELEASE_MD_SNAPSHOT"
-  RELEASE_MD_SNAPSHOT=""
+}
+
+# Frozen retired-file allowlist. One "<relative-path> <sha256>" row per shipped
+# version; multiple rows per path enumerate every version. Comment (#) and
+# blank lines are ignored. Append-only — never remove a historical digest.
+LOOM_RETIRED_FILES=$(cat <<'RETIRED'
+# .claude/commands/loom/release.md — every version shipped in the #3495 -> #3563
+# window (retired by #3563 / PR #3571). Any match is unmodified Loom content.
+.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
+.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
+.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
+.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
+.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
+.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
+.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
+.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
+.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
+.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
+.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
+RETIRED
+)
+
+RETIRED_REMOVE=()
+RETIRED_PRESERVE=()
+# Unique retired paths (a path may have several allowed digests).
+RETIRED_PATHS=$(printf '%s\n' "$LOOM_RETIRED_FILES" \
+  | awk 'NF>=2 && $1 !~ /^#/ {print $1}' | sort -u)
+while IFS= read -r retired_path; do
+  [[ -n "$retired_path" ]] || continue
+  [[ -f "$TARGET_PATH/$retired_path" ]] || continue
+  file_hash=$(_loom_sha256 "$TARGET_PATH/$retired_path")
+  hash_matched=false
+  if [[ -n "$file_hash" ]]; then
+    while read -r allow_path allow_hash; do
+      [[ -n "$allow_path" && "${allow_path:0:1}" != "#" ]] || continue
+      if [[ "$allow_path" == "$retired_path" && "$allow_hash" == "$file_hash" ]]; then
+        hash_matched=true
+        break
+      fi
+    done <<< "$LOOM_RETIRED_FILES"
+  fi
+  if [[ "$hash_matched" == "true" ]]; then
+    RETIRED_REMOVE+=("$retired_path")
+  else
+    RETIRED_PRESERVE+=("$retired_path")
+  fi
+done <<< "$RETIRED_PATHS"
+
+# Preserved: retired path present, but content matches no shipped version.
+if (( ${#RETIRED_PRESERVE[@]} > 0 )); then
+  for f in "${RETIRED_PRESERVE[@]}"; do
+    info "preserving ${f} (retired by Loom, but on-disk content matches no shipped version — likely consumer-customized; leaving in place)"
+  done
 fi
-# --- End customized release.md migration ---
+
+# Removed: retired path present with unmodified, shipped-identical content.
+if (( ${#RETIRED_REMOVE[@]} > 0 )); then
+  echo ""
+  info "Retired Loom files still present (deleted upstream, unmodified copy on disk):"
+  for f in "${RETIRED_REMOVE[@]}"; do
+    echo "    - $f"
+  done
+  echo ""
+  PROCEED_RETIRED=true
+  if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
+    read -r -p "Remove these ${#RETIRED_REMOVE[@]} retired file(s)? [y/N] " CONFIRM_RETIRED
+    [[ "$CONFIRM_RETIRED" =~ ^[Yy]$ ]] || PROCEED_RETIRED=false
+  fi
+  if [[ "$PROCEED_RETIRED" == "true" ]]; then
+    RETIRED_DELETED=0
+    for f in "${RETIRED_REMOVE[@]}"; do
+      if git rm --quiet --force "$f" 2>/dev/null; then
+        (( RETIRED_DELETED++ )) || true
+      else
+        warning "Could not remove retired file: $f (may have been removed already or is untracked)"
+      fi
+    done
+    success "Removed $RETIRED_DELETED retired Loom file(s)"
+  else
+    info "Skipping retired file removal (user declined)"
+  fi
+fi
+# --- End retired-file cleanup ---
 
 cat > .loom/install-metadata.json <<METADATA
 {
@@ -1806,7 +2030,7 @@ case "$MERGE_STATUS" in
     echo "    \$loom-sweep 42"
     echo ""
     echo "  Daemon Mode (autonomous orchestration):"
-    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "    Then in Claude Code: /loom"
     ;;
   auto)
@@ -1825,7 +2049,7 @@ case "$MERGE_STATUS" in
     echo "    \$loom-sweep 42"
     echo ""
     echo "  Daemon Mode (autonomous orchestration):"
-    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "    Then in Claude Code: /loom"
     ;;
   *)
@@ -1839,7 +2063,7 @@ case "$MERGE_STATUS" in
     echo "       cd $TARGET_PATH && codex"
     echo "       \$loom-sweep 42"
     echo "     Daemon Mode (autonomous orchestration):"
-    echo "       cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "       cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "       Then in Claude Code: /loom"
     ;;
 esac

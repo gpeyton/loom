@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.10.6
+**Loom Version**: 0.15.0
 **Installation Date**: 2026-04-21
 
 ## What is Loom?
@@ -109,17 +109,25 @@ The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It exposes a Unix-
 
 **`/loom:sweep` backend detection (Stage -1, Phase D #3454)**: the skill probes whether the daemon is reachable (a Ping over the IPC socket with a 500ms timeout) AND whether a multi-account token pool exists (`.loom/tokens/` contains ≥ 2 `ACCOUNT_KEY_*` entries). **Strict AND** — either probe failing falls through to in-process subagent dispatch (the existing Mode A/B/C lifecycle). Mode C (`--prs`) always uses subagent dispatch; the daemon does not handle PR-set dispatch in v0.10.0. The `--no-daemon` flag forces subagent dispatch unconditionally.
 
-The daemon itself is **not** a work generator. It does not poll the forge for `loom:issue` items; it does not maintain a `shepherd-N` pool; it does not drive support roles on cron. Those responsibilities live in `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows.
+**By default the daemon is not a work generator** — with no autonomous config it does not poll the forge for `loom:issue` items, does not maintain a `shepherd-N` pool, and does not drive support roles on cron; work arrives only via `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows. As of epics #3809 and #3842 the daemon *can* generate and dispatch its own work when **explicitly opted in** — both surfaces are default-off:
+
+- **Autonomous work finder** (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`): polls the forge for open, already-approved `loom:issue` items and auto-dispatches sweeps, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, cpu/load headroom, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`) that halts dispatch when `main` goes red. Enable/tune from the `autonomous` block in `.loom/config.json` (precedence **env > config > default**) and manage the raw process with `loom-daemon-start.sh` / `loom-daemon-stop.sh` — see [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810) and §Operability, plus "Daemon Configuration (Tier 2)" below.
+- **Epic supervisor** (#3842): drives every open `loom:epic` issue through a derived-state fork-join model with a phase-join barrier, serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread — see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
+- **Periodic support-role runner** (#4015, `LOOM_ROLE_RUNNER` / `autonomous.roleRunner`): dispatches the standalone support roles (Champion, Curator, Judge, Auditor, Guide) host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps already use — instead of relying solely on the GitHub Actions cron workflows below, which authenticate with a single static `CLAUDE_API_KEY` secret with no rotation. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
 
 For full surface documentation — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
 > **Note**: `/loom:sweep` also supports a **PR-set mode** (Mode C, #3384) via `--prs <pr-number-list>` or NL phrases like "all open `loom:pr`" — drives Judge / Doctor → Judge / Merge from an existing open-PR set without re-running Curator or Builder. Mode C always uses subagent dispatch (see Stage -1 above).
 
-> **Legacy spawn loop**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) is deprecated and emits a stderr warning on every invocation referencing #3449. It will be deleted in v0.11.0. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
+> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 
-### 4. Scheduled Support Roles (opt-in)
+### 4. Scheduled Support Roles
 
 GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). The five per-role workflows are **thin callers** of one reusable workflow, `.github/workflows/loom-role.yml` (`on: workflow_call`), which holds the shared checkout → install → run logic and the 10-minute timeout. Each caller supplies its role slug and pinned model; the reusable workflow does one tick of work — no Loom-side state file, no long-running process.
+
+**Preferred path (daemon host, #4015):** when `loom-daemon` is running, enable the daemon-native periodic support-role runner (`LOOM_ROLE_RUNNER` / `autonomous.roleRunner.enabled=true` in `.loom/config.json`) instead of the GitHub Actions cron below — it dispatches Champion/Curator/Judge/Auditor/Guide host-side via `spawn-claude.sh`, drawing from the same rotated, health-ranked token pool sweeps use, so there is no separate `CLAUDE_API_KEY` secret to provision and no static-key exhaustion with no fallback. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
+
+**Fallback (no always-on daemon, opt-in):** GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process. This is the degraded mode: a single static `CLAUDE_API_KEY` secret with no rotation and no health-awareness (an exhausted/rate-limited key has no fallback, unlike the daemon path above).
 
 | Workflow | Role | Schedule (commented) | Claude model |
 |----------|------|----------------------|--------------|
@@ -192,6 +200,14 @@ See `.github/labels.yml` for the authoritative `Applied by:` field on every labe
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from closed issues or merged PRs (e.g., `loom:pr` remains on merged PRs). Labels on closed/merged items are harmless — all agents filter by open state — and skipping post-close label removal saves gh API calls. Do not implement label cleanup on merge/close (see issue #2838).
 
+### Issues Are Suggestions (Role Autonomy)
+
+Filed issues are the *input queue*, not mandates. In autonomous mode the **Curator, Builder, and Judge** have standing authority to **close** or **rescope** an issue — with a stated rationale — when building it is not the best outcome (obsolete, duplicate/already covered, low value vs. cost, wrong approach, better split/merged). This is what keeps the auto-picked-up backlog healthy rather than "build whatever is filed". Full mechanism + guardrails live in each role prompt's "Issues Are Suggestions — Close or Rescope With Rationale" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`). The rules in brief:
+
+- **Comment the rationale BEFORE closing**, then `gh issue close <N> --reason "not planned"`. A closed issue leaves the queue automatically (the work-finder only polls *open* `loom:issue` items), so it is not re-picked-up.
+- **Rescope** instead of closing when the core is worth keeping: edit the body / split / relabel, and **remove `loom:issue`** if the labels no longer reflect an approved scope (drop back to `loom:triage`/`loom:curated`) so it is not re-dispatched with a stale scope.
+- **Never close an issue that encodes a still-pending human decision** — route it to `loom:blocked` or `loom:operator-only` with a comment instead. Never invent new labels.
+
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work.
@@ -214,7 +230,7 @@ gh pr create --label "loom:review-requested"
 ### Best Practices
 
 - Always use `./.loom/scripts/worktree.sh <issue-number>` (it writes a `.loom-managed` sentinel that authorizes cleanup)
-- Never run `git worktree` directly (helper prevents nested worktrees)
+- Never run `git worktree` directly (helper prevents nested worktrees) — to remove one managed worktree on demand, use `./.loom/scripts/worktree.sh remove <issue-number>` (sentinel-honoring, idempotent, deletes the local branch; `loom-clean` remains the bulk path)
 - Loom-managed worktrees (under `.loom/worktrees/` with the `.loom-managed` sentinel) are auto-removed when their PR merges. User-provisioned worktrees at other paths are never removed by Loom — set `LOOM_PRESERVE_WORKTREE=1` to disable cleanup globally for a session.
 
 ### Merging PRs
@@ -268,18 +284,37 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### Curator Workflow
 
-1. Find unlabeled issues: `gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"`
+1. Find unlabeled issues: `gh issue list --search "-label:loom:issue -label:loom:building -label:loom:architect -label:loom:hermit -label:loom:curated -label:loom:curating" --state open` (gh ANDs `--label` values and has no `!`/`,` negation syntax, so a `--label="!loom:issue,..."` filter matches a literal label no issue carries and always returns empty; use `-label:` search terms instead)
 2. Enhance issue with technical details
 3. Mark curated: `gh issue edit 42 --add-label "loom:curated"`
 
 ### Overnight / long-running orchestration: keep the host awake (#3350)
 
-`/loom:sweep` and the spawn loop automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+`/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup and warns when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
 
 - **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF.
 - **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`.
 
 Manual invocation: `./.loom/scripts/check-host-sleep.sh` (or `--quiet` for stderr-only output).
+
+### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777 resync)
+
+The installed `.loom/hooks/` and `.loom/scripts/` copies the harness actually executes are synced from `defaults/` **at install time**. A `git pull` that merges a hook/script fix updates `defaults/` but **not** the installed copies — so a session can run stale hooks/scripts indefinitely (the incident: a merged `guard-destructive.sh` fix kept prompting until hand-copied).
+
+This is a **detect → fix** pair:
+
+- **Detect (#3770)** — `/loom:sweep` runs `./.loom/scripts/check-main-freshness.sh` at startup. When local `main` is behind `origin/main` it prints a non-blocking warning and flags any installed file that differs from its `defaults/` counterpart. Advisory only; it never pulls, merges, or resets.
+- **Fix (#3777)** — `./.loom/scripts/resync-installed.sh` refreshes the installed `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (a no-op when in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only ever touches files that exist in `defaults/` (repo-specific hooks with no `defaults/` counterpart are left alone).
+
+The intended flow is **"freshness warning says you're stale → run resync"**:
+
+```bash
+git merge --ff-only origin/main             # bring defaults/ current
+./.loom/scripts/resync-installed.sh --dry-run   # preview what would change
+./.loom/scripts/resync-installed.sh             # apply
+```
+
+`--dry-run` makes no changes and exits `2` when drift is detected (so it doubles as a check). To pin an intentional per-repo customization so resync never overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`) — one per line — in `.loom/resync-ignore`; matching files are reported `skipped`. A full `loom-daemon init` / installer run already performs the equivalent recursive copy, so a normal reinstall keeps the copies current too.
 
 ## Configuration
 
@@ -310,13 +345,50 @@ Configuration stored in `.loom/config.json` (committed to git for team sharing):
 
 The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is a single long-lived process that holds the sweep registry, the event bus, and the reaper task in memory — there is no on-disk state file the operator needs to touch. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full surface and [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md) for the migration narrative away from the legacy Python brain.
 
+**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810, `LOOM_WORK_FINDER`) and reactive main-health gate (#3812, `LOOM_MAIN_HEALTH_GATE`) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
+
+```json
+{
+  "autonomous": {
+    "perTokenConcurrency": 2,
+    "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
+    "mainHealthGate": { "enabled": true },
+    "roleRunner": { "enabled": true, "roles": ["champion", "curator", "judge", "auditor", "guide"] }
+  }
+}
+```
+
+Start/stop the **raw daemon process** (distinct from the tmux `loom start|stop` pool) with dedicated wrappers that run the advisory host-sleep check, write a PID file (`.loom/.daemon.pid`), surface the singleton-guard refusal, and shut down cleanly on **SIGTERM** (not just Ctrl-C):
+
+```bash
+./.loom/scripts/cli/loom-daemon-start.sh                # FLAGS-OFF reliability daemon (both loops off, backgrounded)
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder  # opt in: autonomous work finder
+./.loom/scripts/cli/loom-daemon-start.sh --health-gate  # opt in: main-health gate
+./.loom/scripts/cli/loom-daemon-start.sh --from-config  # enable strictly per .loom/config.json
+./.loom/scripts/cli/loom-daemon-stop.sh                 # SIGTERM → grace → SIGKILL
+```
+
+> **Default is FLAGS-OFF (#3911).** A bare `loom-daemon-start.sh` starts a
+> reliability daemon with **both autonomous loops OFF** — it does **not**
+> auto-dispatch sweeps — matching the ecosystem-wide opt-in / default-off
+> contract (`LOOM_WORK_FINDER` unset ⇒ off, `LOOM_MAIN_HEALTH_GATE` unset ⇒ off,
+> precedence env > config > default). Enable autonomy explicitly with
+> `--work-finder` / `--health-gate`, or hand control to committed config with
+> `--from-config`.
+
+A clean stop leaves in-flight `/loom:sweep` children **running** (they survive a daemon restart by design; use `mcp__loom__cancel_sweep` to actively cancel). The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](docs/autonomous-mode-e2e.md).
+
+**Self-update (#3968)**: after merging a daemon fix, `./.loom/scripts/cli/loom-daemon-update.sh` is the single operator command that rebuilds (`cargo build --release`), reprovisions, and restarts — reading the flags `loom-daemon-start.sh` persisted to `.loom/.daemon.flags` at the last start and replaying them **exactly** (never wider than what was already running). Staleness is detected by comparing the commit baked into the resolved binary against the local source tree's `HEAD` (`--check` for a read-only report, `--dry-run` to preview, `--no-restart` to rebuild without touching a running daemon). A daemon that wasn't already running is never started by this script. `loom-daemon --status` also surfaces a read-only "update available" hint from the same comparison — advisory only, no auto-restart. See [Self-update](.loom/docs/daemon-reference.md#self-update-rebuild--provision--restart-3968) for the full detection strategy and provisioning rules.
+
+**Epic supervisor (#3842)**: separately from the work finder, when enabled the daemon runs a [derived-state epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842) that drives every open `loom:epic` issue through a fork-join lifecycle (decompose → expand → phase-join barrier → close), scheduling phase dispatches and serializing all child-issue creation behind the #3707 issue-creation mutex. It runs on a dedicated off-runtime OS thread (not a `tokio::spawn`) precisely because the mutex-guarded issue-creation calls block; see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842) for the transition table and event topics.
+
 **Per-sweep logs** live at `.loom/logs/sweep-issue-<N>.log` and are tailable via `mcp__loom__tail_sweep_log`.
 
 **Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored): when a sweep child crashes mid-flight, the checkpoint records the last completed phase. On the next dispatch the sweep skill resumes from that phase. The exact schema is owned by the sweep skill (#3373).
 
 **Scheduled support roles** run as separate GitHub Actions cron jobs — see `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
 
-> **Legacy spawn-loop state**: the v0.9.x state file `.loom/spawn-loop-state.json` is still written by the deprecated `spawn-loop.sh` (scheduled for deletion in v0.11.0). The daemon does not consume it. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
+> **Legacy spawn-loop state (obsolete)**: the v0.9.x state file `.loom/spawn-loop-state.json` was written by `spawn-loop.sh`, which was **removed in v0.11.0**. Nothing writes it anymore. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
 
 ### Custom Roles
 
@@ -355,7 +427,7 @@ Settings applied: squash merge only (no merge commits/rebase), delete branches o
 
 ### Multi-Account Token Pool
 
-For environments that rotate among multiple Claude OAuth accounts, Loom can bootstrap a per-account token pool at `.loom/tokens/` from numbered triples in `.env`:
+For environments that rotate among multiple Claude OAuth accounts, Loom can bootstrap a per-account token pool at `.loom/tokens/` from numbered `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` / `ACCOUNT_TOKEN_FILE_N` triples:
 
 ```env
 ACCOUNT_EMAIL_1=user1@example.com
@@ -367,13 +439,71 @@ Run `loom-tokens bootstrap` to materialize the pool:
 
 ```bash
 loom-tokens bootstrap            # Idempotent — only writes new/missing tokens.
-loom-tokens bootstrap --dry-run  # Preview without writing.
-loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from .env.
+loom-tokens bootstrap --dry-run  # Preview + print the effective merged account set.
+loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from source.
 ```
 
-Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` manifest is written alongside with sha256 fingerprints (8 chars) for drift detection — **no secret material is stored in the manifest**. Numbering gaps are allowed; partial triples are skipped with a warning.
+Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` manifest is written alongside with sha256 fingerprints (8 chars) for drift detection plus each account's `source` (home/repo) — **no secret material is stored in the manifest**. Numbering gaps are allowed; partial triples are skipped with a warning.
 
 `.loom/tokens/` is gitignored. The pool is consumed by external rotation logic (e.g. a `claude-wrapper.sh` that picks the least-used token); only the bootstrap step is provided here.
+
+#### Account sources: claude-monitor-first + per-repo (#3695, #3698, #3704)
+
+Rather than re-declaring the same account triples in every repo's `.env`, declare them **once** in the shared claude-monitor master and let each workspace add or override on top of it. Sources are merged by account email in precedence order:
+
+| Source | Default location | Override |
+|--------|------------------|----------|
+| **claude-monitor master** (primary) | `~/.claude-monitor/accounts.env` | `LOOM_CLAUDE_MONITOR_DIR` env var (directory) |
+| **Repo-local** | `<repo>/.loom/accounts.env` if present, else legacy `<repo>/.env` | `--env <path>` on `bootstrap` |
+| **Home master** (opt-in only, #3704) | *no default location* — read **only** when explicitly pointed at | `LOOM_ACCOUNTS_ENV` env var (a path enables it, `""` disables); `--home-env <path>` / `--no-home` on `bootstrap` |
+
+**Default resolution is claude-monitor → repo `.env`.** The `~/.loom/accounts.env` home master is **no longer auto-read** (#3704 retired the default location): it is consulted only when an operator opts in via `LOOM_ACCOUNTS_ENV=<path>` (conventionally `~/.loom/accounts.env`) or `--home-env <path>`. This retires the default *location*, not the *capability*.
+
+`loom-tokens bootstrap` reads the available sources and **merges them by account email** (`ACCOUNT_EMAIL`), with the higher-precedence source winning:
+
+- An email present **only in a lower-precedence source** is inherited into the pool.
+- An email present **only in a higher-precedence source** is added.
+- An email present in **both** → the higher-precedence entry overrides (e.g. to rotate a key or repoint the token file).
+
+To *exclude* an inherited account from one repo, pin the subset you want with `loom-tokens pin` — the merge only ever adds/overrides, never subtracts. The effective merged set (and where each account came from) is printed by `bootstrap` and `bootstrap --dry-run`. A repo with only a legacy `.env` and no other source behaves exactly as before.
+
+> **Secrets**: `~/.claude-monitor/accounts.env`, the opt-in `~/.loom/accounts.env`, and the repo-local `.loom/accounts.env` all hold raw OAuth keys. The repo-local file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed); keep any home-level master `0600` and outside any repo. A repo can rely entirely on the claude-monitor master with no local account file at all.
+
+#### Importing live tokens from claude-monitor (#4006)
+
+`accounts.env` is a **snapshot** — a file someone wrote by hand at some point. claude-monitor keeps the **live** credentials in its SQLite store (`~/.claude-monitor/usage.db` → `oauth_credentials`) and refreshes them as accounts are re-authenticated. The two drift, and the drift is silent and total:
+
+```text
+401 {"type":"authentication_error","message":"OAuth access token has been revoked."}
+```
+
+When that happens to every account at once, `loom-tokens check` reports all accounts `blocked`, the daemon's dynamic concurrency cap collapses to `min(healthy 0 × per-token N, …) = 0`, and dispatch stops entirely. Crucially **`bootstrap --force` does not fix it** — it faithfully rewrites the same revoked tokens, because the snapshot itself is what went stale.
+
+`loom-tokens import-from-monitor` reads the live store directly and is **the standard way to populate a new host's pool** (it replaces hand-copying a pool between machines):
+
+```bash
+loom-tokens import-from-monitor                  # into <repo>/.loom/tokens
+loom-tokens import-from-monitor --shared         # into the machine-level pool (#3938)
+loom-tokens import-from-monitor --force          # apply ROLLED tokens (see below)
+loom-tokens import-from-monitor --dry-run        # preview
+loom-tokens import-from-monitor --prune          # drop accounts the monitor no longer reports
+```
+
+**`--force` is what applies a token roll.** Every rolled token legitimately differs from what is on disk, so without `--force` each one is reported as drift and left alone — deliberately, so a hand-pinned token is never silently clobbered. The command exits `2` when drift was found and not applied, so a script can detect "pool is still stale". After importing, refresh the ranking so the daemon sees the recovered capacity:
+
+```bash
+loom-tokens import-from-monitor --force && loom-tokens check --ranking
+```
+
+Behavior notes:
+
+- **Read-only** on `usage.db` (opened `mode=ro`) — the store belongs to claude-monitor; Loom never writes or migrates it.
+- Only `is_active = 1` rows are imported; `expires_at` is **not** used as a filter (observed rows carry stale timestamps while still authenticating — health comes from `loom-tokens check`).
+- Token filenames use the same derivation as `bootstrap` (`robb@2amlogic.com` → `robb-2amlogic.token`), so an account keeps one identity across both paths and re-importing overwrites in place.
+- Idempotent: unchanged tokens are left untouched. `index.json` records `source: monitor-db` (distinct from the `monitor` snapshot) and, as always, fingerprints only — never secret material.
+- `--prune` removes only `*.token` files; pool state (`.ranking`, `.bad_tokens`, `.failure_counts`, `.allowlist`) is never touched.
+- The importer takes **claude-monitor as authoritative for pool membership**, so it imports every active account — including any that `accounts.env` omitted. Use `loom-tokens pin` to restrict which accounts the selector may actually pick.
+- Absent claude-monitor, an absent `usage.db`, or an older schema without `oauth_credentials` all exit `1` with a message naming the path tried.
 
 #### Account health probe + ranking
 
@@ -392,7 +522,9 @@ Status assignment: `available` (utilizations < 95%), `exhausted` (`7d_utilizatio
 
 OAuth tokens shaped `sk-ant-oat01-*` are sent with `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`; plain API keys use `x-api-key`.
 
-Cron example (probe every 10 minutes):
+**The running `loom-daemon` self-refreshes `.ranking` (#3969)** — it runs the equivalent of `probe-tokens.sh --ranking` on its own periodic loop (default every 10 minutes, `autonomous.tokenRankingRefresh` / `LOOM_TOKEN_RANKING_REFRESH*`, on by default since it is read-only probing with no dispatch side effect), so a standing cron for this is no longer required when the daemon is running. See [Token-ranking self-refresh](.loom/docs/daemon-reference.md#token-ranking-self-refresh-3969) for the config knobs.
+
+A cron entry is now only needed as a **fallback for setups that don't run `loom-daemon`** (e.g. pure `/loom:sweep` subagent dispatch with no daemon process). Cron example (probe every 10 minutes):
 
 ```cron
 */10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
@@ -408,10 +540,40 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 
 ```bash
 loom-clean --force                       # Clean stale worktrees/branches
-./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
+loom-recover-orphans --recover           # Recover orphaned loom:building issues
 gh label sync --file .github/labels.yml  # Re-sync labels (GitHub only)
 # Cancel a running sweep: mcp__loom__cancel_sweep --sweep_id <id>
 ```
+
+## Custom Guard Hooks
+
+Loom ships Bash `PreToolUse` guard hooks (`defaults/hooks/guard-destructive.sh`) that block or ask on destructive commands. Several category toggles let a repo opt out of checks that are a category error for it — see `defaults/CLAUDE.md` → "Custom Guard Hooks" for the full catalog (`guards.sqlDdl`, `guards.cloudCli`, `guards.rmScope`, `guards.forceScope`). The read-only fast-path toggle is documented below.
+
+### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
+
+`guard-destructive.sh` fires before **every** Bash tool call. In Bash-dense sessions almost every call is obviously read-only (`git status`, `ls`, `grep`, `aws … describe*`, `gh … list`), yet each otherwise runs the full deny/ask gauntlet (~37 `grep`/`awk`/`sed` forks plus a `git rev-parse`, ~179ms) before allowing. The read-only fast path (issue #3687) short-circuits that case to a **silent** `allow` (exit 0, zero output, no logging) via one bash-builtin structural test (zero forks) plus one lazy `jq` config read, running before the repo-root `git rev-parse` and every deny/ask array.
+
+The fast path is **on by default**, resolved highest-precedence first:
+
+1. **`LOOM_GUARD_READONLY_FASTPATH` env var** — `0`/`false`/`no` disables (full-path checking restored byte-for-byte); `1`/`true`/`yes` forces on. Overrides config.
+2. **`.loom/config.json` → `guards.readOnlyFastPath`** — default `true` when absent; set `false` to disable.
+3. **Default** — `true`.
+
+**Security**: the fast path is a guard bypass by construction, so admission is purely structural. A command is fast-pathed only when it contains **none** of `;` `&` `|` `<` `>` backtick `$(` newline (excludes chaining/piping/redirection/substitution) **and** its first token exactly matches the built-in allowlist: `git status|log|diff|show` (bare, no `git -C …`), `ls`, `grep`, `rg`, `jq`, `wc`, `head`, `tail`, `test`, `[`, `[[` (any args), `find` (any args **except** a dangerous action-primary — `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`/`-fls`/`-fprint`/`-fprint0`/`-fprintf` — which routes it to the full path, #3772), `gh <noun> view|list`, `aws <service> describe*|get*|list*`, `aws s3 ls`. Wrappers (`bash -c`, `eval`, `sudo …`, `env …`) are excluded automatically because their first token isn't allowlisted. So `git status && git push --force origin main` takes the full path and is still denied.
+
+**`cat` and `ssh` are deliberately excluded**: `cat` has an existing `.ssh`/`.aws/credentials` ASK carve-out a blanket fast-path would skip, and `ssh` wraps an opaque remote payload the catastrophic scan still covers.
+
+**Optional** `guards.readOnlyFastPathExtra` is an extend-only array of **literal first-word commands** added to the allowlist without hand-editing the installer-managed `.claude/settings.json`:
+
+```json
+{ "guards": { "readOnlyFastPath": true, "readOnlyFastPathExtra": ["psql"] } }
+```
+
+> **Note**: `jq`/`wc` (and `head`/`tail`/`test`/`find`) are part of the built-in default allowlist as of #3772 — `readOnlyFastPathExtra` is now only for a genuinely-custom bare read-only word.
+
+> **Warning**: each entry is a full-generality bypass for that command word (all arguments) — only add bare, argument-independent read-only utilities, never scripts or anything that could wrap a mutating call.
+
+Disabling the fast path never weakens any deny/ask rule; a missing/malformed `.loom/config.json` falls through to fast-path-ON.
 
 ## MCP Hooks
 
@@ -436,14 +598,19 @@ For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tok
 
 ### Setup
 
-1. Add account credentials to `.env` at the workspace root:
+1. Declare account credentials in a default source — the shared claude-monitor master `~/.claude-monitor/accounts.env` (primary) or per-repo in `<repo>/.loom/accounts.env` (falls back to legacy `<repo>/.env`). The `~/.loom/accounts.env` home master is **opt-in only** since #3704 (no longer auto-read); point `LOOM_ACCOUNTS_ENV=~/.loom/accounts.env` (or `--home-env <path>`) at it to enable:
    ```env
+   ACCOUNT_EMAIL_1=account-one@example.com
    ACCOUNT_KEY_1=sk-ant-oat01-...
-   ACCOUNT_TOKEN_FILE_1=robb-personal.token
+   ACCOUNT_TOKEN_FILE_1=account-one.token
+   ACCOUNT_EMAIL_2=account-two@example.com
    ACCOUNT_KEY_2=sk-ant-oat01-...
-   ACCOUNT_TOKEN_FILE_2=robb-work.token
+   ACCOUNT_TOKEN_FILE_2=account-two.token
    ```
-2. Run `loom-tokens bootstrap` to materialize per-account `.token` files into `.loom/tokens/` (mode 0600, parent dir 0700). See issue #3234.
+   The claude-monitor, repo-local, and (opt-in) home sources are **merged by email**, with the higher-precedence source overriding/adding (see "Account sources: claude-monitor-first + per-repo" above). Keep any home-level master `0600` and outside any repo.
+2. Run `loom-tokens bootstrap` to materialize the merged set into per-account `.token` files in `.loom/tokens/` (mode 0600, parent dir 0700). See issues #3234, #3695.
+
+   **If claude-monitor runs on this host, prefer `loom-tokens import-from-monitor`** — it reads claude-monitor's live credential store instead of the `accounts.env` snapshot, so a new host needs no account file of its own and a token roll is picked up automatically (add `--force` to apply rolled tokens). See "Importing live tokens from claude-monitor" above.
 3. Spawn agents through `.loom/scripts/spawn-claude.sh` instead of invoking `claude` directly. The wrapper selects a token using a 3-tier algorithm (ranking → allowlist → random), exports `CLAUDE_CODE_OAUTH_TOKEN`, then `exec`s `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for retry behavior).
 
 ### Selection algorithm (`loom_tools.tokens.select`)
@@ -468,9 +635,15 @@ The `classify_error <output> <exit_code>` function returns one of `SUCCESS`, `TI
 
 When invoked from a worktree, `spawn-claude.sh` resolves the canonical repo root via `git rev-parse --git-common-dir` and locates `.loom/tokens/` there — never in the worktree's path. This avoids each worktree maintaining its own bad-tokens list.
 
+### Shared machine-level pool fallback (#3938)
+
+Token selection resolves the effective pool as: the **per-repo** pool `<repo>/.loom/tokens/` when it holds `*.token` files, else the **shared machine-level pool** `~/.loom/tokens/` (override `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback). This lets a consumer repo the daemon dispatches into — which has no pool of its own — spawn against the shared pool instead of hard-failing with `EX_CONFIG`. Crucially, the pool **state** files (`.bad_tokens`, `.failure_counts`, `.ranking`, `.allowlist`) are read/written in whichever pool was selected, so state is **never forked per repo** (token-capacity backpressure sees one truth). Provision the shared pool once per machine with `loom-tokens bootstrap --shared` (destination-only; account sources are unchanged). See `.loom/docs/daemon-reference.md` → "Token pool provisioning for managed repos".
+
+**Package-path fallback for consumer-repo dispatches (#3949)**: `#3938` fixed the pool *location*, but token *selection* still shells into `python3 -m loom_tools.tokens.select`, and `spawn-claude.sh` locates that Python package via (1) `LOOM_PACKAGE_PATH` env, (2) script-relative `../../loom-tools/src`, (3) `$WORKSPACE/loom-tools/src` — tiers (2)/(3) only resolve inside an actual loom checkout, so a consumer-repo dispatch used to hard-fail with `ModuleNotFoundError: No module named 'loom_tools'` unless an operator manually exported `LOOM_PACKAGE_PATH` before starting the daemon. `loom-daemon`'s `spawn_child` now resolves and forwards `LOOM_PACKAGE_PATH` automatically on every dispatch: an ambient override on the daemon's own environment always wins, otherwise it derives `<loom-checkout>/loom-tools/src` from the source tree the running `loom-daemon` binary was compiled from (`CARGO_MANIFEST_DIR`, baked in at build time) when that directory still exists and contains `loom_tools/tokens`. A consumer repo with no loom checkout and no `LOOM_PACKAGE_PATH` env now selects a token successfully with zero manual configuration.
+
 ### Hard-fail on missing pool
 
-`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` when `.loom/tokens/` is absent or all tokens are bad. It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
+`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` (or `loom-tokens bootstrap --shared` for the machine-level pool) when **neither** the per-repo nor the shared pool has usable tokens (absent, empty, or all bad). It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
 
 ### Operator CLI (`loom-tokens pin/unpin/unblock`)
 
@@ -532,7 +705,10 @@ Use `scripts/version.sh` to manage versions across all packages:
 ./scripts/version.sh set 1.0.0 --tag   # Set explicit version + commit + tag
 ```
 
-**Full release flow** (use `/release` skill for guided process):
+**Full release flow** — releases are driven by `/repo:release` from
+[rjwalters/repo](https://github.com/rjwalters/repo) (install repo for the
+command). `/repo:release` detects and honors `scripts/version.sh` as its
+first-priority version tool, so the underlying mechanics are unchanged:
 ```bash
 ./scripts/version.sh bump patch --tag
 git push origin main --tags
@@ -541,13 +717,13 @@ gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
 
 The script updates all 5 version-bearing files (`package.json`, `mcp-loom/package.json`, 2 `Cargo.toml` files (`loom-daemon`, `loom-api`), `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create` to trigger the build.
 
-## Migration: v0.10.0 shepherd/daemon deprecation (in progress)
+## Migration: v0.10.0 shepherd/daemon deprecation
 
 The orchestration-architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. The replacement is a two-surface architecture: `/loom:sweep` for in-session subagent dispatch (Tier 1) and the Rust `loom-daemon` binary for multi-account MCP-level dispatch (Tier 2). Epic #3449 rebuilt the daemon surface in phases A–D, all shipped on main. The completed phases:
 
 | Phase | Issue | What shipped | Status |
 |-------|-------|-----------|--------|
-| Phase 1 | #3374 | Minimal multi-account spawn loop (legacy — deprecated in Phase E of #3449) | shipped, deprecated |
+| Phase 1 | #3374 | Minimal multi-account spawn loop (legacy — deprecated in Phase E of #3449) | shipped (deprecated in Phase E, removed in v0.11.0) |
 | Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
 | Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
 | Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill | shipped |
@@ -556,7 +732,7 @@ The orchestration-architecture migration (epic #3372) deleted the shepherd brain
 | #3449 Phase B | #3453 | `loom-daemon`: event bus (tokio broadcast), 6 frozen topics, `publish_event`, `subscribe_to_events` IPC | shipped |
 | #3449 Phase C | #3455 | MCP tools: `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep`, `tail_event_bus`; daemon-reference.md rewrite | shipped |
 | #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
-| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + doc-fiction rewrite | this PR |
+| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + doc-fiction rewrite | shipped |
 
 **v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles.
 
@@ -566,7 +742,7 @@ The orchestration-architecture migration (epic #3372) deleted the shepherd brain
 |---------|-------------|
 | `loom-daemon` Python CLI | Rust `loom-daemon` binary + `mcp__loom__dispatch_sweep` (+ GitHub Actions for support roles) |
 | `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
-| `defaults/scripts/spawn-loop.sh` (deprecation phase, deletion in v0.11.0) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
+| `defaults/scripts/spawn-loop.sh` (removed in v0.11.0) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
 
 Full migration narrative and per-CLI replacement table: [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 
@@ -587,3 +763,11 @@ See also: [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — records the arch
 
 **Generated by Loom Installation Process**
 Last updated: 2026-04-21
+
+<!-- BEGIN REPO-SKILLS -->
+This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.4.0 installed —
+general repository hygiene and environment commands invoked as `/repo:<command>`. Run
+`/repo:help` for the command list, or see `.claude/skills/repo/SKILL.md` for the full
+guide. Hygiene commands are report-first: they present findings and wait before changing
+anything. Managed by `install.sh` — edit outside the markers only.
+<!-- END REPO-SKILLS -->

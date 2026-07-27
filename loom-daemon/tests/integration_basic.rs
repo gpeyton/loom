@@ -5,10 +5,32 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_session_exists,
-    TestClient, TestDaemon,
+    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_available,
+    tmux_session_exists, TestClient, TestDaemon,
 };
 use serial_test::serial;
+
+/// Skip the enclosing test (early `return`) with a loud note when no usable
+/// tmux server is reachable on this host (issue #3985).
+///
+/// These terminal-lifecycle tests *create* tmux sessions, so a host without a
+/// working tmux (dead server, missing binary, unwritable socket dir) can only
+/// ever fail them — for a reason that has nothing to do with the code under
+/// test. Skipping keeps the shared build gate green on a busy dev host while
+/// CI, which always has a live tmux, still exercises the real path. The gate
+/// also excludes integration test targets entirely (see
+/// `.loom/docs/build-gate.md`), so this is belt-and-suspenders.
+macro_rules! require_tmux {
+    () => {
+        if !tmux_available() {
+            eprintln!(
+                "SKIP: no usable tmux server on this host (issue #3985); \
+                 this terminal-lifecycle path is covered by CI"
+            );
+            return;
+        }
+    };
+}
 
 /// Cleanup helper to run before/after tests.
 /// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
@@ -36,7 +58,15 @@ async fn test_ping_pong() {
     client.ping().await.expect("Second ping failed");
 }
 
-/// Test 1.2: Error handling - malformed JSON
+/// Test 1.2: Error handling - malformed requests (Issue #3805)
+///
+/// A malformed request must be answered with a structured error frame
+/// (`{"type":"StructuredError","payload":{"domain":"ipc","code":"IPC_PROTOCOL_ERROR",...}}`)
+/// rather than silently dropping the connection. The connection must stay
+/// usable for subsequent well-formed requests. All three malformed shapes —
+/// garbage JSON, a missing required field, and an unknown `type` tag — hit
+/// the same `serde_json::from_str::<Request>` failure and must each produce
+/// the structured frame.
 #[tokio::test]
 #[serial]
 async fn test_malformed_json() {
@@ -47,16 +77,63 @@ async fn test_malformed_json() {
         .await
         .expect("Failed to connect");
 
-    // Send malformed JSON (missing required "type" field)
-    let malformed = serde_json::json!({"InvalidRequest": "test"});
-    let result = client.send_request(malformed).await;
+    /// Assert a response is the IPC-protocol structured error frame.
+    fn assert_ipc_protocol_error(response: &serde_json::Value, case: &str) {
+        assert_eq!(
+            response.get("type").and_then(|t| t.as_str()),
+            Some("StructuredError"),
+            "[{case}] expected StructuredError frame, got: {response:?}"
+        );
+        let payload = response
+            .get("payload")
+            .unwrap_or_else(|| panic!("[{case}] StructuredError missing payload: {response:?}"));
+        assert_eq!(
+            payload.get("domain").and_then(|d| d.as_str()),
+            Some("ipc"),
+            "[{case}] expected domain=ipc, got: {payload:?}"
+        );
+        // ErrorCode is a newtype over String, so it serializes as a bare
+        // string (not `{"0": ...}`).
+        assert_eq!(
+            payload.get("code").and_then(|c| c.as_str()),
+            Some("IPC_PROTOCOL_ERROR"),
+            "[{case}] expected code=IPC_PROTOCOL_ERROR, got: {payload:?}"
+        );
+    }
 
-    // Daemon currently closes connection on malformed requests
-    // This is reasonable behavior - malformed requests indicate a protocol error
-    assert!(result.is_err(), "Malformed request should result in error");
+    // Case 1: garbage / unknown-shape JSON (unknown `type` tag). An object
+    // without a valid `type` fails the tagged-enum deserialize.
+    let unknown_type = serde_json::json!({"type": "Nonsense", "payload": {}});
+    let response = client
+        .send_request(unknown_type)
+        .await
+        .expect("unknown-type request must return a frame, not close the connection");
+    assert_ipc_protocol_error(&response, "unknown-type");
 
-    // Since connection is closed, we can't send more requests
-    // This documents current behavior: daemon closes connection on protocol errors
+    // Case 2: missing required field — CancelSweep without `grace_secs`.
+    let missing_field = serde_json::json!({
+        "type": "CancelSweep",
+        "payload": { "sweep_id": "sweep-issue-1-123" }
+    });
+    let response = client
+        .send_request(missing_field)
+        .await
+        .expect("missing-field request must return a frame, not close the connection");
+    assert_ipc_protocol_error(&response, "missing-field");
+
+    // Case 3: structurally invalid JSON (raw garbage, not even an object).
+    let garbage = serde_json::json!("this is not a request object");
+    let response = client
+        .send_request(garbage)
+        .await
+        .expect("garbage request must return a frame, not close the connection");
+    assert_ipc_protocol_error(&response, "garbage");
+
+    // The connection must still be usable after all three malformed requests.
+    client
+        .ping()
+        .await
+        .expect("connection must remain usable after malformed requests");
 }
 
 /// Test 2.1: Create terminal
@@ -64,6 +141,7 @@ async fn test_malformed_json() {
 #[serial]
 async fn test_create_terminal() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -94,6 +172,7 @@ async fn test_create_terminal() {
 #[allow(clippy::panic)]
 async fn test_create_terminal_with_working_dir() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -164,6 +243,7 @@ async fn test_create_terminal_with_working_dir() {
 #[serial]
 async fn test_list_terminals() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -226,6 +306,7 @@ async fn test_list_terminals() {
 #[serial]
 async fn test_destroy_terminal() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -289,6 +370,7 @@ async fn test_destroy_nonexistent_terminal() {
 #[serial]
 async fn test_send_input() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -326,6 +408,7 @@ async fn test_send_input() {
 #[serial]
 async fn test_multiple_clients() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
 

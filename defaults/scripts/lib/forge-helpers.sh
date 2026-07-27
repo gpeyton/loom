@@ -323,7 +323,16 @@ forge_get_pr_nocache() {
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     # Gitea has no caching layer like gh-cached
     forge_get_pr "$nwo" "$pr_number"
+  elif [[ "$(basename "$gh_cmd")" == "gh" ]]; then
+    # Plain `gh` has no --no-cache flag (it's a gh-cached wrapper flag). Plain
+    # `gh api` is already uncached, so calling it without --no-cache preserves
+    # the no-cache intent. Passing --no-cache to plain gh fails on the unknown
+    # flag, and with 2>/dev/null the error is swallowed and callers substitute
+    # '{}', silently breaking merge verification and race-condition rechecks
+    # whenever gh-cached is absent (issue #3547).
+    "$gh_cmd" api "repos/$nwo/pulls/$pr_number" 2>/dev/null
   else
+    # gh-cached wrapper: --no-cache bypasses its cache layer as intended.
     "$gh_cmd" --no-cache api "repos/$nwo/pulls/$pr_number" 2>/dev/null
   fi
 }
@@ -346,6 +355,41 @@ forge_check_auto_delete() {
   else
     "$gh_cmd" api "repos/$nwo" --jq '.delete_branch_on_merge' 2>/dev/null || echo "false"
   fi
+}
+
+# Check whether the repository has GitHub's "Allow auto-merge" setting enabled.
+# Usage: forge_check_auto_merge_allowed NWO [GH_CMD]
+# Returns on stdout: "true", "false", or "unknown".
+#
+# GitHub only: reads the repo-level `allow_auto_merge` flag. When it is false,
+# GitHub rejects the enablePullRequestAutoMerge mutation outright — no PR-level
+# state (CLEAN/UNSTABLE) will ever let it succeed — so callers that want to
+# degrade gracefully (wait-for-checks-then-merge) can detect it up front rather
+# than reacting to the post-mutation error string (#3820).
+#
+# Gitea returns "unknown" (there is no equivalent single repo flag consumed
+# here; Gitea auto-merge goes through loom-auto-merge's own poll-and-merge, which
+# this probe must not perturb). A probe failure (network/auth/unexpected value)
+# also returns "unknown" so callers preserve their existing behavior fail-safe.
+forge_check_auto_merge_allowed() {
+  local nwo="$1"
+  local gh_cmd="${2:-gh}"
+
+  if [[ "$FORGE_TYPE" != "github" ]]; then
+    echo "unknown"
+    return 0
+  fi
+
+  local val
+  val="$("$gh_cmd" api "repos/$nwo" --jq '.allow_auto_merge' 2>/dev/null)" || {
+    echo "unknown"
+    return 0
+  }
+  case "$val" in
+    true)  echo "true" ;;
+    false) echo "false" ;;
+    *)     echo "unknown" ;;
+  esac
 }
 
 # Delete a remote branch.

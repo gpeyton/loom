@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from loom_tools.tokens.check import AccountResult, ProbeReport, write_ranking_atomic
 from loom_tools.tokens.select import (
     EX_CONFIG,
     EmptyTokenPoolError,
@@ -39,21 +38,9 @@ def _make_workspace(tmp_path: Path, accounts: dict[str, str]) -> Path:
     return tmp_path
 
 
-def _write_ranking(workspace: Path, entries: list[tuple[str, str]]) -> None:
-    """Write a ``.ranking`` file matching the real ``check.py`` JSON shape.
-
-    Args:
-        entries: ``(name, status)`` pairs, already in ranked order.
-    """
+def _write_ranking(workspace: Path, lines: list[str]) -> None:
     rfile = workspace / ".loom" / "tokens" / ".ranking"
-    payload = {
-        "ranked_at": "2026-01-01T00:00:00Z",
-        "accounts": [
-            {"name": name, "status": status, "provider": "anthropic"}
-            for name, status in entries
-        ],
-    }
-    rfile.write_text(json.dumps(payload), encoding="utf-8")
+    rfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
     # Ensure mtime is fresh
     now = time.time()
     os.utime(rfile, (now, now))
@@ -193,24 +180,27 @@ def test_allowlist_with_no_existing_tokens_falls_through_to_random(tmp_path):
 # ---------- ranking tier ----------
 
 
-def test_ranking_picks_first_unblocked(tmp_path):
+def test_ranking_picks_among_top_n_eligible(tmp_path):
+    # Default N=3 spreads across eligible ranked entries (a is exhausted, so
+    # b and c are the top-2 eligible). See issue #3736.
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
-    _write_ranking(workspace, [("a", "exhausted"), ("b", ""), ("c", "")])
-    sel = select_token(workspace)
-    assert sel.name == "b"
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("b", "c")
+    assert sel.name != "a"  # never the exhausted account
     assert sel.mode == "ranked"
 
 
 def test_ranking_skips_blocked_status(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, [("a", "blocked"), ("b", "")])
+    _write_ranking(workspace, ["a|blocked", "b|"])
     sel = select_token(workspace)
     assert sel.name == "b"
 
 
 def test_ranking_skips_bad_token(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, [("a", ""), ("b", "")])
+    _write_ranking(workspace, ["a|", "b|"])
     bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
     bad_file.write_text("2026-01-01T00:00:00Z a expired\n", encoding="utf-8")
     sel = select_token(workspace)
@@ -220,14 +210,7 @@ def test_ranking_skips_bad_token(tmp_path):
 def test_stale_ranking_falls_through_to_random(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
     rfile = workspace / ".loom" / "tokens" / ".ranking"
-    payload = {
-        "ranked_at": "2026-01-01T00:00:00Z",
-        "accounts": [
-            {"name": "a", "status": ""},
-            {"name": "b", "status": ""},
-        ],
-    }
-    rfile.write_text(json.dumps(payload), encoding="utf-8")
+    rfile.write_text("a|\nb|\n", encoding="utf-8")
     # Backdate by 11 minutes — past the 10-min freshness window
     old = time.time() - (11 * 60)
     os.utime(rfile, (old, old))
@@ -236,183 +219,424 @@ def test_stale_ranking_falls_through_to_random(tmp_path):
     assert sel.mode == "random"
 
 
-def test_ranking_tolerates_unknown_fields(tmp_path):
-    """Extra/unknown fields in each account entry are ignored, not fatal."""
-    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+def _write_stale_ranking(workspace: Path, lines: list[str], age_secs: float) -> None:
+    """Write .ranking and backdate its mtime by *age_secs* seconds."""
     rfile = workspace / ".loom" / "tokens" / ".ranking"
-    payload = {
-        "ranked_at": "2026-01-01T00:00:00Z",
-        "accounts": [
-            {
-                "name": "a",
-                "status": "exhausted",
-                "5h_utilization": 0.99,
-                "7d_utilization": 0.99,
-                "7d_reset": "2026-01-02T00:00:00Z",
-            },
-            {"name": "b", "status": "", "5h_utilization": None},
-        ],
+    rfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    old = time.time() - age_secs
+    os.utime(rfile, (old, old))
+
+
+def test_stale_ranking_excludes_exhausted_from_random(tmp_path):
+    """A stale .ranking still excludes exhausted accounts from the random tier.
+
+    Regression for issue #3894: without this, an absent/stale ranking degraded
+    to fully-random selection and repeatedly handed out the exhausted account,
+    wedging sweeps at startup.
+    """
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    # 11 minutes old — past the freshness window — with `tired` exhausted.
+    _write_stale_ranking(workspace, ["tired|exhausted", "fresh|"], 11 * 60)
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"  # never the exhausted account
+        assert sel.mode == "random"  # tier-1 declined (stale)
+
+
+def test_stale_ranking_excludes_blocked_from_random(tmp_path):
+    workspace = _make_workspace(tmp_path, {"blk": "kb", "ok": "ko"})
+    _write_stale_ranking(workspace, ["blk|blocked", "ok|"], 20 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "ok"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_excludes_exhausted_from_allowlist(tmp_path):
+    """Stale-ranking exclusions also apply to the allowlist tier."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_allowlist(workspace, ["tired", "fresh"])
+    _write_stale_ranking(workspace, ["tired|exhausted", "fresh|"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "allowlist"
+
+
+def test_stale_ranking_all_exhausted_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale 'everything exhausted' ranking must not hard-fail a live pool.
+
+    The advisory exclusions empty the pool, so selection retries ignoring them
+    — returning a (possibly tired) token rather than raising EmptyTokenPoolError.
+    """
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|exhausted", "b|exhausted"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "random"
+
+
+def test_stale_ranking_without_status_still_random_over_all(tmp_path):
+    """A stale ranking with no exhausted/blocked entries excludes nothing."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|", "b|"], 11 * 60)
+    chosen = {
+        select_token(workspace, rng=random.Random(seed)).name for seed in range(30)
     }
-    rfile.write_text(json.dumps(payload), encoding="utf-8")
-    now = time.time()
-    os.utime(rfile, (now, now))
+    # No exclusions => both accounts reachable via the random tier.
+    assert chosen == {"a", "b"}
+
+
+def test_ranking_with_comments_and_blank_lines(tmp_path):
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(
+        workspace,
+        ["# header comment", "", "a|exhausted", "b|"],
+    )
     sel = select_token(workspace)
     assert sel.name == "b"
-    assert sel.mode == "ranked"
 
 
 def test_ranking_falls_through_when_all_exhausted(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    _write_ranking(workspace, [("a", "exhausted"), ("b", "exhausted")])
+    _write_ranking(workspace, ["a|exhausted", "b|exhausted"])
     sel = select_token(workspace)
     # Falls through past tier 1 (all exhausted), past tier 2 (no allowlist),
     # to tier 3 (random).
     assert sel.mode == "random"
 
 
-def test_malformed_ranking_json_falls_through(tmp_path):
-    """A corrupt/legacy (e.g. pipe-delimited) .ranking file must not raise —
-    tier 1 declines and selection falls through to tier 2/3."""
+# ---------- rate_limited defense-in-depth (issue #3988) ----------
+
+
+def test_ranking_prefers_available_over_rate_limited(tmp_path):
+    """A rate_limited account is skipped while a healthy account exists.
+
+    Regression for issue #3988: rate_limited was previously fully eligible
+    alongside available, so a 429-classified (often genuinely-exhausted-but-
+    misclassified) account competed equally in rotation.
+    """
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_ranking(workspace, ["tired|rate_limited", "fresh|"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_falls_back_to_rate_limited_when_pool_otherwise_empty(tmp_path):
+    """When every ranked account is rate_limited, still dispatch rather than stall."""
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    rfile = workspace / ".loom" / "tokens" / ".ranking"
-    rfile.write_text("a|\nb|\n", encoding="utf-8")  # legacy pipe format, not JSON
-    now = time.time()
-    os.utime(rfile, (now, now))
-    sel = select_token(workspace)
+    _write_ranking(workspace, ["a|rate_limited", "b|rate_limited"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "ranked"
+
+
+def test_ranking_rate_limited_and_exhausted_mixed_prefers_available(tmp_path):
+    workspace = _make_workspace(
+        tmp_path, {"exhausted-acct": "ke", "rl-acct": "kr", "ok-acct": "ko"},
+    )
+    _write_ranking(
+        workspace,
+        ["exhausted-acct|exhausted", "rl-acct|rate_limited", "ok-acct|"],
+    )
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "ok-acct"
+
+
+def test_stale_ranking_excludes_rate_limited_from_random(tmp_path):
+    """Stale-ranking exclusions also treat rate_limited as advisory-excluded."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_stale_ranking(workspace, ["tired|rate_limited", "fresh|"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_all_rate_limited_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale ranking where everything is rate_limited must not stall dispatch."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|rate_limited", "b|rate_limited"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
     assert sel.mode == "random"
 
 
-def test_ranking_json_not_a_dict_falls_through(tmp_path):
-    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    rfile = workspace / ".loom" / "tokens" / ".ranking"
-    rfile.write_text(json.dumps(["a", "b"]), encoding="utf-8")
-    now = time.time()
-    os.utime(rfile, (now, now))
-    sel = select_token(workspace)
-    assert sel.mode == "random"
-
-
-# ---------- writer/reader round-trip (issue #18) ----------
+# ---------- allowlist-of-known-good status (issue #3991) ----------
 #
-# These tests exercise the REAL production writer
-# (loom_tools.tokens.check.write_ranking_atomic) together with the REAL
-# production reader (loom_tools.tokens.select.select_token). This is the
-# regression test for #18: check.py writes JSON, select.py used to parse
-# pipe-delimited lines, so tier-1 (ranked) selection silently never
-# matched anything and every selection fell through to tier-2/tier-3.
+# The regression: tier-1 selection used a two-status *denylist*
+# (exhausted/blocked) that silently treated rate_limited — the probe's most
+# severe live verdict — as eligible, handing out dead tokens. The fix is an
+# *allowlist* of known-good statuses, so any status not positively known good
+# (rate_limited today, or *any future probe status*) is excluded from the
+# preferred pass by default rather than leaking through fail-open.
 
 
-def _make_provider_workspace(
-    tmp_path: Path, accounts: dict[str, str], providers: dict[str, str]
-) -> Path:
-    """Like ``_make_workspace`` but also writes an ``index.json`` mapping
-    each account name to a provider, so ``select_token(..., provider=...)``
-    can filter eligibility the same way it does in production."""
-    workspace = _make_workspace(tmp_path, accounts)
-    tokens_dir = workspace / ".loom" / "tokens"
-    index = {
-        "version": 1,
-        "generated_at": "2026-01-01T00:00:00Z",
-        "accounts": [
-            {"name": name, "file": f"{name}.token", "provider": prov}
-            for name, prov in providers.items()
-        ],
-    }
-    (tokens_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
-    return workspace
+def test_ranking_explicit_available_status_is_selected(tmp_path):
+    """An explicit ``available`` status (not just empty) is treated as healthy."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_ranking(workspace, ["tired|rate_limited", "fresh|available"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
 
 
-def test_writer_reader_round_trip_picks_best_account(tmp_path):
-    """check.write_ranking_atomic() -> select.select_token() end to end."""
+def test_ranking_skips_unknown_future_status_while_available_exists(tmp_path):
+    """A status the probe doesn't emit today must not be silently eligible.
+
+    Fail-safe allowlist (issue #3991): a denylist would treat any new status
+    (e.g. a future ``throttled``) as eligible — exactly the fail-open bug that
+    let ``rate_limited`` through. The allowlist excludes it from the preferred
+    pass so long as a known-good account exists.
+    """
+    workspace = _make_workspace(tmp_path, {"weird": "kw", "fresh": "kf"})
+    _write_ranking(workspace, ["weird|throttled", "fresh|available"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_falls_back_to_unknown_status_when_pool_otherwise_empty(tmp_path):
+    """An all-unknown-status ranked pool still dispatches rather than stalling.
+
+    The empty-pool guard is preserved: excluding non-healthy statuses must not
+    hard-fail a live pool. exhausted/blocked remain hard-excluded, but a novel
+    status is admitted in the fallback pass.
+    """
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|throttled", "b|throttled"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "ranked"
+
+
+def test_ranking_unknown_status_never_beats_exhausted_hard_exclusion(tmp_path):
+    """Even in the fallback pass, exhausted/blocked stay hard-excluded.
+
+    A pool of {exhausted, unknown-status} must fall back to the unknown-status
+    account, never the exhausted one — the fallback pass loosens the healthy
+    allowlist but never the exhausted/blocked hard-exclusion.
+    """
+    workspace = _make_workspace(tmp_path, {"dead": "kd", "weird": "kw"})
+    _write_ranking(workspace, ["dead|exhausted", "weird|throttled"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "weird"
+        assert sel.mode == "ranked"
+
+
+def test_stale_ranking_excludes_unknown_status_from_random(tmp_path):
+    """Stale-ranking advisory exclusions are allowlist-based too (issue #3991).
+
+    An account with a non-healthy stale status — including a future/unknown one
+    — is advisory-excluded from the lower tiers while a healthy account exists.
+    """
+    workspace = _make_workspace(tmp_path, {"weird": "kw", "fresh": "kf"})
+    _write_stale_ranking(workspace, ["weird|throttled", "fresh|available"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_all_unknown_status_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale ranking that is entirely unknown-status must not stall dispatch."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|throttled", "b|throttled"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "random"
+
+
+# ---------- ranking spread (issue #3736 / rotation #3909) ----------
+
+
+def test_ranking_default_rotates_across_all_available(tmp_path, monkeypatch):
+    """Default (unbounded) window rotates one-per-account across ALL available.
+
+    Issue #3909: the ranked tier no longer caps the spread to a top-N slice by
+    default — consecutive selections round-robin across every available account
+    so the pool drains evenly instead of stacking on the best-ranked few.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
+    )
+    _write_ranking(workspace, ["a|", "b|", "c|", "d|", "e|"])
+    all_accounts = {"a", "b", "c", "d", "e"}
+    chosen: list[str] = []
+    for _ in range(10):
+        sel = select_token(workspace, rng=random.Random(0))
+        assert sel.mode == "ranked"
+        chosen.append(sel.name)
+    # Every available account is reached (no top-N slice leaves d/e idle).
+    assert set(chosen) == all_accounts
+
+
+def test_ranking_explicit_cap_limits_window(tmp_path, monkeypatch):
+    """An explicit spreadTopN cap still restricts rotation to the top-N window."""
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "3")
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
+    )
+    _write_ranking(workspace, ["a|", "b|", "c|", "d|", "e|"])
+    window = {"a", "b", "c"}
+    chosen: set[str] = set()
+    for _ in range(20):
+        sel = select_token(workspace, rng=random.Random(0))
+        assert sel.mode == "ranked"
+        assert sel.name in window  # never spills past the top-N window
+        chosen.add(sel.name)
+    assert chosen == window  # rotation reaches every account in the window
+
+
+def test_ranking_n1_restores_greedy_first_eligible(tmp_path, monkeypatch):
+    """N=1 (env override) exactly restores the historical greedy behavior."""
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "1")
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
-    tokens_dir = workspace / ".loom" / "tokens"
-
-    report = ProbeReport(
-        ranked_at="2026-01-01T00:00:00Z",
-        accounts=[
-            AccountResult(name="a", status="exhausted"),
-            AccountResult(name="b", status="available"),
-            AccountResult(name="c", status="available"),
-        ],
-    )
-    write_ranking_atomic(report, tokens_dir / ".ranking")
-
-    sel = select_token(workspace)
-    assert sel.name == "b"
-    assert sel.mode == "ranked"
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|"])
+    # First eligible entry is b — deterministic regardless of seed.
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "b"
+        assert sel.mode == "ranked"
 
 
-def test_writer_reader_round_trip_respects_rank_order(tmp_path):
-    """The writer's list order IS the rank order; the reader must preserve it."""
-    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    tokens_dir = workspace / ".loom" / "tokens"
+def test_ranking_spread_config_key(tmp_path, monkeypatch):
+    """.loom/config.json -> tokens.spreadTopN is honored when env is unset."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    config_path = workspace / ".loom" / "config.json"
+    config_path.write_text(json.dumps({"tokens": {"spreadTopN": 1}}), encoding="utf-8")
+    # spreadTopN=1 => greedy first eligible (a), deterministic across seeds.
+    for seed in range(10):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "a"
 
-    # "b" ranked ahead of "a" even though "a" sorts first alphabetically —
-    # the reader must pick "b" because it's first in the writer's list.
-    report = ProbeReport(
-        ranked_at="2026-01-01T00:00:00Z",
-        accounts=[
-            AccountResult(name="b", status="available"),
-            AccountResult(name="a", status="available"),
-        ],
-    )
-    write_ranking_atomic(report, tokens_dir / ".ranking")
-
-    sel = select_token(workspace)
-    assert sel.name == "b"
-    assert sel.mode == "ranked"
+    # env var overrides the config key.
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "3")
+    chosen = {
+        select_token(workspace, rng=random.Random(seed)).name for seed in range(50)
+    }
+    assert len(chosen) > 1
 
 
-def test_writer_reader_round_trip_provider_filtered(tmp_path):
-    """Mixed-provider round trip: each provider's select_token() call must
-    pick the correct account purely from the real writer's real output."""
-    workspace = _make_provider_workspace(
+def test_ranking_spread_skips_interleaved_exhausted_blocked(tmp_path, monkeypatch):
+    """Exhausted/blocked entries interleaved in the ranking are never chosen.
+
+    The top-N window is filled from the *eligible* entries only, preserving
+    ranking order and skipping exhausted/blocked/bad tokens.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
         tmp_path,
-        {"claude-1": "ka", "codex-1": "kb"},
-        providers={"claude-1": "anthropic", "codex-1": "openai"},
+        {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
     )
-    tokens_dir = workspace / ".loom" / "tokens"
+    # Interleaved: a exhausted, b ok, c blocked, d ok, e ok.
+    # Eligible order: b, d, e. Default N=3 => window {b, d, e}.
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|blocked", "d|", "e|"])
+    window = {"b", "d", "e"}
+    chosen: set[str] = set()
+    for seed in range(50):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.mode == "ranked"
+        assert sel.name in window
+        assert sel.name not in ("a", "c")  # never exhausted/blocked
+        chosen.add(sel.name)
+    assert len(chosen) > 1
 
-    report = ProbeReport(
-        ranked_at="2026-01-01T00:00:00Z",
-        accounts=[
-            AccountResult(name="codex-1", status="available", provider="openai"),
-            AccountResult(name="claude-1", status="available", provider="anthropic"),
-        ],
+
+def test_ranking_spread_skips_bad_in_window(tmp_path, monkeypatch):
+    """A bad token is excluded from the top-N window entirely."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
+    bad_file.write_text("2026-01-01T00:00:00Z a expired\n", encoding="utf-8")
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name in ("b", "c")
+        assert sel.name != "a"
+
+
+# ---------- concurrent-dispatch distribution (issue #3909) ----------
+
+
+@pytest.mark.parametrize(
+    ("m_available", "n_dispatches"),
+    [(5, 3), (5, 5), (3, 5), (1, 4)],
+)
+def test_concurrent_dispatch_uses_min_n_m_distinct(
+    tmp_path, monkeypatch, m_available, n_dispatches
+):
+    """N sequential selections over M available accounts use min(N,M) distinct.
+
+    Models a burst of N concurrent dispatches sharing the rotation cursor: they
+    fan out one-per-account across the available pool rather than stacking.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    names = [chr(ord("a") + i) for i in range(m_available)]
+    workspace = _make_workspace(tmp_path, {n: f"k{n}" for n in names})
+    _write_ranking(workspace, [f"{n}|" for n in names])
+    chosen = [
+        select_token(workspace, rng=random.Random(0)).name
+        for _ in range(n_dispatches)
+    ]
+    assert len(set(chosen)) == min(n_dispatches, m_available)
+
+
+def test_ranking_rotation_not_always_same_first(tmp_path, monkeypatch):
+    """The first pick rotates across cycles / pools (not always .ranking[0]).
+
+    Fresh pools seeded from different rngs must not all start on the same
+    best-ranked account — the anti-stacking property of #3909.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    firsts: set[str] = set()
+    for seed in range(25):
+        ws = _make_workspace(
+            tmp_path / f"pool-{seed}",
+            {"a": "ka", "b": "kb", "c": "kc", "d": "kd"},
+        )
+        _write_ranking(ws, ["a|", "b|", "c|", "d|"])
+        firsts.add(select_token(ws, rng=random.Random(seed)).name)
+    assert len(firsts) > 1
+
+
+def test_ranking_rotation_drains_evenly_over_cycles(tmp_path, monkeypatch):
+    """Over 2 full cycles each available account is used exactly twice."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    counts: dict[str, int] = {"a": 0, "b": 0, "c": 0}
+    for _ in range(6):  # 2 cycles over 3 accounts
+        counts[select_token(workspace, rng=random.Random(0)).name] += 1
+    assert counts == {"a": 2, "b": 2, "c": 2}
+
+
+def test_ranking_rotation_skips_exhausted_and_never_stalls(tmp_path, monkeypatch):
+    """Rotation only spans available accounts and always returns while >=1 free.
+
+    Preserves #3900 (skip exhausted/blocked) and the #3907 floor (never stall
+    while at least one account has capacity).
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd"},
     )
-    write_ranking_atomic(report, tokens_dir / ".ranking")
-
-    sel_anthropic = select_token(workspace)
-    assert sel_anthropic.name == "claude-1"
-    assert sel_anthropic.mode == "ranked"
-
-    sel_openai = select_token(workspace, provider="openai")
-    assert sel_openai.name == "codex-1"
-    assert sel_openai.mode == "ranked"
-
-
-def test_writer_reader_round_trip_via_run_check(tmp_path, monkeypatch):
-    """Same contract, but going through run_check() (write_ranking=True)
-    instead of calling write_ranking_atomic() directly, to also exercise
-    build_report()'s sorting."""
-    from loom_tools.tokens import check as check_mod
-
-    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
-    tokens_dir = workspace / ".loom" / "tokens"
-
-    def fake_probe(provider, name, token, *, probe_prompt, model, session=None):
-        # "b" is available (ranks first), "a" is exhausted (ranks last).
-        if name == "b":
-            return AccountResult(name=name, status="available")
-        return AccountResult(name=name, status="exhausted")
-
-    monkeypatch.setattr(check_mod, "probe_account_for_provider", fake_probe)
-
-    check_mod.run_check(tokens_dir, write_ranking=True, stagger=False)
-
-    sel = select_token(workspace)
-    assert sel.name == "b"
-    assert sel.mode == "ranked"
+    # Only b and d are available; a exhausted, c blocked.
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|blocked", "d|"])
+    chosen = [
+        select_token(workspace, rng=random.Random(0)).name for _ in range(8)
+    ]
+    assert set(chosen) == {"b", "d"}  # rotates across exactly the available two
+    assert "a" not in chosen and "c" not in chosen
 
 
 # ---------- CLI ----------
@@ -496,3 +720,68 @@ def test_cli_empty_pool_exits_78(tmp_path):
     )
     assert result.returncode == EX_CONFIG
     assert "loom-tokens bootstrap" in result.stderr
+
+
+# ---------- shared machine-level pool fallback (issue #3938) ----------
+
+
+def _make_shared_pool(tmp_path: Path, accounts: dict[str, str]) -> Path:
+    """Materialize a shared machine-level pool (flat dir, not <repo>/.loom)."""
+    shared = tmp_path / "shared-pool"
+    shared.mkdir(parents=True)
+    for name, key in accounts.items():
+        (shared / f"{name}.token").write_text(key, encoding="utf-8")
+    return shared
+
+
+def test_falls_back_to_shared_pool_when_repo_has_none(tmp_path, monkeypatch):
+    """A consumer repo with no per-repo pool selects from the shared pool."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    shared = _make_shared_pool(tmp_path, {"shared-a": "key-shared-a"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    sel = select_token(repo)
+    assert sel.name == "shared-a"
+    assert sel.key == "key-shared-a"
+    assert sel.file == shared / "shared-a.token"
+
+
+def test_per_repo_pool_wins_over_shared(tmp_path, monkeypatch):
+    repo = _make_workspace(tmp_path, {"repo-a": "key-repo-a"})
+    shared = _make_shared_pool(tmp_path, {"shared-a": "key-shared-a"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    sel = select_token(repo)
+    assert sel.name == "repo-a"
+
+
+def test_shared_pool_bad_tokens_written_in_shared_dir(tmp_path, monkeypatch):
+    """State (.bad_tokens) is written in the SELECTED pool dir, never forked."""
+    from loom_tools.tokens.bad_tokens import is_bad, mark_bad
+
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    shared = _make_shared_pool(tmp_path, {"shared-a": "k-a", "shared-b": "k-b"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    mark_bad(repo, "shared-a", "expired")
+
+    # Written into the shared pool, NOT into <repo>/.loom/tokens.
+    assert (shared / ".bad_tokens").is_file()
+    assert not (repo / ".loom" / "tokens" / ".bad_tokens").exists()
+    # And selection sees the same truth: shared-a is skipped.
+    assert is_bad(repo, "shared-a") is True
+    sel = select_token(repo)
+    assert sel.name == "shared-b"
+
+
+def test_shared_disabled_still_hard_fails(tmp_path, monkeypatch):
+    """With the shared fallback disabled, a repo-less pool still hard-fails."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    _make_shared_pool(tmp_path, {"shared-a": "k-a"})  # exists but ignored
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", "")
+
+    with pytest.raises(EmptyTokenPoolError):
+        select_token(repo)

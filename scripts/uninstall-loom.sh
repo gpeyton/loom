@@ -193,8 +193,8 @@ CURRENT_STEP="Validate Target"
 header "Step 1: Validating Target Repository"
 echo ""
 
-# Check if target is a git repository
-if [[ ! -d "$TARGET_PATH/.git" ]]; then
+# Check if target is a git repository (worktree-safe: a linked worktree's .git is a file)
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   error "Target is not a git repository: $TARGET_PATH"
 fi
 success "Git repository detected"
@@ -1217,40 +1217,88 @@ if [[ -f "$WORKTREE_ABS/.loom/AGENTS.md" ]]; then
 fi
 
 # Handle .gitignore - remove Loom-specific patterns
+# Handle .gitignore - remove the Loom-managed block
+#
+# Issue #3590: the Loom-managed region is delimited by sentinel markers written
+# by `update_gitignore` (loom-daemon/src/init/post_init.rs). Deleting the whole
+# marked span in one pass is the single source of truth — it removes every Loom
+# pattern (not a drifted 4-item subset) and never reflows user spacing outside
+# the block, so an install -> uninstall -> install round-trip is byte-stable.
+# The markers mirror the `<!-- BEGIN/END LOOM ORCHESTRATION -->` convention used
+# for CLAUDE.md above.
 if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
   info "Removing Loom patterns from .gitignore..."
 
   GITIGNORE="$WORKTREE_ABS/.gitignore"
 
-  # Loom-specific patterns to remove (exact matches)
-  LOOM_PATTERNS=(
-    ".loom/state.json"
-    ".loom/worktrees/"
-    ".loom/*.log"
-    ".loom/*.sock"
-    "# Loom - AI Development Orchestration"
-  )
+  # Keep these in sync with post_init.rs (GITIGNORE_BEGIN_MARKER / END_MARKER).
+  GITIGNORE_BEGIN_MARKER="# >>> loom-managed (do not edit) >>>"
+  GITIGNORE_END_MARKER="# <<< loom-managed <<<"
 
   MODIFIED=false
-  for pattern in "${LOOM_PATTERNS[@]}"; do
-    if grep -qF "$pattern" "$GITIGNORE" 2>/dev/null; then
-      # Remove the exact line
-      grep -vF "$pattern" "$GITIGNORE" > "${GITIGNORE}.tmp" || true
-      mv "${GITIGNORE}.tmp" "$GITIGNORE"
-      MODIFIED=true
-    fi
-  done
+
+  if grep -qxF "$GITIGNORE_BEGIN_MARKER" "$GITIGNORE" 2>/dev/null && \
+     grep -qxF "$GITIGNORE_END_MARKER" "$GITIGNORE" 2>/dev/null; then
+    # Marker-delimited block: delete BEGIN..END inclusive in a single pass.
+    # Exact-line matching (awk `$0==`) needs no regex escaping and leaves every
+    # other line — including user blank lines — byte-for-byte untouched.
+    awk -v b="$GITIGNORE_BEGIN_MARKER" -v e="$GITIGNORE_END_MARKER" '
+      $0 == b { inblock = 1; next }
+      inblock { if ($0 == e) inblock = 0; next }
+      { print }
+    ' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
+    MODIFIED=true
+  else
+    # Backward-compat: legacy markerless installs (pre-#3590) wrote a header
+    # plus bare patterns. Remove the known headers and the full authoritative
+    # pattern set by exact whole-line match. This enumerated list exists ONLY
+    # for these legacy files; the marker path above is the source of truth for
+    # current installs. Blank lines are left as-is (no whole-file reflow).
+    LOOM_LEGACY_LINES=(
+      "# Loom runtime state (don't commit these)"
+      "# Loom - AI Development Orchestration"
+      ".loom-in-use"
+      ".loom-checkpoint"
+      ".loom/.daemon.pid"
+      ".loom/.daemon.log"
+      ".loom/daemon.sock"
+      ".loom/daemon-loop.pid"
+      ".loom/daemon-metrics.json"
+      ".loom/loom-source-path"
+      ".loom/spawn-loop-state.json"
+      ".loom/issue-failures.json"
+      ".loom/interventions/"
+      ".loom/worktrees/"
+      ".loom/state.json"
+      ".loom/mcp-command.json"
+      ".loom/activity.db"
+      ".loom/claims/"
+      ".loom/signals/"
+      ".loom/status/"
+      ".loom/retry-state/"
+      ".loom/diagnostics/"
+      ".loom/guide-docs-state.json"
+      ".loom/metrics_state.json"
+      ".loom/manifest.json"
+      ".loom/stuck-config.json"
+      ".loom/metrics/"
+      ".loom/usage-cache.json"
+      ".loom/claude-config/"
+      ".loom/*.log"
+      ".loom/*.sock"
+      ".loom/logs/"
+    )
+    for pattern in "${LOOM_LEGACY_LINES[@]}"; do
+      if grep -qxF "$pattern" "$GITIGNORE" 2>/dev/null; then
+        grep -vxF "$pattern" "$GITIGNORE" > "${GITIGNORE}.tmp" || true
+        mv "${GITIGNORE}.tmp" "$GITIGNORE"
+        MODIFIED=true
+      fi
+    done
+  fi
 
   if [[ "$MODIFIED" == "true" ]]; then
-    # Clean up consecutive blank lines left by removal
-    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp"
-    mv "${GITIGNORE}.tmp" "$GITIGNORE"
-
-    # Remove trailing blank lines (awk equivalent, consistent with the
-    # consecutive-blank-line trim immediately above).
-    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
-
-    # If file is now empty, remove it
+    # If file is now empty (or only whitespace), remove it
     if [[ ! -s "$GITIGNORE" ]] || ! grep -q '[^[:space:]]' "$GITIGNORE" 2>/dev/null; then
       rm -f "$GITIGNORE"
       REMOVED_LIST+=(".gitignore")
@@ -1373,10 +1421,31 @@ echo ""
 for dir in "${REMOVE_DIRS[@]}"; do
   dir_path="$WORKTREE_ABS/$dir"
   if [[ -d "$dir_path" ]]; then
-    # Check if directory is empty (or only contains .DS_Store)
+    # Check if directory holds foreign content (files or symlinks), ignoring
+    # empty subdirectories and .DS_Store.
+    #
+    # Issue #3634: count files AND symlinks — `\( -type f -o -type l \)` — rather
+    # than `-type f` (regular files only) or `-mindepth 1` (any child).
+    #
+    # `-type f` alone does NOT count symlinks (type `l`), so a directory whose
+    # only remaining content is a co-installed tool's symlink dir — e.g. Repo
+    # Skills' `.claude/commands/repo/` of symlinks — was judged "empty" and
+    # `rm -rf`'d, clobbering a foreign tool's install (the original bug).
+    #
+    # `-mindepth 1` over-corrects: it counts empty subdirectories as content.
+    # `REMOVE_DIRS` is NOT strictly child-first (`.loom/scripts` precedes
+    # `.loom/scripts/cli`), so a parent dir gets checked while its still-empty
+    # child exists → deemed non-empty → left behind, orphaning real Loom cruft
+    # (regressing CI Test 29).
+    #
+    # `\( -type f -o -type l \)` is the right signal: files/symlinks are foreign
+    # content to PRESERVE, while empty dirs are Loom cruft to REMOVE. A foreign
+    # symlink dir keeps its symlink (found → preserved); a Loom dir holding only
+    # empty subdirs finds nothing → removed. Order-independent.
+    #
     # `-print -quit` (instead of piping to `head -1`) avoids SIGPIPE on `find`,
     # which under `set -o pipefail` would trip the EXIT trap and abort the script.
-    remaining=$(find "$dir_path" -type f -not -name '.DS_Store' -print -quit 2>/dev/null)
+    remaining=$(find "$dir_path" \( -type f -o -type l \) -not -name '.DS_Store' -print -quit 2>/dev/null)
     if [[ -z "$remaining" ]]; then
       rm -rf "$dir_path"
       REMOVED_LIST+=("$dir/ (empty directory)")
@@ -1399,6 +1468,27 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 
   cd "$TARGET_PATH"
   stage_touched_paths
+
+  # Issue #3545: stage ONLY the paths this uninstall actually touched — never a
+  # bare `git add -A`. A bare `git add -A` stages every pending change in the
+  # tree, sweeping unrelated user work (in-progress edits, an embedded
+  # `.claude/worktrees/agent-*/`, etc.) into the index alongside the Loom
+  # deletions. The `install.sh --quick` reinstall path then prints generic
+  # `git add -A && git commit` guidance that would commit those user files.
+  # Scope staging to the Loom-managed paths that were removed / smart-edited so
+  # user files are never staged.
+  STAGE_PATHS=(
+    ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}
+    ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}
+    ${SMART_REMOVE_FILES[@]+"${SMART_REMOVE_FILES[@]}"}
+    ".loom/CLAUDE.md"
+  )
+  for _stage_path in ${STAGE_PATHS[@]+"${STAGE_PATHS[@]}"}; do
+    # `-A` stages deletions and modifications alike; per-path invocation with
+    # `|| true` tolerates pathspecs that never matched (e.g. an untracked file
+    # that was removed, or a smart-remove target that did not exist).
+    git add -A -- "$_stage_path" 2>/dev/null || true
+  done
 
   if git diff --staged --quiet; then
     info "No changes detected - Loom files may have already been removed"

@@ -25,6 +25,12 @@
 # (where .mcp.json / .codex/config.toml get written) and LOOM_WORKSPACE
 # (the env var mcp-loom uses to find the repo it operates on) move to the
 # target when --target/--workspace is given. See issue #49 finding 7.
+# Builds the unified MCP server if dist/index.js is missing OR stale
+# (older than any TypeScript source under mcp-loom/src/). The staleness
+# check prevents the built bundle from silently drifting behind source —
+# e.g. new sweep-dispatch tools added to src/tools/sweeps.ts never showing
+# up in dist/index.js because the artifact merely *exists* (see #3803, same
+# failure shape as the installed-copy drift fixed in #3777).
 
 set -euo pipefail
 
@@ -82,11 +88,26 @@ else
 fi
 
 MCP_DIR="$LOOM_SOURCE_ROOT/mcp-loom"
+MCP_DIR="$WORKSPACE_ROOT/mcp-loom"
+MCP_SRC="$MCP_DIR/src"
 MCP_ENTRY="$MCP_DIR/dist/index.js"
 
-# Build the unified MCP server if not already built
+# Decide whether the MCP server needs (re)building.
+#   - missing artifact               -> build
+#   - artifact older than any source -> rebuild (stale)
+NEEDS_BUILD=0
+BUILD_REASON=""
 if [[ ! -f "$MCP_ENTRY" ]]; then
-  echo "MCP server not built, building mcp-loom..."
+  NEEDS_BUILD=1
+  BUILD_REASON="MCP server not built"
+elif [[ -d "$MCP_SRC" ]] && [[ -n "$(find "$MCP_SRC" -type f -newer "$MCP_ENTRY" -print -quit 2>/dev/null)" ]]; then
+  # At least one source file is newer than the built bundle.
+  NEEDS_BUILD=1
+  BUILD_REASON="MCP server bundle is stale (src newer than dist)"
+fi
+
+if [[ "$NEEDS_BUILD" -eq 1 ]]; then
+  echo "$BUILD_REASON, building mcp-loom..."
   if command -v node &> /dev/null; then
     (cd "$MCP_DIR" && npm install --silent && npm run build) || {
       echo "Warning: Failed to build mcp-loom. MCP tools will not be available." >&2

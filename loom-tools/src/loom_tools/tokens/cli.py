@@ -11,6 +11,9 @@ Subcommands:
   which accounts the spawn-time selector is allowed to pick.
 * ``unblock`` (#3238) — clear ``auth``-reason entries from
   ``.bad_tokens`` so the named accounts become eligible again.
+* ``import-from-monitor`` (#4006) — materialize the pool from
+  claude-monitor's **live** credential store (``usage.db``) rather than the
+  ``accounts.env`` snapshot, which goes stale whenever accounts are rolled.
 
 Additional subcommands (status, ranking sync, etc.) can be added later
 without breaking the top-level surface — the dispatch table mirrors
@@ -32,6 +35,12 @@ from loom_tools.common.repo import find_repo_root
 from loom_tools.tokens import allowlist as allowlist_mod
 from loom_tools.tokens import failure_counts
 from loom_tools.tokens.bootstrap import bootstrap_tokens
+from loom_tools.tokens.monitor_db import (
+    MonitorDbUnavailable,
+    import_from_monitor,
+    monitor_db_path,
+)
+from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
 from loom_tools.tokens.check import (
     DEFAULT_PROBE_PROMPT,
     format_table,
@@ -49,13 +58,54 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bp = sub.add_parser(
         "bootstrap",
-        help="Materialize .loom/tokens/ from ACCOUNT_*_N triples in .env.",
+        help=(
+            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging by "
+            "email with precedence claude-monitor "
+            "(~/.claude-monitor/accounts.env, primary) > repo-local. The home "
+            "master (~/.loom/accounts.env) is opt-in only: it is read solely "
+            "when $LOOM_ACCOUNTS_ENV (or --home-env) points at it, never by "
+            "default. ACCOUNT_TOKEN_FILE_N is optional: when omitted it is "
+            "auto-derived from ACCOUNT_EMAIL_N (e.g. alice@example.com -> "
+            "alice-example.token)."
+        ),
     )
     bp.add_argument(
         "--env",
         type=Path,
         default=None,
-        help="Path to .env file (default: <repo-root>/.env).",
+        help=(
+            "Path to the repo-local account source (default: "
+            "<repo>/.loom/accounts.env if present, else <repo>/.env)."
+        ),
+    )
+    bp.add_argument(
+        "--home-env",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the home-dir master account source. Opt-in only: with no "
+            "flag, the home master is read only when $LOOM_ACCOUNTS_ENV points "
+            "at a file (it is not consulted otherwise; there is no default "
+            "location). It sits below the claude-monitor master "
+            "(~/.claude-monitor/accounts.env), which is always consulted when "
+            "present."
+        ),
+    )
+    bp.add_argument(
+        "--no-home",
+        action="store_true",
+        help="Ignore the home master; bootstrap from the repo-local source only.",
+    )
+    bp.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "Materialize the SHARED machine-level pool at ~/.loom/tokens "
+            "(override with $LOOM_SHARED_TOKENS_DIR) instead of the repo-local "
+            "<repo>/.loom/tokens. Selection falls back to this pool when a "
+            "consumer repo has no pool of its own (issue #3938), so one "
+            "bootstrap serves every repo the daemon dispatches into."
+        ),
     )
     bp.add_argument(
         "--force",
@@ -68,6 +118,62 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Report what would change without writing any files.",
     )
     bp.add_argument(
+        "--json",
+        dest="emit_json",
+        action="store_true",
+        help="Emit a JSON summary on stdout (in addition to log lines).",
+    )
+
+    ip = sub.add_parser(
+        "import-from-monitor",
+        help=(
+            "Materialize the pool from claude-monitor's LIVE credential store "
+            "(~/.claude-monitor/usage.db) instead of the accounts.env "
+            "snapshot. Use this after rolling accounts: the snapshot keeps the "
+            "old (now revoked) tokens, so `bootstrap --force` would rewrite "
+            "them unchanged."
+        ),
+    )
+    ip.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "Import into the SHARED machine-level pool at ~/.loom/tokens "
+            "(override with $LOOM_SHARED_TOKENS_DIR) instead of the repo-local "
+            "<repo>/.loom/tokens."
+        ),
+    )
+    ip.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=(
+            "Path to claude-monitor's usage.db (default: <claude-monitor "
+            "dir>/usage.db, honoring $LOOM_CLAUDE_MONITOR_DIR)."
+        ),
+    )
+    ip.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite on-disk tokens that differ from the store. Required to "
+            "apply rolled tokens, since every rolled token differs by design."
+        ),
+    )
+    ip.add_argument(
+        "--prune",
+        action="store_true",
+        help=(
+            "Delete *.token files for accounts claude-monitor no longer "
+            "reports active (pool state files are never touched)."
+        ),
+    )
+    ip.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing any files.",
+    )
+    ip.add_argument(
         "--json",
         dest="emit_json",
         action="store_true",
@@ -87,6 +193,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Write .loom/tokens/.ranking atomically (consumed by the spawn "
             "wrapper, #3235). Includes accounts from every provider."
+        ),
+    )
+    cp.add_argument(
+        "--source",
+        choices=["auto", "monitor", "probe"],
+        default=None,
+        help=(
+            "Where to source the ranking (#3697): 'auto' (default) uses "
+            "claude-monitor's ~/.claude-monitor/ranking.json when present and "
+            "fresh, else probes; 'monitor' uses claude-monitor only (no "
+            "probe); 'probe' always live-probes (pre-#3697 behavior). "
+            "Overrides $LOOM_RANKING_SOURCE."
         ),
     )
     cp.add_argument(
@@ -208,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bootstrap":
         return _cmd_bootstrap(args)
+    if args.command == "import-from-monitor":
+        return _cmd_import_from_monitor(args)
     if args.command == "check":
         return _cmd_check(args)
     if args.command == "pin":
@@ -229,12 +349,38 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
         log_error(str(exc))
         return 1
 
+    # `--no-home` disables the master (pass None); otherwise pass an explicit
+    # --home-env path, or fall through to the default resolution sentinel.
+    home_kwargs: dict[str, object] = {}
+    if args.no_home:
+        home_kwargs["home_env_path"] = None
+    elif args.home_env is not None:
+        home_kwargs["home_env_path"] = args.home_env
+
+    # `--shared` redirects the destination pool to the machine-level location
+    # (issue #3938). Only the write target changes; account sources are
+    # unchanged. Refuse when the operator has disabled the shared pool.
+    shared_kwargs: dict[str, object] = {}
+    if getattr(args, "shared", False):
+        shared_dir = shared_tokens_dir()
+        if shared_dir is None:
+            log_error(
+                "--shared requested but the shared pool is disabled "
+                "(LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a "
+                "directory.",
+            )
+            return 1
+        shared_kwargs["tokens_dir"] = shared_dir
+        log_info(f"Bootstrapping the shared machine-level pool at {shared_dir}")
+
     try:
         result = bootstrap_tokens(
             repo_root,
             env_path=args.env,
             force=args.force,
             dry_run=args.dry_run,
+            **home_kwargs,
+            **shared_kwargs,
         )
     except FileNotFoundError as exc:
         log_error(str(exc))
@@ -245,12 +391,163 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
 
     if args.emit_json:
         print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _print_effective_accounts(result)
 
     # Treat unresolved drift (without --force) as a non-zero exit so CI
     # can detect divergence.
     if result.drifted and not args.force:
         return 2
     return 0
+
+
+def _cmd_import_from_monitor(args: argparse.Namespace) -> int:
+    """Import the pool from claude-monitor's live credential store (#4006)."""
+    # Destination: the shared machine-level pool, or this repo's pool.
+    if getattr(args, "shared", False):
+        tokens_dir = shared_tokens_dir()
+        if tokens_dir is None:
+            log_error(
+                "--shared requested but the shared pool is disabled "
+                "(LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a "
+                "directory.",
+            )
+            return 1
+        log_info(f"Importing into the shared machine-level pool at {tokens_dir}")
+    else:
+        try:
+            repo_root = find_repo_root()
+        except FileNotFoundError as exc:
+            log_error(str(exc))
+            return 1
+        tokens_dir = repo_root / ".loom" / "tokens"
+
+    try:
+        result = import_from_monitor(
+            tokens_dir,
+            db_path=args.db,
+            force=args.force,
+            dry_run=args.dry_run,
+            prune=args.prune,
+        )
+    except MonitorDbUnavailable as exc:
+        log_error(str(exc))
+        return 1
+    except ValueError as exc:
+        log_error(str(exc))
+        return 1
+
+    if args.emit_json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _print_monitor_import(result)
+
+    # Unresolved drift without --force is the "rolled tokens not applied" case;
+    # exit non-zero so a script notices the pool is still stale.
+    if result.drifted and not args.force:
+        return 2
+    return 0
+
+
+def _print_monitor_import(result: "object") -> None:
+    """Print the imported account set. Secrets are never shown."""
+    db_path = getattr(result, "db_path", None) or monitor_db_path()
+    effective = getattr(result, "effective", []) or []
+    pruned = getattr(result, "pruned", []) or []
+
+    print(f"claude-monitor store: {db_path}")
+    print(f"Destination pool: {getattr(result, 'tokens_dir', None)}")
+
+    if not effective:
+        print("Active accounts: (none)")
+        return
+
+    written = set(getattr(result, "written", []) or [])
+    unchanged = set(getattr(result, "unchanged", []) or [])
+    drifted = set(getattr(result, "drifted", []) or [])
+
+    print(f"Active accounts ({len(effective)}):")
+    for acct in effective:
+        filename = acct.get("file", "")
+        if filename in written:
+            disposition = "written"
+        elif filename in unchanged:
+            disposition = "unchanged"
+        elif filename in drifted:
+            disposition = "DRIFT (use --force)"
+        else:
+            disposition = "-"
+        print(f"  {acct.get('name', ''):<26} {acct.get('email', ''):<34} {disposition}")
+
+    if pruned:
+        print(f"Pruned ({len(pruned)}): {', '.join(pruned)}")
+
+
+# Human-readable label for each provenance tag from the merge (#3695, #3698).
+_SOURCE_LABEL = {
+    "home": "home",
+    "repo": "repo",
+    "repo-override": "repo (overrides home)",
+    "monitor": "claude-monitor",
+    "monitor-override": "claude-monitor (overrides repo/home)",
+}
+
+
+def _print_effective_accounts(result: "object") -> None:
+    """Print the effective merged account set and where each came from.
+
+    Satisfies the #3695 acceptance criterion that ``bootstrap`` (and
+    ``--dry-run``) reports the effective set with provenance. Secrets are never
+    shown — only email, token filename, and source.
+    """
+    effective = getattr(result, "effective", []) or []
+    monitor_env = getattr(result, "monitor_env", None)
+    home_env = getattr(result, "home_env", None)
+    repo_env = getattr(result, "repo_env", None)
+
+    print("Account sources:")
+    print(f"  claude-monitor: {monitor_env if monitor_env else '(none)'}")
+    print(f"  home: {home_env if home_env else '(none)'}")
+    print(f"  repo: {repo_env if repo_env else '(none)'}")
+
+    if not effective:
+        print("Effective accounts: (none)")
+        return
+
+    print(f"Effective accounts ({len(effective)}):")
+    width = max(len(a.get("name", "")) for a in effective)
+    for a in effective:
+        label = _SOURCE_LABEL.get(a.get("source", ""), a.get("source", ""))
+        name = a.get("name", "")
+        email = a.get("email", "")
+        print(f"  {name:<{width}}  {email}  [{label}]")
+
+
+# Environment override for the ranking source (#3697). The --source flag
+# takes precedence; this env is the fallback; 'auto' is the built-in default.
+_RANKING_SOURCE_VAR = "LOOM_RANKING_SOURCE"
+_VALID_RANKING_SOURCES = ("auto", "monitor", "probe")
+
+
+def _resolve_ranking_source(flag_value: str | None) -> str:
+    """Resolve the ranking source: flag > $LOOM_RANKING_SOURCE > 'auto'.
+
+    An invalid env value is ignored (with a warning) and treated as unset so
+    a typo never silently disables ranking.
+    """
+    if flag_value is not None:
+        return flag_value
+    env = os.environ.get(_RANKING_SOURCE_VAR)
+    if env is not None:
+        candidate = env.strip().lower()
+        if candidate in _VALID_RANKING_SOURCES:
+            return candidate
+        if candidate:
+            log_warning(
+                f"Ignoring invalid {_RANKING_SOURCE_VAR}={env!r}; "
+                f"expected one of {', '.join(_VALID_RANKING_SOURCES)}."
+            )
+    return "auto"
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -274,10 +571,16 @@ def _cmd_check(args: argparse.Namespace) -> int:
         except FileNotFoundError as exc:
             log_error(str(exc))
             return 1
-        tokens_dir = repo_root / ".loom" / "tokens"
+        # Rank the pool selection actually uses: per-repo when present, else the
+        # shared machine-level pool (issue #3938), so `.ranking` is written
+        # beside the tokens the spawn wrapper will pick.
+        tokens_dir = resolve_tokens_dir(repo_root)
+
+    source = _resolve_ranking_source(args.source)
 
     report = run_check(
         tokens_dir,
+        source=source,
         write_ranking=args.ranking,
         probe_prompt=args.probe_prompt,
         stagger=not args.no_stagger,
@@ -492,8 +795,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         log_error("`unblock` requires at least one account name.")
         return 1
 
-    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
-    lock_path = workspace / ".loom" / "tokens" / ".bad_tokens.lock"
+    # Operate on the effective pool (per-repo, else shared) so unblock clears
+    # the same .bad_tokens selection consults (issue #3938).
+    _tokens_dir = resolve_tokens_dir(workspace)
+    bad_file = _tokens_dir / ".bad_tokens"
+    lock_path = _tokens_dir / ".bad_tokens.lock"
 
     # Reuse the bad_tokens lock to coordinate with concurrent appenders.
     from loom_tools.tokens.bad_tokens import _MkdirLock
@@ -562,8 +868,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             )
         else:
             log_info(
-                f"No matching entries removed (use --all-reasons to drop "
-                f"non-auth entries too).",
+                "No matching entries removed (use --all-reasons to drop "
+                "non-auth entries too).",
             )
     return 0
 

@@ -3,10 +3,14 @@
 # Usage: ./install.sh [OPTIONS] [/path/to/target-repo]
 #
 # Options:
-#   -y, --yes    Non-interactive mode (skip confirmation prompts)
-#   --quick      Quick Install - direct install without GitHub workflow
-#   --full       Full Install - creates issue, worktree, and PR
-#   -h, --help   Show this help message
+#   -y, --yes                  Non-interactive mode (skip confirmation prompts)
+#   --quick                    Quick Install - direct install without GitHub workflow
+#   --full                     Full Install - creates issue, worktree, and PR
+#   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
+#                              (forwarded to scripts/install-loom.sh)
+#   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
+#                              (forwarded to scripts/install-loom.sh)
+#   -h, --help                 Show this help message
 #
 # Examples:
 #   ./install.sh --quick ~/projects/my-app
@@ -48,10 +52,19 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
-# Install hooks and CLI wrapper that loom-daemon init doesn't handle
+# Install hooks and CLI wrapper that loom-daemon init doesn't handle.
+#
+# Issue #3625: an existing hook may be a downstream-tuned or forked copy — most
+# notably a customized guard-destructive.sh with a hand-tuned rm allowlist — so
+# it must NOT be silently clobbered on the quick-install/update path. Preserve
+# any existing .loom/hooks/<name> unless an explicit force overwrite is
+# requested (the caller passes "true", e.g. behind --clean). This mirrors the
+# preserve-unless-force behavior already in scripts/install-loom.sh:1099-1116,
+# which the quick path previously diverged from with an unconditional cp.
 install_hooks_and_cli() {
   local loom_root="$1"
   local target="$2"
+  local force="${3:-false}"
 
   # Install hooks
   if [[ -d "$loom_root/defaults/hooks" ]]; then
@@ -59,10 +72,14 @@ install_hooks_and_cli() {
     for hook_file in "$loom_root/defaults/hooks/"*.sh; do
       [[ -f "$hook_file" ]] || continue
       hook_name=$(basename "$hook_file")
-      cp "$hook_file" "$target/.loom/hooks/$hook_name"
-      chmod +x "$target/.loom/hooks/$hook_name"
+      if [[ -f "$target/.loom/hooks/$hook_name" ]] && [[ "$force" != "true" ]]; then
+        warning "Preserving existing hook: $hook_name (use --clean to overwrite)"
+      else
+        cp "$hook_file" "$target/.loom/hooks/$hook_name"
+        chmod +x "$target/.loom/hooks/$hook_name"
+        success "Installed hook: $hook_name"
+      fi
     done
-    success "Installed hooks"
   fi
 
   # Install CLI wrapper
@@ -170,6 +187,13 @@ finalize_quick_install() {
 }
 METADATA
   success "Recorded installation metadata"
+
+  # Quick Install ships .github/labels.yml but does NOT create the labels on
+  # the forge (that is a Full Install step). Point the operator at the shipped
+  # sync script so the label-based workflow doesn't break on first use (#3582).
+  info "Labels not yet synced. Run '.loom/scripts/sync-labels.sh' from the"
+  info "  repo root to create the Loom workflow labels on the forge (or use"
+  info "  Full Install, which syncs them automatically)."
 }
 
 # Verify critical installation files exist
@@ -231,8 +255,130 @@ loom_daemon_binary_stale() {
   [[ -n "$newer_file" ]]
 }
 
+# Issue #3588: re-append the current Loom ephemeral .gitignore patterns after a
+# --quick reinstall stash pop that was performed against a HEAD-reset .gitignore.
+#
+# The reinstall restores .gitignore to its committed HEAD state before popping so
+# the user's stashed hunk applies cleanly (see the pop block below). That reset
+# strips the Loom patterns the daemon's `init` had (re-)written, so we re-apply
+# them here. The pattern list is derived from the post-init snapshot (lines that
+# were present there but absent from the committed HEAD version) rather than
+# hard-coded, so it never drifts from the daemon's authoritative list in
+# loom-daemon/src/init/post_init.rs. Appending only missing lines keeps this
+# idempotent (append-only), mirroring `update_gitignore`.
+reapply_loom_gitignore_patterns() {
+  local target_path="$1"
+  local postinit_snapshot="$2"
+  local gitignore="$target_path/.gitignore"
+
+  [[ -f "$postinit_snapshot" && -f "$gitignore" ]] || return 0
+
+  # The committed .gitignore (the stash base the user's hunk was recorded
+  # against). Lines present in the post-init snapshot but not here are exactly
+  # the Loom patterns `init` (re-)appended.
+  local head_version loom_lines
+  head_version="$(git -C "$target_path" show HEAD:.gitignore 2>/dev/null)"
+
+  loom_lines="$(grep -vxF -f <(printf '%s\n' "$head_version") "$postinit_snapshot" 2>/dev/null || true)"
+  [[ -z "$loom_lines" ]] && return 0
+
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if ! grep -qxF -- "$line" "$gitignore" 2>/dev/null; then
+      # Ensure a trailing newline before appending (command substitution strips
+      # the newline, so a non-empty result means the file did NOT end in \n).
+      if [[ -s "$gitignore" && -n "$(tail -c1 "$gitignore" 2>/dev/null)" ]]; then
+        printf '\n' >>"$gitignore"
+      fi
+      printf '%s\n' "$line" >>"$gitignore"
+    fi
+  done <<<"$loom_lines"
+}
+
+# Issue #3663: re-apply the current Loom-owned CLAUDE.md marker block after a
+# --quick reinstall stash pop that was performed against a HEAD-reset CLAUDE.md.
+#
+# This generalizes the #3588 .gitignore treatment (HEAD-reset-before-pop, then
+# reapply) to CLAUDE.md, whose Loom content is a marker-delimited block
+# (`<!-- BEGIN LOOM ORCHESTRATION -->` … `<!-- END LOOM ORCHESTRATION -->`)
+# rather than a set of appended lines. The reinstall restores CLAUDE.md to its
+# committed HEAD state before popping so the user's stashed hunk applies cleanly
+# (see the pop block below). That reset reverts the Loom block to its old
+# committed content, so we splice the freshly written block back in here.
+#
+# We rebuild the file as: everything BEFORE the begin marker (from the popped
+# working copy — the user's restored content) + the block (begin…end inclusive)
+# taken from the post-init snapshot (the daemon's authoritative fresh block) +
+# everything AFTER the end marker (again from the popped working copy). Only the
+# delimited Loom region is replaced; every line the user's pop restored outside
+# the markers (e.g. their own `REPO-SKILLS` block) is left byte-for-byte intact.
+# Derived from the snapshot, never hard-coded, mirroring
+# reapply_loom_gitignore_patterns's "trust the daemon's output" property.
+# Idempotent: splicing an already-current block is a no-op. If either file lacks
+# both markers there is no delimited region to reconcile, so the popped file is
+# left as-is.
+reapply_loom_claude_md_block() {
+  local target_path="$1"
+  local postinit_snapshot="$2"
+  local claude_md="$target_path/CLAUDE.md"
+  local begin="<!-- BEGIN LOOM ORCHESTRATION -->"
+  local end="<!-- END LOOM ORCHESTRATION -->"
+
+  [[ -f "$postinit_snapshot" && -f "$claude_md" ]] || return 0
+
+  # Both the snapshot and the popped file must carry the marker block, else
+  # there is no delimited Loom region to splice — leave the popped file alone.
+  grep -qF "$begin" "$postinit_snapshot" && grep -qF "$end" "$postinit_snapshot" || return 0
+  grep -qF "$begin" "$claude_md" && grep -qF "$end" "$claude_md" || return 0
+
+  local tmp
+  tmp="$(mktemp 2>/dev/null || true)"
+  [[ -n "$tmp" ]] || return 0
+
+  # Pass 1 (snapshot): capture the begin…end block into `block`.
+  # Pass 2 (popped file): print user content up to begin, emit the captured
+  # block once, then resume printing user content after end.
+  if awk -v b="$begin" -v e="$end" '
+    FNR==NR {
+      if (index($0, b)) grab=1
+      if (grab) block = block $0 ORS
+      if (index($0, e)) grab=0
+      next
+    }
+    {
+      if (index($0, b)) { printf "%s", block; skip=1 }
+      if (!skip) print
+      if (index($0, e)) skip=0
+    }
+  ' "$postinit_snapshot" "$claude_md" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    cat "$tmp" >"$claude_md" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Issue #3663: emit the Loom marker block (begin…end inclusive) from stdin.
+# Used to decide whether a user's stashed CLAUDE.md edit lands INSIDE the Loom
+# block (in which case a HEAD-reset+reapply would clobber it) or entirely
+# outside it (safe to reset+reapply). Empty output means no block was found.
+_emit_loom_claude_block() {
+  awk '
+    index($0, "<!-- BEGIN LOOM ORCHESTRATION -->") { inblk=1 }
+    inblk { print }
+    index($0, "<!-- END LOOM ORCHESTRATION -->") { inblk=0 }
+  '
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Machine-level loom-daemon provisioning helper (#3922). Sourced so the Quick
+# Install path (which runs `loom-daemon init` directly, without delegating to
+# scripts/install-loom.sh) can also drop the built binary on PATH. The Full
+# Install path `exec`s scripts/install-loom.sh, which sources this helper itself.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
 
 # Show banner
 echo ""
@@ -250,6 +396,11 @@ INSTALL_TYPE=""
 # Required in addition to --quick/--yes/--full when an existing install is
 # detected -- see the reinstall gate below and issue #49 finding 1.
 CONFIRM_REINSTALL=false
+# Source/target override flags accepted by scripts/install-loom.sh. The top-level
+# wrapper does not act on them (its source guard runs only in the delegated
+# installer), but it must accept and forward them so the flags it suggests
+# actually work. See issue #3650.
+SOURCE_OVERRIDE_FLAGS=()
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes)
@@ -278,27 +429,37 @@ while [[ "${1:-}" == -* ]]; do
       CONFIRM_REINSTALL=true
       shift
       ;;
+    --allow-non-main-source|--allow-stale-target)
+      # Pass-through: accepted here so the wrapper's own suggestion works, then
+      # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
+      SOURCE_OVERRIDE_FLAGS+=("$1")
+      shift
+      ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
       echo "Options:"
-      echo "  -y, --yes    Non-interactive mode (skip confirmation prompts)"
-      echo "  --quick      Quick Install - direct install without GitHub workflow"
-      echo "  --full       Full Install - creates issue, worktree, and PR"
-      echo "  --confirm-reinstall"
-      echo "               Acknowledge a destructive reinstall over an existing"
-      echo "               .loom/ install. Required alongside --quick/--yes/--full"
-      echo "               when the target already has Loom installed -- without"
-      echo "               it, non-interactive runs stop and ask you to inventory"
-      echo "               customizations first (interactive runs still get a"
-      echo "               y/N prompt instead)."
-      echo "  -h, --help   Show this help message"
+      echo "  -y, --yes                  Non-interactive mode (skip confirmation prompts)"
+      echo "  --quick                    Quick Install - direct install without GitHub workflow"
+      echo "  --full                     Full Install - creates issue, worktree, and PR"
+      echo "  --confirm-reinstall        Acknowledge a destructive reinstall over an existing"
+      echo "                             .loom/ install. Required alongside --quick/--yes/--full"
+      echo "                             when the target already has Loom installed -- without"
+      echo "                             it, non-interactive runs stop and ask you to inventory"
+      echo "                             customizations first (interactive runs still get a"
+      echo "                             y/N prompt instead)."
+      echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
+      echo "                             Loom source (forwarded to scripts/install-loom.sh)"
+      echo "  --allow-stale-target       Permit installing over a newer/stale target"
+      echo "                             (forwarded to scripts/install-loom.sh)"
+      echo "  -h, --help                 Show this help message"
       echo ""
       echo "Examples:"
       echo "  ./install.sh --quick ~/projects/my-app"
       echo "  ./install.sh --full /path/to/team-project"
       echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
       echo "  ./install.sh --quick --confirm-reinstall ~/projects/my-app  # Reinstall over an existing install"
+      echo "  ./install.sh --yes --allow-non-main-source /path/to/target  # Install from a non-main source"
       exit 0
       ;;
     *)
@@ -339,8 +500,8 @@ TARGET_PATH="$(cd "$TARGET_PATH" && pwd 2>/dev/null)" || \
 info "Target repository: $TARGET_PATH"
 echo ""
 
-# Check if it's a git repository
-if [[ ! -d "$TARGET_PATH/.git" ]]; then
+# Check if it's a git repository (worktree-safe: a linked worktree's .git is a file)
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   warning "$TARGET_PATH is not a git repository."
   echo ""
   echo "Would you like to initialize git and optionally set up GitHub?"
@@ -692,6 +853,63 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
+  # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
+  # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
+  # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
+  # target tree and the reinstall reconciles the index afterwards; stashing
+  # first keeps a user's pre-existing staged/working changes from being caught
+  # up in either step. The non-quick reinstall delegates to install-loom.sh,
+  # which performs its own guarding, so it is intentionally left unstashed here.
+  #
+  # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+  # `git stash push` swept sibling installers' uncommitted tracked changes
+  # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
+  # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
+  # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
+  # are never touched. Empty intersection → no stash at all.
+  REINSTALL_STASHED_USER_CHANGES=false
+  if [[ "$INSTALL_TYPE" == "1" ]]; then
+    # shellcheck source=scripts/install/stash-scope.sh
+    source "$LOOM_ROOT/scripts/install/stash-scope.sh"
+    REINSTALL_OWNED_DIRTY=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && REINSTALL_OWNED_DIRTY+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+
+    if [[ ${#REINSTALL_OWNED_DIRTY[@]} -gt 0 ]]; then
+      info "Stashing uncommitted Loom-owned changes before reinstall..."
+      if git -C "$TARGET_PATH" stash push \
+           -m "loom-install: preserving user changes before --quick reinstall" \
+           -- "${REINSTALL_OWNED_DIRTY[@]}" 2>/dev/null; then
+        REINSTALL_STASHED_USER_CHANGES=true
+        REINSTALL_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1)"
+        success "Loom-owned changes stashed → ${REINSTALL_STASH_REF:-stash@{0}}"
+        info "  Stashed ${#REINSTALL_OWNED_DIRTY[@]} Loom-owned path(s): ${REINSTALL_OWNED_DIRTY[*]}"
+        info "  Recover manually with: git -C \"$TARGET_PATH\" stash pop"
+      else
+        warning "Failed to stash user changes - continuing without stash"
+        warning "Uncommitted changes may appear alongside the reinstall diff"
+      fi
+    fi
+  fi
+
+  # Issue #3598: snapshot the committed .loom/config.json before the chained
+  # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
+  # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
+  # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
+  # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
+  # merge-aware config copy preserve consumer keys instead of regenerating the
+  # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
+  # Standalone uninstall behavior is intentionally unchanged.
+  REINSTALL_CONFIG_SNAPSHOT=""
+  if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
+    REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
+    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+      cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
+        REINSTALL_CONFIG_SNAPSHOT=""
+    fi
+  fi
+
   # Uninstall existing installation (local mode, no separate PR)
   info "Uninstalling existing Loom installation..."
   "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
@@ -724,15 +942,247 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # fills CLAUDE.md correctly (issue #3502).
     prepare_loom_metadata_env "$LOOM_ROOT"
 
+    # Issue #3598: restore the snapshotted config.json before init so the
+    # daemon's merge-aware config copy sees the consumer's committed values
+    # (e.g. worktree.root) and preserves them in the merged result.
+    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" && -f "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+      mkdir -p "$TARGET_PATH/.loom"
+      cp "$REINSTALL_CONFIG_SNAPSHOT" "$TARGET_PATH/.loom/config.json" 2>/dev/null || true
+    fi
+
     # Run loom-daemon init
     "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
+
+    # Clean up the config snapshot now that init has merged it into place.
+    [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]] && rm -f "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || true
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
+
+    # Provision a machine-level loom-daemon binary (#3922) so the consumer's
+    # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
+
+    # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
+    # The chained uninstall staged the deletion of every prior Loom file (now
+    # scoped to Loom-managed paths — see scripts/uninstall-loom.sh), then
+    # `loom-daemon init --force` rewrote those files to disk WITHOUT touching
+    # the index. Left as-is, `git status` shows ~150 paired staged-`D` /
+    # untracked-`??` entries instead of the real version-upgrade diff. Unstage
+    # the uninstall's staged deletions so the working tree reflects only the
+    # actual old→new file changes.
+    #
+    # Issue #3597: scope the unstage to Loom-owned paths so user-staged
+    # non-Loom changes (sibling installers, unrelated work) stay staged. The
+    # uninstall only stages Loom-managed paths (#3450), so the dirty ∩
+    # ownership intersection is exactly the set of staged deletions to undo.
+    info "Reconciling git index after reinstall..."
+    RECONCILE_PATHS=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && RECONCILE_PATHS+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+    if [[ ${#RECONCILE_PATHS[@]} -gt 0 ]]; then
+      git -C "$TARGET_PATH" restore --staged -- "${RECONCILE_PATHS[@]}" 2>/dev/null || \
+        git -C "$TARGET_PATH" reset -q HEAD -- "${RECONCILE_PATHS[@]}" 2>/dev/null || true
+    fi
+
+    # Issue #3611: reconcile GENERATED install-time artifacts that the ownership-
+    # scoped pass above misses. `.loom/install-metadata.json` is written by
+    # finalize_quick_install, NOT shipped in defaults/, so it is absent from the
+    # manifest-derived ownership set that scopes RECONCILE_PATHS. The chained
+    # uninstall staged its deletion (uninstall-loom.sh REMOVE_FILES → git add -A),
+    # and finalize then rewrote it on disk as an UNTRACKED file — leaving a
+    # `D` staged-deletion + `??` untracked pair. Committed as-is, that untracks
+    # the very file verify_install and the upgrade detector depend on. Explicitly
+    # unstage the staged deletion so the rewritten file reappears as a tracked
+    # modification (` M`), never `D`+`??`. Guarded by a staged-diff check so it is
+    # a no-op when the file was never staged for deletion. (`.loom/loom-source-path`
+    # has the same generated-at-install shape but is gitignored → untracked → no
+    # staged deletion, so it needs no reconcile; `.loom/config/skill-routes.json`
+    # ships in defaults/config and is already covered by RECONCILE_PATHS.)
+    for _generated_tracked in ".loom/install-metadata.json"; do
+      if git -C "$TARGET_PATH" diff --staged --name-only -- "$_generated_tracked" 2>/dev/null \
+           | grep -qxF "$_generated_tracked"; then
+        git -C "$TARGET_PATH" restore --staged -- "$_generated_tracked" 2>/dev/null || \
+          git -C "$TARGET_PATH" reset -q HEAD -- "$_generated_tracked" 2>/dev/null || true
+      fi
+    done
+
+    # Restore any user changes stashed before the uninstall (see above).
+    #
+    # Issue #3588: the uninstall→init round-trip rewrites .gitignore
+    # non-reversibly — the uninstall strips Loom patterns from mid-block and
+    # collapses blank lines (scripts/uninstall-loom.sh), then `init` re-appends
+    # the patterns at end-of-file (loom-daemon update_gitignore). That moves
+    # lines relative to HEAD, so a stashed .gitignore hunk — recorded against
+    # the committed context — no longer has a matching 3-way base on disk and
+    # `git stash pop` conflicts. Previously the pop was silenced with
+    # `2>/dev/null`: the conflict was hidden, the stash silently kept, and the
+    # user's uncommitted .gitignore edit stranded (data-loss risk).
+    #
+    # Fix: before popping, restore .gitignore to its committed HEAD state so the
+    # pop's 3-way base matches the stash base and the user's hunk applies
+    # cleanly; then re-append the current Loom ephemeral patterns (append-only,
+    # idempotent). If the pop still fails for any reason, surface the real
+    # conflict output and a working recovery path instead of hiding it.
+    if [[ "$REINSTALL_STASHED_USER_CHANGES" == "true" ]]; then
+      info "Restoring stashed user changes..."
+
+      # Issue #3663: generalize the #3588 .gitignore HEAD-reset-then-reapply to
+      # every Loom-owned dirty file that carries a well-defined Loom-vs-user
+      # split — today `.gitignore` (Loom patterns appended at EOF) and
+      # `CLAUDE.md` (a marker-delimited Loom block with user content around it).
+      # For each such path tracked at HEAD, snapshot the post-init on-disk
+      # version (which carries the freshly written Loom content) and reset the
+      # working copy to HEAD so the pop's 3-way base lines up with the committed
+      # context and the user's stashed hunk applies cleanly. After a successful
+      # pop we re-apply only the Loom portion from the snapshot (append for
+      # `.gitignore`, marker-block splice for `CLAUDE.md`), leaving everything
+      # the user's pop restored untouched.
+      #
+      # HEAD-reset is deliberately scoped to files with a reapply strategy. A
+      # fully Loom-owned file (a role `.md`, `config.json`) has no partial
+      # reapply, so resetting it would silently drop the reinstall's update —
+      # those fall through to a plain pop, which surfaces a genuine conflict
+      # (named below) instead of resetting-and-losing. Untracked/newly created
+      # files have no HEAD base to restore to and the plain pop already applies
+      # them cleanly, so they are skipped too.
+      REINSTALL_RESET_PATHS=()
+      REINSTALL_RESET_SNAPSHOTS=()
+      REINSTALL_RESET_STRATEGIES=()
+      for _owned_path in ${REINSTALL_OWNED_DIRTY[@]+"${REINSTALL_OWNED_DIRTY[@]}"}; do
+        _reset_strategy=""
+        case "$_owned_path" in
+          .gitignore) _reset_strategy="gitignore" ;;
+          CLAUDE.md)  _reset_strategy="claude_md" ;;
+          *) continue ;;
+        esac
+        git -C "$TARGET_PATH" cat-file -e "HEAD:$_owned_path" 2>/dev/null || continue
+
+        # Issue #3663: CLAUDE.md's reapply replaces the ENTIRE marker block, so
+        # the reset+reapply path is only safe when (a) HEAD already carries a
+        # Loom block to splice and (b) the user's stashed edits are OUTSIDE that
+        # block. When the user edited INSIDE the block, reset+reapply would
+        # silently clobber their in-block edit — so skip the reset and let the
+        # plain pop's 3-way merge surface a genuine conflict (named below),
+        # keeping the edit in the stash. When HEAD has no block at all, `init`'s
+        # freshly appended block already survives an out-of-block pop unchanged,
+        # so there is nothing to splice. Detect both by comparing the stashed
+        # (user) block region against HEAD's block region.
+        if [[ "$_reset_strategy" == "claude_md" ]]; then
+          _head_block="$(git -C "$TARGET_PATH" show HEAD:CLAUDE.md 2>/dev/null | _emit_loom_claude_block)" || true
+          [[ -n "$_head_block" ]] || continue
+          _stashed_block="$(git -C "$TARGET_PATH" show 'stash@{0}:CLAUDE.md' 2>/dev/null | _emit_loom_claude_block)" || true
+          [[ "$_stashed_block" == "$_head_block" ]] || continue
+        fi
+
+        _reset_snap="$(mktemp 2>/dev/null || true)"
+        [[ -n "$_reset_snap" ]] || continue
+        if cp "$TARGET_PATH/$_owned_path" "$_reset_snap" 2>/dev/null && \
+           git -C "$TARGET_PATH" checkout HEAD -- "$_owned_path" 2>/dev/null; then
+          REINSTALL_RESET_PATHS+=("$_owned_path")
+          REINSTALL_RESET_SNAPSHOTS+=("$_reset_snap")
+          REINSTALL_RESET_STRATEGIES+=("$_reset_strategy")
+        else
+          rm -f "$_reset_snap" 2>/dev/null || true
+        fi
+      done
+
+      # Issue #3611: pop with `--index` so a caller's pre-existing staged/
+      # unstaged split is reproduced. A plain `git stash pop` re-applies EVERY
+      # stashed hunk to the working tree as *unstaged* — a caller who had a
+      # `.gitignore` edit STAGED before the reinstall got it back unstaged, and
+      # any careful partial staging in flight was silently flattened. `--index`
+      # reinstates the index tree the stash recorded at push time, so staged
+      # hunks come back staged and unstaged hunks stay unstaged. The `.gitignore`
+      # HEAD-reset above provides a clean 3-way base so the index restore lines
+      # up; `reapply_loom_gitignore_patterns` (below) then appends Loom ephemeral
+      # patterns to the WORKING TREE ONLY (never the staged copy — they are not
+      # the caller's change). `--index` is stricter than a plain pop: if it
+      # cannot reinstate the index cleanly (a genuine conflict) it fails, and we
+      # fall through to the conflict-surfacing branch below rather than silently
+      # degrading to an unstaged pop that would drop the staged split.
+      #
+      # Capture the pop in an `if` condition so the assignment is exempt from
+      # `set -e`. A plain top-level `VAR="$(cmd)"` assignment inherits the
+      # command-substitution exit status, so a conflicting `git stash pop`
+      # (non-zero) would trip `set -euo pipefail` on the assignment itself and
+      # abort the installer before the conflict-surfacing branch below ever
+      # runs (issue #3588 / PR review).
+      if REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop --index 2>&1)"; then
+        REINSTALL_POP_STATUS=0
+      else
+        REINSTALL_POP_STATUS=$?
+      fi
+
+      if [[ $REINSTALL_POP_STATUS -eq 0 ]]; then
+        # Pop succeeded. Each file we reset to HEAD now carries the user's hunk
+        # but its OLD committed Loom content — re-apply the fresh Loom portion
+        # from that file's post-init snapshot (append for .gitignore, marker-
+        # block splice for CLAUDE.md).
+        _reset_i=0
+        while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
+          case "${REINSTALL_RESET_STRATEGIES[$_reset_i]}" in
+            gitignore)
+              reapply_loom_gitignore_patterns "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
+              ;;
+            claude_md)
+              reapply_loom_claude_md_block "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
+              ;;
+          esac
+          _reset_i=$((_reset_i + 1))
+        done
+        success "User changes restored"
+      else
+        # Genuine conflict (e.g. the user also edited the same lines a Loom-owned
+        # file that `init` rewrote occupies). Roll every reset file back to its
+        # post-init snapshot so the tree is not left half-reset, then surface the
+        # real conflict — naming the specific file(s) that conflicted — and a
+        # concrete recovery path. Do NOT abort — the reinstall itself succeeded;
+        # only the user-change restore needs manual attention.
+        _reset_i=0
+        while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
+          cp "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" \
+            "$TARGET_PATH/${REINSTALL_RESET_PATHS[$_reset_i]}" 2>/dev/null || true
+          _reset_i=$((_reset_i + 1))
+        done
+        # Issue #3663: name the file(s) that actually conflicted rather than a
+        # generic "recover by hand". Prefer git's own unmerged set; fall back to
+        # the guarded Loom-owned dirty set when git reports none.
+        REINSTALL_CONFLICT_FILES="$(git -C "$TARGET_PATH" diff --name-only --diff-filter=U 2>/dev/null | paste -sd' ' - 2>/dev/null || true)"
+        if [[ -z "$REINSTALL_CONFLICT_FILES" ]]; then
+          REINSTALL_CONFLICT_FILES="${REINSTALL_OWNED_DIRTY[*]-}"
+        fi
+        REINSTALL_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
+        [[ -z "$REINSTALL_STASH_REF" ]] && REINSTALL_STASH_REF="stash@{0}"
+        warning "Failed to restore stashed user changes automatically"
+        echo ""
+        [[ -n "$REINSTALL_CONFLICT_FILES" ]] && \
+          echo "  Conflicting file(s): $REINSTALL_CONFLICT_FILES" && echo ""
+        echo "  git stash pop --index reported:"
+        printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
+        echo ""
+        echo "  Note: the restore preserves your original staged/unstaged split"
+        echo "  (git stash pop --index). That split could not be reproduced"
+        echo "  automatically here, so recover by hand to keep it intact."
+        echo "  Your changes are preserved in the stash ($REINSTALL_STASH_REF)."
+        echo "  A plain 'git stash pop' will conflict the same way, so recover by hand:"
+        echo "    cd $TARGET_PATH"
+        echo "    git stash show -p $REINSTALL_STASH_REF              # inspect the stashed diff"
+        echo "    git stash show -p $REINSTALL_STASH_REF | git apply --3way   # or reconcile by hand"
+        echo "    git stash drop $REINSTALL_STASH_REF                 # once you've reconciled"
+      fi
+
+      _reset_i=0
+      while [[ $_reset_i -lt ${#REINSTALL_RESET_SNAPSHOTS[@]} ]]; do
+        rm -f "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" 2>/dev/null || true
+        _reset_i=$((_reset_i + 1))
+      done
+    fi
 
     echo ""
     success "Quick reinstallation complete!"
@@ -746,7 +1196,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   if [[ "$NON_INTERACTIVE" == true ]]; then
     INSTALL_FLAGS+=(--yes)
   fi
-  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} "$TARGET_PATH"
+  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
   SELF_INSTALL=false
@@ -882,11 +1332,19 @@ case "$METHOD" in
         error "Installation failed"
     fi
 
-    # Install hooks and CLI wrapper (not handled by loom-daemon init)
-    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    # Install hooks and CLI wrapper (not handled by loom-daemon init).
+    # Force-overwrite existing hooks only under --clean (a deliberate fresh
+    # install); otherwise preserve a downstream-tuned hook (#3625).
+    _HOOK_FORCE=false
+    [[ "$FORCE_FLAG" == "--clean" ]] && _HOOK_FORCE=true
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE"
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
+
+    # Provision a machine-level loom-daemon binary (#3922) so the consumer's
+    # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
 
     echo ""
     success "Quick installation complete!"
@@ -954,7 +1412,7 @@ case "$METHOD" in
     echo ""
 
     # Run the full installation workflow
-    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG "$TARGET_PATH"
+    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
     ;;
 esac
 
