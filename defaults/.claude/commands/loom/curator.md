@@ -480,18 +480,29 @@ fi
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
-### Complexity routing marker (`<!-- loom:complexity=complex -->`, issue #3702)
+### Complexity routing marker (`<!-- loom:complexity=... -->`, issue #3702)
 
-When your enhancement pass judges an issue to be **genuinely complex** — long-horizon implementation, deep cross-cutting reasoning, or high blast radius (not merely "a bit of work") — you MAY emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the Builder to a more capable model:
+**Classify every issue you curate.** Emit one machine-readable marker into the curated issue body so the sweep orchestrator routes the work to the right model. This is the ONLY thing that sets the model — no operator, bot, or role default does it for you:
 
 ```html
-<!-- loom:complexity=complex -->
+<!-- loom:complexity=mechanical -->
 ```
 
-- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Values are `routine` | `complex`. Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`** — most issues need no marker.
-- **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and bumps the Builder's role-default model up **exactly one tier** — `sonnet → opus`. See `sweep.md` → "Tier 2.5 — Curator complexity marker".
-- **Hard bounds** (the router's authority is deliberately bounded): **one bump maximum, never to `fable`, and never a label.** Emitting `complex` cannot reach the top (frontier) model — that is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
-- **Use sparingly.** A miscalibrated `complex` only spends one tier of extra cost and the Judge gate still corrects any miss; but marking everything `complex` defeats the cheap-first default. Emit it only when the complexity is real. Do **not** emit `<!-- loom:complexity=routine -->` explicitly — an absent marker already means routine.
+- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`.**
+
+- **The three tiers.** You are classifying *how expensive it is to be wrong*, not how much typing the issue involves:
+
+  | Value | Emit when | Model |
+  |---|---|---|
+  | `mechanical` | Verifiable by tests or by inspection, no design judgement: file splits, dead-code deletion, renames, hardcoded constants/dates, missing ARIA attributes, mock/fixture fixes, adding a missing constraint. A reviewer can tell it's right by reading it. | `haiku` |
+  | `routine` | Normal bugs and features needing some reasoning but with contained blast radius. **This is the default** — most issues. | `sonnet` |
+  | `complex` | Being wrong is expensive or hard to detect: money, payments or billing; security, authentication or access control; deletions and destructive migrations; long-horizon or cross-cutting design work. | `opus` |
+
+- **What it does**: at dispatch the sweep skill reads the marker as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from the table above. **`complex` also applies to that issue's Judge** — when being wrong is expensive, the review must be at least as strong as the build. `mechanical` never downgrades the Judge; a cheap build still gets a normal review.
+
+- **Hard bounds**: never `fable` (reserved for the objective escalation ladder on Judge rejection or an explicit operator param), and never a label. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
+
+- **Calibration.** The two failure modes are not symmetric. Marking something `mechanical` that needed judgement wastes a Doctor cycle and the Judge catches it; marking a money or security issue `routine` ships a subtly wrong change. **When genuinely torn between two tiers, choose the higher one** — but do not mark everything `complex`, which defeats the point. Do **not** emit `<!-- loom:complexity=routine -->` explicitly; an absent marker already means routine.
 
 ## Where to Add Enhancements
 
