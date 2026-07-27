@@ -409,28 +409,22 @@ Every role subagent dispatched by this skill (`loom-curator`, `loom-builder`, `l
 3. **Role default** — `.loom/roles/<role>.json` → `suggestedModel` (ships as an alias: `sonnet`, `opus`, or `haiku`).
 4. **Session default** — if none of the above resolves (or resolves to an empty string), **omit the `model` parameter entirely** so the subagent inherits the parent session's model. Never pass `model: ""`.
 
-**Tier 2.5 — Curator complexity marker (issue #3702)**: between tier 2 and tier 3, grep the issue body for the Curator-emitted marker `<!-- loom:complexity=... -->` (an HTML comment; see `curator.md`). It is the **primary** model signal — the Curator classifies each issue by how expensive it is to be wrong, and this tier turns that classification into the dispatched model, *replacing* the tier-3 `suggestedModel` resolution rather than nudging it:
+**Tier 2.5 — complexity marker**: between tiers 2 and 3, grep the issue body for `<!-- loom:complexity=... -->`. It is the primary model signal and **replaces** the tier-3 `suggestedModel` resolution:
 
-| Marker | Builder model | Judge model |
+| Marker | Builder | Judge |
 |---|---|---|
-| `mechanical` | `tierModels[<runtime>].mechanical` | unchanged (a cheap build still gets a normal review) |
+| `mechanical` | `tierModels[<runtime>].mechanical` | unchanged |
 | `routine` / absent / malformed | `tierModels[<runtime>].routine` | unchanged |
-| `complex` | `tierModels[<runtime>].complex` | **raised to `tierModels[<runtime>].complex`** to match the Builder |
+| `complex` | `tierModels[<runtime>].complex` | raised to match the Builder |
 
-**The tier is runtime-neutral; the model is not.** The Curator classifies work by cost-of-being-wrong and never names a model. Resolve the concrete model from `.loom/config.json` → `sweep.tierModels[<runtime>][<tier>]`, where `<runtime>` is the dispatched worker type (`claude`, `codex`, …) — the same value that selects the worker runner. Shipped defaults map Claude to `haiku|sonnet|opus` and Codex to `gpt-5-mini|gpt-5|gpt-5-codex`; a workspace retunes either by editing config, and a new runtime is added by adding a key. **Never hardcode a model name in this file or infer one from the tier.** If the runtime has no `tierModels` entry, or the tier is missing from it, resolve nothing at tier 2.5 and fall through to tier 3 — an unknown runtime must degrade to the existing chain, never to a Claude model name.
+Resolve `<runtime>` (the dispatched worker type) and the tier against `.loom/config.json` → `sweep.tierModels`. **Never hardcode a model name here.** No entry for that runtime or tier ⇒ resolve nothing and fall through to tier 3.
 
-**`complex` is the only value that touches the Judge.** When being wrong is expensive, the review must be at least as strong as the build; a `complex` issue must never be reviewed by a weaker model than built it. `mechanical` never downgrades the Judge — cheapening review is how a cheap build's mistakes ship.
-
-Hard bounds, all enforced here:
-
-> **Experiment-mode suppression (issue #3725).** When `sweep.modelExperiment` resolves to `experiment` (see "Model-cost experiment mode" below), the forced arm **overrides and SUPPRESSES this tier-2.5 bump** for the Builder: the marker is still *read* (same grep), but it is used **only as the stratification key**, never as a `sonnet → opus` bump. This is load-bearing — without it, a `complex`-marked issue on Arm B (sonnet-first) would silently become opus and confound the A/B. The bump behaves exactly as documented here whenever the experiment is `off`/`observe`.
-
-- **Never to `fable`.** The marker tops out at `opus`. Fable is reached only via the escalation ladder (objective Judge-rejection evidence) or an explicit operator param, never on a Curator's classification.
-- **It is not a label** and creates no label — it lives only in the issue body.
-- **Tier-1 and tier-2 pins still win.** The marker sits *strictly between* tiers 2 and 3: an explicit dispatch param (tier 1) or a `roleConfig.model` workspace pin (tier 2) overrides it, exactly as they override tier 3.
-- **Absent / malformed marker ⇒ `routine`** — the safe middle. Never infer a tier from the issue text yourself; an unclassified issue is a `routine` issue.
-- **The Curator's own dispatch is never affected by the marker** — it runs on its role default (`opus`), since it is the role that produces the classification. The Doctor likewise resolves normally, then follows the Judge-rejection escalation ladder below.
-- **Emit one line per dispatch** recording what was resolved and why, e.g. `model: builder=haiku (complexity=mechanical)` — so a wrong tier is visible in the log rather than inferred from cost days later.
+- `complex` is the only value that touches the Judge — expensive-to-be-wrong work must never be reviewed by a weaker model than built it. `mechanical` never lowers the Judge.
+- Never `fable`; that is reached only via the escalation ladder or an explicit operator param.
+- It is not a label and creates none.
+- Tier-1 and tier-2 pins still win.
+- The Curator's own dispatch ignores the marker — it produces the classification.
+- Log the resolved model and reason per dispatch, e.g. `model: builder=haiku (complexity=mechanical)`.
 
 **No-Fable-Judge hard invariant (issue #3702)**: **Judge model resolution can never resolve to `fable`, regardless of `sweep.escalation` contents or any marker.** The escalation ladder and the tier-2.5 marker apply only to the Curator-marker→Builder path and to the rejection-triggered Doctor — never to Judge. The Judge is the escalation sensor (see #3481); reviewing security-adjacent diffs is precisely Fable's refusal surface, and a refusing Judge would deadlock the control loop. If a resolved Judge model would ever be `fable` (alias or pinned ID), fall back to `opus` for the Judge dispatch and log the substitution.
 

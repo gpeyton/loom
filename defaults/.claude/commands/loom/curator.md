@@ -480,33 +480,27 @@ fi
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
-### Complexity routing marker (`<!-- loom:complexity=... -->`, issue #3702)
+### Complexity routing marker
 
-**Classify every issue you curate.** Emit one machine-readable marker into the curated issue body so the sweep orchestrator routes the work to the right model. This is the ONLY thing that sets the model — no operator, bot, or role default does it for you.
-
-> **Why the Curator itself runs on `opus`.** Curation is not a cheap tier: you set the model for every role downstream of you, so a misclassification here is not one wrong issue, it is a wrong Builder *and* a wrong Judge on work whose whole point was that being wrong is expensive. The classification is worth more than it costs.
+Classify every issue you curate. Emit one marker into the issue body — it is the only thing that sets the model for the roles downstream of you.
 
 ```html
 <!-- loom:complexity=mechanical -->
 ```
 
-- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`.**
+Classify by **how expensive it is to be wrong**, not by how much work it looks like:
 
-- **The three tiers.** You are classifying *how expensive it is to be wrong*, not how much typing the issue involves:
+| Value | Emit when |
+|---|---|
+| `mechanical` | Verifiable by tests or inspection, no design judgement — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
+| `routine` | Normal bugs and features, contained blast radius. **Default** — most issues. |
+| `complex` | Money, security and access control, destructive migrations, cross-cutting design. |
 
-  | Value | Emit when |
-  |---|---|
-  | `mechanical` | Verifiable by tests or by inspection, no design judgement: file splits, dead-code deletion, renames, hardcoded constants/dates, missing ARIA attributes, mock/fixture fixes, adding a missing constraint. A reviewer can tell it's right by reading it. |
-  | `routine` | Normal bugs and features needing some reasoning but with contained blast radius. **This is the default** — most issues. |
-  | `complex` | Being wrong is expensive or hard to detect: money, payments or billing; security, authentication or access control; deletions and destructive migrations; long-horizon or cross-cutting design work. |
-
-  **Never name a model.** The tier is runtime-neutral — the same issue may be built by a Claude or a Codex worker. `sweep.md` resolves the concrete model from `.loom/config.json` → `sweep.tierModels[<runtime>][<tier>]`. Your job is the classification; the mapping is not yours to make.
-
-- **What it does**: at dispatch the sweep skill reads the marker as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from the table above. **`complex` also applies to that issue's Judge** — when being wrong is expensive, the review must be at least as strong as the build. `mechanical` never downgrades the Judge; a cheap build still gets a normal review.
-
-- **Hard bounds**: never `fable` (reserved for the objective escalation ladder on Judge rejection or an explicit operator param), and never a label. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
-
-- **Calibration.** The two failure modes are not symmetric. Marking something `mechanical` that needed judgement wastes a Doctor cycle and the Judge catches it; marking a money or security issue `routine` ships a subtly wrong change. **When genuinely torn between two tiers, choose the higher one** — but do not mark everything `complex`, which defeats the point. Do **not** emit `<!-- loom:complexity=routine -->` explicitly; an absent marker already means routine.
+- Absent marker means `routine`. Don't emit `routine` explicitly.
+- **Never name a model.** The tier is runtime-neutral; `sweep.md` resolves it from `sweep.tierModels[<runtime>][<tier>]`.
+- `complex` also raises that issue's Judge. `mechanical` never lowers it.
+- Torn between two tiers? Take the higher one — but marking everything `complex` defeats the point.
+- You run on the strongest tier yourself, because you set every downstream model: a misclassification here is a wrong Builder *and* a wrong Judge.
 
 ## Where to Add Enhancements
 
