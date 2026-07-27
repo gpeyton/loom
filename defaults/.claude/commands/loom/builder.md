@@ -790,6 +790,15 @@ For additional PR quality guidelines, see **builder-pr.md**.
 - Verify each criterion explicitly with concrete checks (not "I think it works")
 - Run `pnpm check:ci` before creating PR
 
+### Hard acceptance-criteria gate
+
+`gh pr create` is forbidden until the Builder has enumerated every acceptance
+criterion and verified that each one is implemented, or the issue text
+explicitly marks it out of scope. An unmet criterion is not review work for
+the Judge: continue implementing it, or atomically transition the issue from
+`loom:building` to `loom:blocked` and comment with the unmet list and reason.
+Never open a knowingly partial PR containing `Closes #N`.
+
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
 **Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:

@@ -374,6 +374,28 @@ Codex has no Claude-Code-style Task-tool subagents — there is nothing to dispa
 - **The "one level deep" #3289 constraint is Claude-specific and does not apply here** — there is no stream-pump and no parallel grandchildren to stall. **But preserve the sequencing #3289's policy also enforces:** settle each PR fully (Judge → optional single Doctor→Judge cycle → Merge) before touching the next, and honour the single Doctor→Judge cycle cap. The sequential settling is load-bearing regardless of runtime.
 - **Checkpointing, label discipline, `worktree.sh`, and `merge-pr.sh` are all runtime-agnostic** and used identically. The only thing that changes is *who* executes each phase (this session, sequentially) versus *what* executes it (a dispatched subagent).
 
+#### Sequential-session turn-boundary contract
+
+For the sequential in-session path, completing a phase is **never** a
+stopping point. After every Curator, Builder, Judge, Doctor, or Merge result
+(including a recoverable error), the session must immediately either:
+
+1. checkpoint the completed phase and start the next phase selected by the
+   lifecycle routing table in the **same turn**; or
+2. transition the item explicitly to `loom:blocked`, log the reason, and move
+   to the next candidate.
+
+Ending a turn while a target is neither merged, merge-ready (`loom:pr`),
+blocked, nor a dry-run result is a protocol violation. A recoverable
+dependency or toolchain failure is not a phase failure: make one bounded,
+targeted repair attempt in place (for example, install the missing dependency
+or retry with the documented CI environment). If that attempt cannot restore
+the phase, explicitly block the item with the failure and attempted repair;
+never silently end the turn.
+
+At every phase boundary, apply this checklist: **phase done → checkpoint →
+next phase in the same turn**.
+
 The repo-local Codex shim `.codex/prompts/loom-sweep.md` (#16) documents this sequential-in-session contract for a Codex operator; the daemon child-prompt encoding (below) points Codex children at it.
 
 #### Codex backend policy: process-level fan-out is the only supported parallel backend (issue #54)
@@ -1000,6 +1022,8 @@ For each issue `N` in the wave, before any role skill is invoked:
 
 ### 2. Curator phase (still per-issue, before the wave dispatch)
 
+**Phase exit: curator done → checkpoint → approval gate in the same turn.**
+
 For each surviving issue `N` in the wave:
 
 - **Checkpoint skip.** If `CHECKPOINT_PHASE` is one of `curator-done`, `builder-done`, `judge-done`, `doctor-done`, skip the curator phase entirely (it already completed in a prior sweep run). Do NOT re-invoke the curator skill — re-curating is wasted work and can produce churn on an issue that's already mid-lifecycle.
@@ -1027,6 +1051,10 @@ Each issue must reach `loom:issue` before the Builder can claim it.
 
 ### 4. Builder phase (parallel within the wave)
 
+**Phase exit: builder done → checkpoint → Judge in the same turn.** A
+recoverable environment failure gets one bounded repair attempt; otherwise
+record an explicit blocked outcome rather than ending the sweep.
+
 **Checkpoint skip.** For each surviving issue, if `CHECKPOINT_PHASE` is one of `builder-done`, `judge-done`, `doctor-done`, the Builder phase has already completed for this issue. Read the `pr_number` from the checkpoint and route the PR directly into the Judge phase (step 5) — do NOT dispatch a builder subagent.
 
 ```bash
@@ -1046,6 +1074,11 @@ Each builder is responsible for:
 - Implementing the change, running tests, committing.
 - Pushing the branch and opening a PR labeled `loom:review-requested`.
 - Closing references: `Closes #N` in the PR body.
+- **Before creating that PR, enumerate every issue acceptance criterion and
+  verify each is implemented or explicitly out of scope per the issue text.**
+  If any criterion is unmet, the Builder must keep building or transition the
+  issue explicitly to `loom:blocked` with the unmet list. It must never open a
+  knowingly partial `Closes #N` PR.
 
 **Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker).
 
@@ -1070,6 +1103,10 @@ If the builder failed (no PR opened), do NOT write a checkpoint — leave the ch
 **Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
 
 ### 5. Judge phase (sequential per PR within the wave)
+
+**Phase exit: Judge result → checkpoint or Doctor routing → next phase in the
+same turn.** A Judge rejection routes immediately to the single Doctor cycle;
+it is not a reason to end the sweep.
 
 For each PR in the wave (including PRs whose Builder just ran *and* PRs routed in via a `builder-done` checkpoint), in the order the builders completed (or any deterministic order — wave-internal ordering is not load-bearing), run the Judge phase sequentially:
 
@@ -1101,6 +1138,8 @@ for pr in wave_prs:
 
 ### 6. Doctor phase (inline per PR, only if Judge requested changes)
 
+**Phase exit: Doctor done → checkpoint → follow-up Judge in the same turn.**
+
 If Judge requests changes on PR `#X` mid-wave, run a **single inline Doctor→Judge cycle** for `#X` before moving to the next PR's Judge:
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for PR `#X`.
@@ -1117,6 +1156,9 @@ If Judge requests changes on PR `#X` mid-wave, run a **single inline Doctor→Ju
 The Doctor cycle for `#X` does **not** block other PRs in the wave — but because Judge runs sequentially per-PR within the wave, the next PR's Judge waits for `#X`'s Doctor→Judge cycle to settle before it starts. This is the intended sequencing.
 
 ### 7. Merge (per PR)
+
+**Phase exit: merge result → checkpoint cleanup or explicit retry/blocked
+routing → next item in the same turn.**
 
 Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr merge`):
 
@@ -1160,6 +1202,13 @@ Total: 4 merged, 2 blocked, 2 skipped.
 ```
 
 Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2 failed → probably a base-branch problem, not the issues themselves").
+
+**Terminal-state assertion (required before ending the sweep):** every target
+in the summary must be exactly one of `merged`, `merge-ready` (`loom:pr`),
+`blocked` with a reason, `skipped` by a documented pre-flight rule, or
+`dry-run`. If any target has no terminal classification, the sweep is
+incomplete and must continue from its next lifecycle phase rather than end the
+session.
 
 ## Stop Conditions
 
