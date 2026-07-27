@@ -187,6 +187,7 @@ set -e
 assert_eq "0" "$exit_code" "--help exits 0"
 assert_contains "spawn-codex-wave.sh" "$output" "--help output mentions spawn-codex-wave.sh"
 assert_contains "LOOM_CODEX_MULTI_WAVE" "$output" "--help documents LOOM_CODEX_MULTI_WAVE"
+assert_contains "--monitor" "$output" "--help documents the foreground local monitor"
 
 # ============================================================
 # Section 2: single-issue wave always runs (regardless of gate)
@@ -460,6 +461,219 @@ if command -v jq &>/dev/null; then
     rm -rf "$EMPTY_LOG_DIR"
 else
     echo "  (jq not available -- skipping structured status file assertions)"
+fi
+
+# ============================================================
+# Section 12b: foreground local monitor (issue #83). The monitor must keep
+# the caller blocked while any child is running, use the canonical bounded
+# 30/60/120/300-second backoff, reach terminal state from local JSON alone,
+# and spend zero GitHub polling budget. Stopping this observer must not
+# rewrite or cancel the wave it observes.
+# ============================================================
+
+echo ""
+echo "Testing foreground local monitor -- real wait, bounded backoff, zero GitHub polling (issue #83)..."
+
+if command -v jq &>/dev/null; then
+    MONITOR_LOG_DIR="$(mktemp -d)"
+    MONITOR_STUB_DIR="$(mktemp -d)"
+    MONITOR_SLEEP_LOG="$(mktemp)"
+    MONITOR_GH_MARKER="$(mktemp)"
+    rm -f "$MONITOR_GH_MARKER"
+    MONITOR_STATUS_FILE="$MONITOR_LOG_DIR/spawn-codex-wave-status.json"
+    MONITOR_JQ_BIN="$(command -v jq)"
+
+    cat > "$MONITOR_STATUS_FILE" <<'JSON'
+{
+  "wave_started_at": "2026-07-27T00:00:00Z",
+  "multi_wave": true,
+  "wave_cancelled": false,
+  "wave_cancel_initiator": null,
+  "wave_cancel_signal": null,
+  "children": [
+    {
+      "issue": 9501,
+      "pid": 12345,
+      "phase": null,
+      "outcome": "running",
+      "started_at": "2026-07-27T00:00:00Z",
+      "finished_at": null,
+      "exit_code": null,
+      "signal": null,
+      "cancellation_initiator": null,
+      "log_file": "/tmp/unused.log"
+    }
+  ]
+}
+JSON
+
+    # Replace only sleep and gh. The sleep fixture records the requested
+    # production delays, waits briefly so foreground duration is observable,
+    # and moves the local status to terminal after the third read interval.
+    # The gh fixture is a tripwire: normal monitoring must never invoke it.
+    cat > "$MONITOR_STUB_DIR/sleep" <<'STUB'
+#!/usr/bin/env bash
+echo "$1" >> "$MONITOR_SLEEP_LOG"
+/bin/sleep 0.2
+call_count=$(/usr/bin/wc -l < "$MONITOR_SLEEP_LOG" | /usr/bin/tr -d ' ')
+if [[ "$call_count" -ge 3 ]]; then
+    tmp="${MONITOR_STATUS_FILE}.tmp"
+    "$MONITOR_JQ_BIN" \
+        '.children[].outcome = "completed"
+         | .children[].finished_at = "2026-07-27T00:01:00Z"
+         | .children[].exit_code = 0' \
+        "$MONITOR_STATUS_FILE" > "$tmp"
+    /bin/mv "$tmp" "$MONITOR_STATUS_FILE"
+fi
+STUB
+    chmod +x "$MONITOR_STUB_DIR/sleep"
+    cat > "$MONITOR_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+: > "$MONITOR_GH_MARKER"
+echo "ERROR: foreground monitor invoked gh" >&2
+exit 99
+STUB
+    chmod +x "$MONITOR_STUB_DIR/gh"
+
+    MONITOR_START=$(date +%s.%N 2>/dev/null || date +%s)
+    set +e
+    monitor_output=$(PATH="$MONITOR_STUB_DIR:$PATH" \
+        LOOM_CODEX_WAVE_LOG_DIR="$MONITOR_LOG_DIR" \
+        MONITOR_SLEEP_LOG="$MONITOR_SLEEP_LOG" \
+        MONITOR_STATUS_FILE="$MONITOR_STATUS_FILE" \
+        MONITOR_JQ_BIN="$MONITOR_JQ_BIN" \
+        MONITOR_GH_MARKER="$MONITOR_GH_MARKER" \
+        "$SCRIPTS_DIR/spawn-codex-wave.sh" --monitor 2>&1)
+    monitor_code=$?
+    set -e
+    MONITOR_END=$(date +%s.%N 2>/dev/null || date +%s)
+    MONITOR_ELAPSED=$(awk -v s="$MONITOR_START" -v e="$MONITOR_END" 'BEGIN { print e - s }')
+    monitor_delays="$(tr '\n' ' ' < "$MONITOR_SLEEP_LOG" | sed 's/[[:space:]]*$//')"
+    monitor_outcome="$(jq -r '.children[0].outcome' "$MONITOR_STATUS_FILE")"
+
+    assert_eq "0" "$monitor_code" "--monitor exits 0 after the observed queue becomes terminal"
+    assert_gt "$MONITOR_ELAPSED" "0.4" \
+        "--monitor remains foreground-blocked while local status is running (actual=${MONITOR_ELAPSED}s)"
+    assert_eq "30 60 120" "$monitor_delays" \
+        "--monitor requests the canonical increasing backoff sequence before terminal state"
+    assert_contains "local structured state only; zero GitHub polling" "$monitor_output" \
+        "--monitor announces its local-only, zero-GitHub-polling contract"
+    assert_contains "foreground monitor reached a terminal queue state" "$monitor_output" \
+        "--monitor reports its real terminal condition"
+    assert_eq "completed" "$monitor_outcome" \
+        "--monitor returns only after the local structured child outcome is terminal"
+    assert_eq "0" "$([[ -e "$MONITOR_GH_MARKER" ]] && echo 1 || echo 0)" \
+        "--monitor makes zero gh/GitHub polling calls"
+
+    # A terminal status returns immediately without sleeping or invoking gh.
+    : > "$MONITOR_SLEEP_LOG"
+    set +e
+    terminal_monitor_output=$(PATH="$MONITOR_STUB_DIR:$PATH" \
+        LOOM_CODEX_WAVE_LOG_DIR="$MONITOR_LOG_DIR" \
+        MONITOR_SLEEP_LOG="$MONITOR_SLEEP_LOG" \
+        MONITOR_STATUS_FILE="$MONITOR_STATUS_FILE" \
+        MONITOR_JQ_BIN="$MONITOR_JQ_BIN" \
+        MONITOR_GH_MARKER="$MONITOR_GH_MARKER" \
+        "$SCRIPTS_DIR/spawn-codex-wave.sh" --monitor 2>&1)
+    terminal_monitor_code=$?
+    set -e
+    assert_eq "0" "$terminal_monitor_code" "--monitor returns successfully for an already-terminal queue"
+    assert_contains "foreground monitor reached a terminal queue state" "$terminal_monitor_output" \
+        "--monitor reports the terminal condition without an unnecessary wait"
+    assert_eq "0" "$(wc -l < "$MONITOR_SLEEP_LOG" | tr -d ' ')" \
+        "--monitor performs no backoff sleep for an already-terminal queue"
+
+    # Reset to running and terminate only the observer. Use a sleep fixture
+    # that execs a long local sleep so SIGTERM cannot race a status rewrite.
+    jq '.children[].outcome = "running"
+        | .children[].finished_at = null
+        | .children[].exit_code = null' \
+        "$MONITOR_STATUS_FILE" > "$MONITOR_STATUS_FILE.tmp"
+    mv "$MONITOR_STATUS_FILE.tmp" "$MONITOR_STATUS_FILE"
+    STOP_MONITOR_STUB_DIR="$(mktemp -d)"
+    cat > "$STOP_MONITOR_STUB_DIR/sleep" <<'STUB'
+#!/usr/bin/env bash
+exec /bin/sleep 30
+STUB
+    chmod +x "$STOP_MONITOR_STUB_DIR/sleep"
+    cat > "$STOP_MONITOR_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+: > "$MONITOR_GH_MARKER"
+exit 99
+STUB
+    chmod +x "$STOP_MONITOR_STUB_DIR/gh"
+
+    if command -v python3 &>/dev/null; then
+        STOP_MONITOR_OUTFILE="$(mktemp)"
+        stop_monitor_result="$(
+            SPAWN_CODEX_WAVE_SH="$SCRIPTS_DIR/spawn-codex-wave.sh" \
+            STOP_MONITOR_STUB_DIR="$STOP_MONITOR_STUB_DIR" \
+            STOP_MONITOR_LOG_DIR="$MONITOR_LOG_DIR" \
+            STOP_MONITOR_OUTFILE="$STOP_MONITOR_OUTFILE" \
+            python3 - <<'PYEOF'
+import os
+import subprocess
+import time
+
+env = dict(os.environ)
+env["PATH"] = os.environ["STOP_MONITOR_STUB_DIR"] + ":" + env.get("PATH", "")
+env["LOOM_CODEX_WAVE_LOG_DIR"] = os.environ["STOP_MONITOR_LOG_DIR"]
+with open(os.environ["STOP_MONITOR_OUTFILE"], "wb") as stream:
+    proc = subprocess.Popen(
+        [os.environ["SPAWN_CODEX_WAVE_SH"], "--monitor"],
+        stdout=stream,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    time.sleep(0.5)
+    proc.terminate()
+    proc.wait(timeout=5)
+print(f"RETURN_CODE={proc.returncode}")
+PYEOF
+        )"
+        stop_monitor_code="$(printf '%s\n' "$stop_monitor_result" | sed -n 's/^RETURN_CODE=//p')"
+        stop_monitor_outcome="$(jq -r '.children[0].outcome' "$MONITOR_STATUS_FILE")"
+        stop_monitor_cancelled="$(jq -r '.wave_cancelled' "$MONITOR_STATUS_FILE")"
+
+        assert_eq "-15" "$stop_monitor_code" \
+            "explicit observer stop terminates only the --monitor process"
+        assert_eq "running" "$stop_monitor_outcome" \
+            "observer stop does not rewrite a live child outcome as failed or cancelled"
+        assert_eq "false" "$stop_monitor_cancelled" \
+            "observer stop does not mark the owning wave cancelled"
+        assert_eq "0" "$([[ -e "$MONITOR_GH_MARKER" ]] && echo 1 || echo 0)" \
+            "observer-stop path also makes zero gh/GitHub polling calls"
+        rm -f "$STOP_MONITOR_OUTFILE"
+    else
+        echo "  (python3 not available -- skipping observer-stop isolation assertion)"
+    fi
+
+    # Documentation-shape regression: every Codex entry surface names the
+    # terminal condition, supported monitor, zero-polling contract, and UI
+    # product boundary so the behavior cannot regress to an implementation-
+    # only feature that supervisors do not know to use.
+    foreground_contract="$(
+        cat \
+            "$SCRIPTS_DIR/../.agents/skills/loom-sweep/SKILL.md" \
+            "$SCRIPTS_DIR/../.claude/commands/loom/sweep.md" \
+            "$SCRIPTS_DIR/../.codex/prompts/loom-sweep.md" \
+            "$SCRIPTS_DIR/../.codex/GUARDRAIL-PARITY.md" \
+            "$SCRIPTS_DIR/../.codex/agents/loom-orchestrator.toml" \
+            "$SCRIPTS_DIR/../../docs/guides/getting-started.md"
+    )"
+    assert_contains "spawn-codex-wave.sh --monitor" "$foreground_contract" \
+        "Codex-facing contracts document the supported foreground monitor"
+    assert_contains "zero recurring GitHub" "$foreground_contract" \
+        "Codex-facing contracts pin the zero-GitHub-polling budget"
+    assert_contains "cannot pin" "$foreground_contract" \
+        "Codex-facing contracts state the Working-indicator product boundary"
+    assert_contains "observer" "$foreground_contract" \
+        "Codex-facing contracts distinguish observer stop from child cancellation"
+
+    rm -f "$MONITOR_SLEEP_LOG" "$MONITOR_GH_MARKER"
+    rm -rf "$MONITOR_LOG_DIR" "$MONITOR_STUB_DIR" "$STOP_MONITOR_STUB_DIR"
+else
+    echo "  (jq not available -- skipping foreground monitor assertions)"
 fi
 
 # ============================================================

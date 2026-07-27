@@ -795,6 +795,40 @@ This is always safe: it never mutates anything and never triggers cancellation. 
 
 The documented default — and the only pattern this contract endorses as "the operator loop" — is: **start the wave, then block until it returns.** `spawn-codex-wave.sh` already implements the settling boundary this requires (it does not return until every child in the wave has exited). A supervising agent's job is to invoke it and wait, exactly as it would wait on any other long-running build step. Any optional progress display layered on top (e.g., a human watching a second terminal run `--status` on a backoff schedule) is exactly that — optional, informational, and never load-bearing for correctness. The wave completes on its own; nothing about the join needs "help."
 
+### Foreground-turn liveness while delivery is active (issue #83)
+
+A Codex supervisor has one additional terminal condition: **while Loom-owned
+delivery work is outstanding, keep the current turn open on real foreground
+work.** Do not return a final response between status checks. Prefer the
+runner's existing blocking join; when a command yields an execution handle,
+wait on that same handle until it returns.
+
+When observing a wave that is already running outside the current command,
+use the supported local foreground monitor:
+
+```bash
+./.loom/scripts/spawn-codex-wave.sh --monitor
+```
+
+`--monitor` reads `spawn-codex-wave-status.json` only. It uses bounded
+increasing backoff (30s → 60s → 120s → 300s, capped at 300s), makes **zero
+recurring GitHub REST/GraphQL/`gh` polling calls**, and returns when every
+child has a terminal outcome. Remote CI or forge inspection is a separate,
+explicit, rate-conscious observation only when the operator requests it.
+Never add artificial sleeps, no-op tool calls, or other fake work merely to
+animate the UI.
+
+The monitoring turn ends only when the queue is terminal or the operator
+explicitly stops observing it. Stopping the observer stops only that
+read-only monitor: it must not signal the owning wave, rewrite a live child's
+outcome as `failed`, or consume cancellation provenance. Explicitly cancelling
+the wave remains a separate action governed by the taxonomy above.
+
+This preserves Codex's normal foreground `Working (… • esc to interrupt)`
+indicator for the lifetime of the active turn. **Product boundary:** Loom can
+keep a turn pending, but it cannot independently pin, recreate, or control
+that Codex UI indicator after the turn has ended.
+
 ### Signals and cancellation provenance (the mechanical half)
 
 `spawn-codex-wave.sh` traps `INT` and `TERM` on its own process. On receipt of either:

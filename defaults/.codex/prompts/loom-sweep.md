@@ -72,3 +72,13 @@ gate.
   `spawn-codex-wave.sh --status` for structured state instead of parsing
   logs. Full contract and outcome taxonomy: the sweep skill's "Codex Child
   Supervision Contract" section.
+- **Keep the Codex turn foreground-active while delivery is outstanding
+  (issue #83).** Prefer the wave runner's blocking join and wait on the same
+  execution handle. To observe an already-running wave, use
+  `./.loom/scripts/spawn-codex-wave.sh --monitor`; it reads only local
+  structured state with 30s → 60s → 120s → 300s bounded backoff and makes
+  zero recurring GitHub polling calls. Do not return a final response
+  between checks or manufacture no-op activity. Stop the turn only when the
+  queue is terminal or the operator stops observing it; observer stop is not
+  child cancellation or failure. Loom cannot pin Codex's Working indicator
+  after the turn ends.

@@ -103,6 +103,19 @@ outcome taxonomy, and the forward reference to #53's resume mechanics**: see
 `.claude/commands/loom/sweep.md`'s "Codex Child Supervision Contract" section
 — it is canonical and binding on this skill.
 
+**Foreground-turn liveness (issue #83):** while Loom-owned delivery work is
+still outstanding, a supervising Codex turn stays open on real foreground
+work. Prefer the wave runner's blocking join. If the runner is already active
+elsewhere, use `./.loom/scripts/spawn-codex-wave.sh --monitor`, which reads
+only the local structured status file with bounded
+30s → 60s → 120s → 300s backoff and makes zero recurring GitHub API calls.
+Do not return a final response between checks, busy-poll, or manufacture no-op
+activity. The turn ends when the queue is terminal or the operator explicitly
+stops observing it; stopping the observer does not cancel or fail a live
+child. Loom can keep Codex's normal Working indicator visible by keeping the
+turn pending, but cannot pin or recreate that UI indicator after the turn
+ends.
+
 Keep daemon MCP dispatch, checkpointing (`.loom/sweep-checkpoint/`), label
 validation, confirmation gates, and dry-run behavior unchanged — this
 skill is a routing layer over the canonical sweep spec, not a new one.
