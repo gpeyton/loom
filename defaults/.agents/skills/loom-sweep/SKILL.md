@@ -52,6 +52,36 @@ lifecycle **sequentially in this session**, following the retired
   two child directories containing `auth.json` under `LOOM_CODEX_HOMES_DIR`.
   Claude's `.loom/tokens/` and `ACCOUNT_KEY_*` values are not a Codex pool.
 
+## Mandatory Codex plan surface (issue #66)
+
+After resolving targets and announcing the selected backend, create and own a
+visible `update_plan` plan for the full sweep lifetime. For every issue `N`,
+the plan contains `#N Curator`, `#N Builder (PR)`, `#N Judge`,
+`#N Doctor (if rejected)`, and `#N Merge`; add wave-settle items for
+multi-issue waves. Reconcile initial statuses from the sweep checkpoint and
+forge labels so resume never regresses a completed phase.
+
+Mark a phase `in_progress` when it begins. The required phase-exit ordering is:
+
+```text
+complete phase work → write checkpoint → update_plan → publish/log → proceed
+```
+
+Judge rejection re-opens Doctor and, after Doctor completes, returns Judge to
+`in_progress` for the one permitted re-review. If a phase is skipped, rewrite
+its item with the skip reason and complete it. Because `update_plan` has no
+blocked status, rewrite a blocked item as `BLOCKED — <reason>` and put it in
+the completed state; the text preserves the terminal non-success outcome.
+When Judge approves without Doctor, complete the optional item as
+`Doctor (not needed: Judge approved)`.
+
+Dry-run still creates the plan, prints the would-be task list, and settles
+every item as `(dry-run only; not executed)` without forge or repository
+mutation. Before returning a live or dry-run summary, assert that no plan item
+remains `pending` or `in_progress`. If `update_plan` is unavailable, emit the
+canonical `SWEEP_PHASE issue=#N phase=<phase> status=<status> reason="<text>"`
+line required by the canonical sweep spec at every transition.
+
 ## Backend policy: native Codex agents are not a supported Loom backend (issue #54)
 
 Current Codex clients expose native, in-session collaboration primitives —

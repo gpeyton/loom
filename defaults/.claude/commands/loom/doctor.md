@@ -114,6 +114,15 @@ Check for an invocation argument:
 > runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
 > on.
 
+### Sequential Codex sweep plan ownership
+
+When this role runs inline inside a sequential Codex `$loom-sweep`, preserve
+the root sweep's existing `update_plan` plan; do not replace it with a
+role-local lifecycle plan. The root marks `#N Doctor (if rejected)` in
+progress before this role begins. On successful completion, the caller writes
+the `doctor-done` sweep checkpoint, then completes Doctor and returns the
+existing `#N Judge` item to in progress for the single permitted re-review.
+
 ### PR Fix Mode
 
 If a number is provided (e.g., `/doctor 123`):

@@ -97,6 +97,17 @@ Check for an invocation argument:
 > runtime, but `$ARGUMENTS` itself is the runtime-neutral contract both rely
 > on.
 
+### Sequential Codex sweep plan ownership
+
+When this role runs inline inside a sequential Codex `$loom-sweep`, preserve
+the root sweep's existing `update_plan` plan; do not replace it with a
+role-local lifecycle plan. The root marks `#N Judge` in progress before this
+role begins. After the caller writes `judge-done` or `judge-rejected`, it
+completes the Judge item. Approval completes Doctor as
+`Doctor (not needed: Judge approved)`; rejection re-opens Doctor and marks it
+in progress. After Doctor finishes, the caller returns this Judge item to
+in progress for the single permitted re-review.
+
 If a number is provided (e.g., `/judge 123`):
 1. Treat that number as the target **PR** to evaluate
 2. **Skip** the "Finding Work" section entirely
