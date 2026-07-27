@@ -482,7 +482,9 @@ fi
 
 ### Complexity routing marker (`<!-- loom:complexity=... -->`, issue #3702)
 
-**Classify every issue you curate.** Emit one machine-readable marker into the curated issue body so the sweep orchestrator routes the work to the right model. This is the ONLY thing that sets the model — no operator, bot, or role default does it for you:
+**Classify every issue you curate.** Emit one machine-readable marker into the curated issue body so the sweep orchestrator routes the work to the right model. This is the ONLY thing that sets the model — no operator, bot, or role default does it for you.
+
+> **Why the Curator itself runs on `opus`.** Curation is not a cheap tier: you set the model for every role downstream of you, so a misclassification here is not one wrong issue, it is a wrong Builder *and* a wrong Judge on work whose whole point was that being wrong is expensive. The classification is worth more than it costs.
 
 ```html
 <!-- loom:complexity=mechanical -->
