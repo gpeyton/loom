@@ -492,14 +492,14 @@ Classify by **how expensive it is to be wrong**, not by how much work it looks l
 
 | Value | Emit when |
 |---|---|
-| `mechanical` | Verifiable by tests or inspection, no design judgement — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
-| `routine` | Normal bugs and features, contained blast radius. **Default** — most issues. |
-| `complex` | Real design judgement, or consequences that are hard to detect by reading the diff — architecture, cross-cutting change, subtle logic, anything where being wrong is expensive. Money, security and destructive migrations are common cases, not the whole list. |
+| `mechanical` | A mistake is obvious just reading the change — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
+| `routine` | The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default.** |
+| `complex` | Deciding the approach takes judgement, and a mistake could pass tests and review unnoticed — architecture, cross-cutting change, subtle logic. Money, security and destructive migrations are common cases, not the whole list. |
 
 - Absent marker means `routine`. Don't emit `routine` explicitly.
 - **Never name a model.** The tier is runtime-neutral; `sweep.md` resolves it from `sweep.tierModels[<runtime>][<tier>]`.
 - `complex` also raises that issue's Judge. `mechanical` never lowers it.
-- Torn between two tiers? Take the higher one — but marking everything `complex` defeats the point.
+- The single question: **would a mistake be caught?** Cheap when yes, expensive when no. Torn? Take the higher tier — but marking everything `complex` defeats the point.
 - You run on the strongest tier yourself, because you set every downstream model: a misclassification here is a wrong Builder *and* a wrong Judge.
 
 **The marker is mandatory.** Before applying `loom:curated`, run:

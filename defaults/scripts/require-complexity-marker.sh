@@ -27,9 +27,9 @@ BLOCKED: issue $ISSUE has no complexity marker.
 
 Add exactly one of these to the issue body before applying loom:curated:
 
-  <!-- loom:complexity=mechanical -->   verifiable by tests/inspection
-  <!-- loom:complexity=routine -->      normal work, contained blast radius
-  <!-- loom:complexity=complex -->      needs real design judgement, or wrong is costly
+  <!-- loom:complexity=mechanical -->   a mistake is obvious on reading it
+  <!-- loom:complexity=routine -->      mistake would surface in tests/review
+  <!-- loom:complexity=complex -->      mistake could pass tests and review unseen
 
 Torn between two? Take the higher one.
 EOF
