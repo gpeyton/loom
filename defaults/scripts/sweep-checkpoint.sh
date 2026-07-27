@@ -12,7 +12,7 @@
 #
 # Checkpoint file format (atomic write via .tmp + mv):
 #   {
-#     "phase": "<curator-done|builder-done|judge-done|doctor-done|merge-done>",
+#     "phase": "<curator-done|builder-done|judge-rejected|judge-done|doctor-done|merge-done>",
 #     "task_id": "<task identifier, e.g. sweep PID>",
 #     "timestamp": "<ISO 8601 UTC>",
 #     "pr_number": <int or null>,
@@ -37,6 +37,9 @@
 # Phases are recorded *after* successful completion of the corresponding
 # lifecycle phase, so "curator-done" means the curator phase succeeded for
 # this issue and the next sweep should skip it.
+# `judge-rejected` records a successful request-changes verdict and requires
+# `--pr-number`; a resumed sweep uses that durable routing key to enter the
+# single Doctor→Judge cycle without repeating the initial Judge pass.
 #
 # On merge-done, callers should invoke `delete` to remove the checkpoint —
 # stale-checkpoint detection (closed issue + leftover checkpoint) is performed
@@ -61,7 +64,7 @@
 
 set -euo pipefail
 
-VALID_PHASES=(curator-done builder-done judge-done doctor-done merge-done)
+VALID_PHASES=(curator-done builder-done judge-rejected judge-done doctor-done merge-done)
 
 usage() {
     sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'
@@ -127,6 +130,10 @@ cmd_write() {
     [[ -z "$task_id" ]] && task_id="sweep-$$"
     if [[ "$pr_number" != "null" && ! "$pr_number" =~ ^[0-9]+$ ]]; then
         echo "ERROR: --pr-number must be a positive integer or 'null'" >&2
+        exit 1
+    fi
+    if [[ "$phase" == "judge-rejected" && "$pr_number" == "null" ]]; then
+        echo "ERROR: judge-rejected requires --pr-number for resume routing" >&2
         exit 1
     fi
     if [[ -n "$attempt" && ! "$attempt" =~ ^[1-9][0-9]*$ ]]; then
