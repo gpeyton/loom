@@ -89,20 +89,25 @@ fn is_marker(line: &str, marker: &str) -> bool {
 
 /// Locate the inclusive `(start, end)` line indices of the marked block.
 ///
-/// Returns `None` when either marker is absent, or when `END` precedes `BEGIN`
-/// (a malformed file is treated as markerless and goes through migration, which
-/// is idempotent and safe).
+/// Returns `None` unless there is exactly one ordered marker pair. A malformed
+/// file is treated as markerless and goes through migration, which strips the
+/// orphaned Loom marker lines before inserting one fresh, well-formed block.
 fn find_marker_block(lines: &[&str]) -> Option<(usize, usize)> {
-    let start = lines
+    let starts: Vec<usize> = lines
         .iter()
-        .position(|l| is_marker(l, LABELS_SECTION_START))?;
-    let end = lines
+        .enumerate()
+        .filter_map(|(idx, line)| is_marker(line, LABELS_SECTION_START).then_some(idx))
+        .collect();
+    let ends: Vec<usize> = lines
         .iter()
-        .skip(start + 1)
-        .position(|l| is_marker(l, LABELS_SECTION_END))?
-        + start
-        + 1;
-    Some((start, end))
+        .enumerate()
+        .filter_map(|(idx, line)| is_marker(line, LABELS_SECTION_END).then_some(idx))
+        .collect();
+
+    match (starts.as_slice(), ends.as_slice()) {
+        ([start], [end]) if start < end => Some((*start, *end)),
+        _ => None,
+    }
 }
 
 /// Extract the label name from a top-level `- name: X` line.
@@ -291,6 +296,19 @@ pub fn merge_labels_yml(shipped: &str, existing: Option<&str>) -> String {
                 kept.push((*line).to_string());
             }
             i = end + 1;
+            continue;
+        }
+
+        // A malformed marker set is deliberately handled by the markerless
+        // migration path. Marker lines are Loom-owned syntax, never consumer
+        // content, so discard every orphan here before inserting one canonical
+        // block below. This prevents an orphan BEGIN from becoming the start
+        // of a later, over-broad replacement range.
+        if !had_markers
+            && (is_marker(lines[i], LABELS_SECTION_START)
+                || is_marker(lines[i], LABELS_SECTION_END))
+        {
+            i += 1;
             continue;
         }
 
@@ -672,6 +690,49 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn malformed_markers_migrate_without_losing_consumer_content() {
+        let existing = "\
+# BEGIN LOOM LABELS
+# Consumer labels must survive this orphan marker.
+- name: area/api
+  description: API surface
+  color: \"112233\"
+# BEGIN LOOM LABELS
+- name: loom:issue
+  description: stale Loom text
+  color: \"000000\"
+# END LOOM LABELS
+- name: area/web
+  description: Web surface
+  color: \"445566\"
+";
+
+        let merged = merge_labels_yml(SHIPPED, Some(existing));
+
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| is_marker(line, LABELS_SECTION_START))
+                .count(),
+            1,
+            "migration must leave exactly one BEGIN marker: {merged}"
+        );
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| is_marker(line, LABELS_SECTION_END))
+                .count(),
+            1,
+            "migration must leave exactly one END marker: {merged}"
+        );
+        assert!(merged.contains("# Consumer labels must survive this orphan marker."));
+        assert!(merged.contains("- name: area/api"));
+        assert!(merged.contains("- name: area/web"));
+        assert!(!merged.contains("stale Loom text"));
+        assert_eq!(merge_labels_yml(SHIPPED, Some(&merged)), merged);
     }
 
     #[test]
