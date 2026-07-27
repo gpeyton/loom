@@ -1,33 +1,19 @@
 #!/usr/bin/env bash
-# test-worktree-nested-symlinks.sh — Tests for nested-node_modules + linkPaths symlinking (#3528)
-#
-# Verifies worktree.sh symlinks per-package node_modules and configurable
-# gitignored artifact paths from the main workspace into a fresh worktree,
-# and records them in the worktree's .git/info/exclude so `git add -A` never
-# stages them.
+# test-worktree-nested-symlinks.sh — dependency isolation + explicit links (#62, #3528)
 #
 # Coverage:
-#   1. Nested apps/web/node_modules (alongside apps/web/package.json) is
-#      symlinked into a worktree that also materializes apps/web/.
-#   2. A worktree.linkPaths entry present in .loom/config.json and in the main
-#      workspace is symlinked into the worktree.
-#   3. The worktree's .git/info/exclude contains the new symlink paths, and a
-#      second pass does not duplicate the entries (idempotent).
-#   4. A repo with NO nested node_modules and NO linkPaths config produces no
-#      nested/linkPaths symlinks (no-behavior-change regression guard).
-#   5. Missing jq (simulated via PATH override) skips the linkPaths step silently.
-#   6. A forced ln -s failure (dst pre-exists as a real file) warns and worktree
-#      creation still succeeds (exit 0).
-#
-# Pattern follows test-worktree-sentinel.sh / test-worktree-concurrency.sh:
-# throw-away bare origin + clone in a mktemp dir, copy worktree.sh + lib/,
-# exercise behaviors.
+#   1. pnpm projects get real root/nested worktree-local node_modules by default.
+#   2. pnpm is invoked non-interactively with the frozen lockfile.
+#   3. worktree.linkPaths stays an independent explicit symlink.
+#   4. worktree.dependencyMode=symlink preserves legacy root/nested links.
+#   5. Invalid config and missing jq both fail safe to isolation.
+#   6. A failed isolated install warns but does not abort worktree creation.
+#   7. Artifact-link processing remains best-effort.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
 RED='\033[0;31m'
@@ -49,33 +35,43 @@ assert_symlink() {
     fi
 }
 
+assert_real_dir() {
+    if [[ -d "$1" && ! -L "$1" ]]; then
+        pass "$2"
+    else
+        fail "$2 (expected real directory: $1)"
+    fi
+}
+
 assert_not_symlink() {
     if [[ ! -L "$1" ]]; then
         pass "$2"
     else
-        fail "$2 (unexpected symlink present: $1)"
+        fail "$2 (unexpected symlink: $1)"
     fi
 }
 
 assert_grep() {
-    local pattern="$1" file="$2" msg="$3"
+    local pattern="$1" file="$2" message="$3"
     if [[ -f "$file" ]] && grep -qxF "$pattern" "$file"; then
-        pass "$msg"
+        pass "$message"
     else
-        fail "$msg (line not found: '$pattern' in $file)"
+        fail "$message (line not found: '$pattern' in $file)"
     fi
 }
 
-# Build a throwaway repo with an origin/main ref and the .loom layout
-# worktree.sh expects. Materializes package layout via the args:
-#   setup_repo <tmp-out-var-unused>  — caller passes extra setup by editing
-# We keep it simple: setup_repo echoes the repo working-tree path; caller then
-# adds packages / config as needed and commits nothing (worktree.sh only needs
-# origin/main to exist, and the main-workspace files it symlinks are read from
-# the working tree, not from git).
+assert_not_grep() {
+    local pattern="$1" file="$2" message="$3"
+    if [[ ! -f "$file" ]] || ! grep -qxF "$pattern" "$file"; then
+        pass "$message"
+    else
+        fail "$message (unexpected line: '$pattern' in $file)"
+    fi
+}
+
 setup_repo() {
     local tmp
-    tmp=$(mktemp -d /tmp/loom-wt-nested.XXXXXX)
+    tmp=$(mktemp -d /tmp/loom-wt-deps.XXXXXX)
     git init -q -b main "$tmp/origin.git" --bare
     git init -q -b main "$tmp/repo"
     (
@@ -101,192 +97,218 @@ cleanup_repo() {
     rm -rf "$(dirname "$repo")"
 }
 
-# Resolve a worktree's info/exclude the same way worktree.sh does.
 worktree_exclude_path() {
-    local wt="$1"
-    ( cd "$wt" && git rev-parse --git-path info/exclude 2>/dev/null | \
-        while IFS= read -r p; do
-            if [[ "$p" == /* ]]; then echo "$p"; else echo "$wt/$p"; fi
-        done )
+    local worktree="$1"
+    (
+        cd "$worktree"
+        git rev-parse --git-path info/exclude 2>/dev/null |
+            while IFS= read -r exclude_path; do
+                if [[ "$exclude_path" == /* ]]; then
+                    echo "$exclude_path"
+                else
+                    echo "$worktree/$exclude_path"
+                fi
+            done
+    )
 }
 
-# --- Test 1 + 2 + 3: nested node_modules + linkPaths + exclude idempotency ---
-echo "Test 1-3: nested node_modules + worktree.linkPaths + .git/info/exclude"
+install_fake_pnpm() {
+    local repo="$1" exit_code="${2:-0}"
+    local fake_bin="$repo/.fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/pnpm" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "\$PWD/.pnpm-args"
+printf '%s\n' "\$PWD" > "\$PWD/.pnpm-cwd"
+printf '%s\n' "\${CI:-}" > "\$PWD/.pnpm-ci"
+if [[ "$exit_code" -ne 0 ]]; then
+    exit "$exit_code"
+fi
+mkdir -p "\$PWD/node_modules"
+printf 'worktree-root\n' > "\$PWD/node_modules/.modules.yaml"
+if [[ -f "\$PWD/apps/web/package.json" ]]; then
+    mkdir -p "\$PWD/apps/web/node_modules"
+    printf 'worktree-nested\n' > "\$PWD/apps/web/node_modules/.modules.yaml"
+fi
+EOF
+    chmod +x "$fake_bin/pnpm"
+    echo "$fake_bin"
+}
+
+add_pnpm_fixture() {
+    local repo="$1"
+    (
+        cd "$repo"
+        mkdir -p apps/web node_modules apps/web/node_modules
+        printf '{"name":"root","private":true}\n' > package.json
+        printf '{"name":"web"}\n' > apps/web/package.json
+        printf 'lockfileVersion: "9.0"\n' > pnpm-lock.yaml
+        printf 'node_modules/\n' > .gitignore
+        printf 'main-root\n' > node_modules/.modules.yaml
+        printf 'main-nested\n' > apps/web/node_modules/.modules.yaml
+        git add package.json apps/web/package.json pnpm-lock.yaml .gitignore
+        git commit -q -m "add pnpm workspace"
+        git push -q origin main
+    )
+}
+
+echo "Test 1-3: isolated pnpm dependencies + linkPaths + idempotency"
 REPO=$(setup_repo)
+add_pnpm_fixture "$REPO"
+FAKE_BIN=$(install_fake_pnpm "$REPO")
 (
     cd "$REPO"
-    # Root node_modules + root package.json (existing behavior).
-    mkdir -p node_modules
-    echo '{"name":"root"}' > package.json
-    # Nested package: apps/web with its own node_modules + package.json. The
-    # worktree must also materialize apps/web (it does — full checkout tracks it
-    # only if committed, but worktree.sh checks the worktree path exists). We
-    # commit apps/web/package.json so the worktree checkout materializes the dir.
-    mkdir -p apps/web/node_modules
-    echo '{"name":"web"}' > apps/web/package.json
-    git add apps/web/package.json package.json
-    git commit -q -m "add packages"
-    git push -q origin main
-    # Generated-artifact dir to be linked via config.
     mkdir -p apps/web/src/wasm
-    echo "generated" > apps/web/src/wasm/index.js
-    # config.json with worktree.linkPaths.
+    printf 'generated\n' > apps/web/src/wasm/index.js
     cat > .loom/config.json <<'JSON'
 { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
 JSON
-
-    ./.loom/scripts/worktree.sh 3528 >/tmp/wt-nested.$$ 2>&1 || {
-        echo "worktree.sh failed (see /tmp/wt-nested.$$)"; cat /tmp/wt-nested.$$
-    }
+    PATH="$FAKE_BIN:$PATH" ./.loom/scripts/worktree.sh 62 >/tmp/wt-isolated.$$ 2>&1
 )
-WT="$REPO/.loom/worktrees/issue-3528"
-assert_symlink "$WT/apps/web/node_modules" "nested apps/web/node_modules symlinked into worktree"
-assert_symlink "$WT/apps/web/src/wasm" "worktree.linkPaths entry apps/web/src/wasm symlinked into worktree"
+WT="$REPO/.loom/worktrees/issue-62"
+assert_real_dir "$WT/node_modules" "root node_modules is a real worktree-local directory"
+assert_real_dir "$WT/apps/web/node_modules" "nested node_modules is a real worktree-local directory"
+assert_grep "worktree-root" "$WT/node_modules/.modules.yaml" "root install metadata belongs to worktree"
+assert_grep "worktree-nested" "$WT/apps/web/node_modules/.modules.yaml" "nested install metadata belongs to worktree"
+assert_grep "main-root" "$REPO/node_modules/.modules.yaml" "main root dependency metadata is unchanged"
+assert_grep "main-nested" "$REPO/apps/web/node_modules/.modules.yaml" "main nested dependency metadata is unchanged"
+assert_grep "install --frozen-lockfile" "$WT/.pnpm-args" "pnpm uses frozen-lockfile install"
+assert_grep "$WT" "$WT/.pnpm-cwd" "pnpm runs from the worktree"
+assert_grep "true" "$WT/.pnpm-ci" "pnpm runs non-interactively with CI=true"
+assert_symlink "$WT/apps/web/src/wasm" "worktree.linkPaths remains an explicit symlink"
 
 EXCLUDE="$(worktree_exclude_path "$WT")"
-assert_grep "apps/web/node_modules" "$EXCLUDE" ".git/info/exclude records nested node_modules path"
-assert_grep "apps/web/src/wasm" "$EXCLUDE" ".git/info/exclude records linkPaths entry"
+assert_grep "apps/web/src/wasm" "$EXCLUDE" "exclude records explicit linkPath"
+assert_not_grep "node_modules" "$EXCLUDE" "isolated root dependencies are not recorded as links"
+assert_not_grep "apps/web/node_modules" "$EXCLUDE" "isolated nested dependencies are not recorded as links"
 
-# Idempotency: re-invoke worktree.sh for the same issue. Because info/exclude is
-# a shared (common-dir) file that git worktrees inherit from the main repo, the
-# second pass hits the same exclude file — worktree.sh's grep -qxF guard must
-# keep each entry single-line rather than appending duplicates.
 (
     cd "$REPO"
-    ./.loom/scripts/worktree.sh 3528 >/tmp/wt-nested2.$$ 2>&1 || true
+    PATH="$FAKE_BIN:$PATH" ./.loom/scripts/worktree.sh 62 >/tmp/wt-isolated-reentry.$$ 2>&1
 )
-NM_COUNT=$(grep -cxF "apps/web/node_modules" "$EXCLUDE" 2>/dev/null || echo 0)
-WASM_COUNT=$(grep -cxF "apps/web/src/wasm" "$EXCLUDE" 2>/dev/null || echo 0)
-if [[ "$NM_COUNT" == "1" && "$WASM_COUNT" == "1" ]]; then
-    pass "exclude entries appear exactly once (no duplication)"
+LINK_COUNT=$(grep -cxF "apps/web/src/wasm" "$EXCLUDE" 2>/dev/null || echo 0)
+if [[ "$LINK_COUNT" == "1" ]]; then
+    pass "re-entry does not duplicate explicit linkPath excludes"
 else
-    fail "exclude entries duplicated (node_modules=$NM_COUNT, wasm=$WASM_COUNT)"
-fi
-
-# git add -A must not stage the symlinks (they're excluded).
-(
-    cd "$WT"
-    git add -A 2>/dev/null || true
-    if git status --porcelain 2>/dev/null | grep -qE 'apps/web/(node_modules|src/wasm)$'; then
-        fail "symlinks were staged by git add -A (should be excluded)"
-    else
-        pass "git add -A does not stage the created symlinks"
-    fi
-)
-cleanup_repo "$REPO"
-
-# --- Test 4: no nested node_modules + no linkPaths → no extra symlinks ---
-echo ""
-echo "Test 4: no monorepo layout / no linkPaths → no nested symlinks (regression)"
-REPO=$(setup_repo)
-(
-    cd "$REPO"
-    mkdir -p node_modules
-    echo '{"name":"root"}' > package.json
-    ./.loom/scripts/worktree.sh 100 >/tmp/wt-plain.$$ 2>&1 || {
-        echo "worktree.sh failed (see /tmp/wt-plain.$$)"; cat /tmp/wt-plain.$$
-    }
-)
-WT="$REPO/.loom/worktrees/issue-100"
-# No apps/ dir at all — confirm the worktree has no nested node_modules symlinks.
-if find "$WT" -mindepth 2 -type l -name node_modules 2>/dev/null | grep -q .; then
-    fail "unexpected nested node_modules symlink in a non-monorepo repo"
-else
-    pass "no nested node_modules symlinks created for non-monorepo repo"
-fi
-# Exclude file should have no linkPaths noise (may not exist at all — that's fine).
-EXCLUDE="$(worktree_exclude_path "$WT")"
-if [[ -f "$EXCLUDE" ]] && grep -qE 'apps/|src/wasm' "$EXCLUDE" 2>/dev/null; then
-    fail "exclude file gained monorepo entries in a plain repo"
-else
-    pass "exclude file has no monorepo/linkPaths entries in a plain repo"
+    fail "re-entry duplicated linkPath exclude (count=$LINK_COUNT)"
 fi
 cleanup_repo "$REPO"
 
-# --- Test 5: missing jq → linkPaths step skipped silently ---
 echo ""
-echo "Test 5: missing jq → linkPaths skipped, worktree still succeeds"
+echo "Test 4: explicit compatibility mode preserves legacy root/nested links"
 REPO=$(setup_repo)
+add_pnpm_fixture "$REPO"
 (
     cd "$REPO"
-    mkdir -p node_modules
-    echo '{"name":"root"}' > package.json
-    mkdir -p apps/web/src/wasm
-    echo "generated" > apps/web/src/wasm/index.js
     cat > .loom/config.json <<'JSON'
-{ "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
+{ "worktree": { "dependencyMode": "symlink" } }
+JSON
+    ./.loom/scripts/worktree.sh 63 >/tmp/wt-legacy.$$ 2>&1
+)
+WT="$REPO/.loom/worktrees/issue-63"
+assert_symlink "$WT/node_modules" "legacy mode symlinks root node_modules"
+assert_symlink "$WT/apps/web/node_modules" "legacy mode symlinks nested node_modules"
+EXCLUDE="$(worktree_exclude_path "$WT")"
+assert_grep "node_modules" "$EXCLUDE" "legacy root dependency link is excluded"
+assert_grep "apps/web/node_modules" "$EXCLUDE" "legacy nested dependency link is excluded"
+cleanup_repo "$REPO"
+
+echo ""
+echo "Test 5: invalid dependency mode fails safe to isolated install"
+REPO=$(setup_repo)
+add_pnpm_fixture "$REPO"
+FAKE_BIN=$(install_fake_pnpm "$REPO")
+(
+    cd "$REPO"
+    cat > .loom/config.json <<'JSON'
+{ "worktree": { "dependencyMode": "mystery" } }
+JSON
+    PATH="$FAKE_BIN:$PATH" ./.loom/scripts/worktree.sh 64 >/tmp/wt-invalid.$$ 2>&1
+)
+WT="$REPO/.loom/worktrees/issue-64"
+assert_real_dir "$WT/node_modules" "invalid mode uses isolated root dependencies"
+if grep -q "Unknown worktree.dependencyMode 'mystery'; using isolated" /tmp/wt-invalid.$$; then
+    pass "invalid dependency mode emits a safe-default warning"
+else
+    fail "invalid dependency mode did not emit warning"
+fi
+cleanup_repo "$REPO"
+
+echo ""
+echo "Test 6: missing jq cannot activate compatibility mode or linkPaths"
+REPO=$(setup_repo)
+add_pnpm_fixture "$REPO"
+(
+    cd "$REPO"
+    mkdir -p apps/web/src/wasm
+    printf 'generated\n' > apps/web/src/wasm/index.js
+    cat > .loom/config.json <<'JSON'
+{ "worktree": { "dependencyMode": "symlink", "linkPaths": ["apps/web/src/wasm"] } }
 JSON
 
-    # Simulate missing jq by constructing a shim PATH that provides every binary
-    # worktree.sh needs (git, coreutils, find, ...) via symlinks to their real
-    # locations, but deliberately OMITS jq. Setting PATH to only this shim dir
-    # makes `command -v jq` fail while everything else keeps working.
     SHIM=$(mktemp -d /tmp/loom-nojq.XXXXXX)
-    for bin in git find dirname basename mkdir ln grep rm mv cp cat sed awk \
-               readlink pwd sort head tail wc tr cut date id sleep chmod \
-               mktemp rmdir touch env bash sh printf test true false ls stat; do
-        real="$(command -v "$bin" 2>/dev/null || true)"
-        [[ -n "$real" ]] && ln -s "$real" "$SHIM/$bin" 2>/dev/null || true
+    for binary_name in git find dirname basename mkdir ln grep rm mv cp cat sed awk \
+                       readlink pwd sort head tail wc tr cut date id sleep chmod \
+                       mktemp rmdir touch env bash sh printf test true false ls stat; do
+        binary_path="$(command -v "$binary_name" 2>/dev/null || true)"
+        [[ -n "$binary_path" ]] && ln -s "$binary_path" "$SHIM/$binary_name" 2>/dev/null || true
     done
-    export PATH="$SHIM"
-
-    if ./.loom/scripts/worktree.sh 101 >/tmp/wt-nojq.$$ 2>&1; then
-        echo "OK"
-    else
-        echo "worktree.sh failed under missing-jq (see /tmp/wt-nojq.$$)"; cat /tmp/wt-nojq.$$
-    fi
+    PATH="$SHIM" ./.loom/scripts/worktree.sh 65 >/tmp/wt-nojq.$$ 2>&1
 )
-WT="$REPO/.loom/worktrees/issue-101"
-if [[ -d "$WT" ]]; then
-    pass "worktree created successfully with jq unavailable"
-else
-    fail "worktree not created when jq unavailable"
-fi
-assert_not_symlink "$WT/apps/web/src/wasm" "linkPaths symlink skipped when jq unavailable"
+WT="$REPO/.loom/worktrees/issue-65"
+assert_not_symlink "$WT/node_modules" "missing jq does not enable legacy root dependency link"
+assert_not_symlink "$WT/apps/web/node_modules" "missing jq does not enable legacy nested dependency link"
+assert_not_symlink "$WT/apps/web/src/wasm" "missing jq skips explicit linkPaths"
 cleanup_repo "$REPO"
 
-# --- Test 6: forced ln -s failure warns but worktree creation succeeds ---
 echo ""
-echo "Test 6: pre-existing dst blocks symlink but worktree still succeeds (exit 0)"
+echo "Test 7: failed isolated install warns but worktree creation succeeds"
 REPO=$(setup_repo)
+add_pnpm_fixture "$REPO"
+FAKE_BIN=$(install_fake_pnpm "$REPO" 9)
 RC=0
 (
     cd "$REPO"
-    mkdir -p node_modules
-    echo '{"name":"root"}' > package.json
-    mkdir -p apps/web/node_modules
-    echo '{"name":"web"}' > apps/web/package.json
-    git add apps/web/package.json package.json
-    git commit -q -m "add web pkg"
-    git push -q origin main
-    # Pre-create the worktree dir with apps/web/node_modules as a REAL file so
-    # ln -s fails (dst exists). worktree.sh recreates the worktree though, so
-    # instead force the failure at the linkPaths layer: config points at a path
-    # whose dst we pre-create. Use a linkPaths entry and pre-seed the worktree.
-    cat > .loom/config.json <<'JSON'
-{ "worktree": { "linkPaths": ["blocked-artifact"] } }
-JSON
-    mkdir -p blocked-artifact
-    echo x > blocked-artifact/f
-    ./.loom/scripts/worktree.sh 102 >/tmp/wt-fail.$$ 2>&1
+    PATH="$FAKE_BIN:$PATH" ./.loom/scripts/worktree.sh 66 >/tmp/wt-install-fail.$$ 2>&1
 ) || RC=$?
-# worktree.sh must not abort on a symlink failure. Since the dst won't pre-exist
-# (fresh worktree), this test primarily asserts exit 0 and worktree presence
-# even with an artifact-linking config in play.
-if [[ "$RC" -eq 0 ]]; then
-    pass "worktree.sh exits 0 even with artifact-linking config engaged"
+if [[ "$RC" -eq 0 && -d "$REPO/.loom/worktrees/issue-66" ]]; then
+    pass "failed pnpm install leaves a usable worktree"
 else
-    fail "worktree.sh exited non-zero ($RC) — symlink logic must be best-effort"
+    fail "failed pnpm install aborted worktree creation (exit=$RC)"
 fi
-WT="$REPO/.loom/worktrees/issue-102"
-if [[ -d "$WT" ]]; then
-    pass "worktree directory created despite linkPaths processing"
+if grep -q "Isolated pnpm install failed" /tmp/wt-install-fail.$$; then
+    pass "failed pnpm install emits a bounded warning"
 else
-    fail "worktree directory missing after linkPaths processing"
+    fail "failed pnpm install warning missing"
 fi
 cleanup_repo "$REPO"
 
-# --- Summary ---
+echo ""
+echo "Test 8: artifact-link processing remains best-effort"
+REPO=$(setup_repo)
+(
+    cd "$REPO"
+    printf '{"name":"root"}\n' > package.json
+    printf 'node_modules/\n' > .gitignore
+    git add package.json .gitignore
+    git commit -q -m "add package"
+    git push -q origin main
+    mkdir -p blocked-artifact
+    printf 'x\n' > blocked-artifact/file
+    cat > .loom/config.json <<'JSON'
+{ "worktree": { "linkPaths": ["blocked-artifact"] } }
+JSON
+    ./.loom/scripts/worktree.sh 67 >/tmp/wt-artifact.$$ 2>&1
+)
+WT="$REPO/.loom/worktrees/issue-67"
+if [[ -d "$WT" ]]; then
+    pass "worktree survives artifact-link processing"
+else
+    fail "worktree missing after artifact-link processing"
+fi
+assert_symlink "$WT/blocked-artifact" "configured artifact remains linked"
+cleanup_repo "$REPO"
+
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"
 [[ $TESTS_FAILED -eq 0 ]] || exit 1
