@@ -170,6 +170,8 @@ pub enum Request {
     ListSweeps {
         state_filter: Option<SweepState>,
     },
+    /// Report dispatch authentication readiness without starting a sweep.
+    GetDispatchAuthReadiness,
     // ========================================================================
     // Event Bus Requests (Issue #3453 — Phase B of #3449)
     // ========================================================================
@@ -299,6 +301,7 @@ pub enum Response {
     SweepList {
         sweeps: Vec<SweepInfo>,
     },
+    DispatchAuthReadiness(DispatchAuthReadiness),
     // ========================================================================
     // Event Bus Responses (Issue #3453 — Phase B of #3449)
     // ========================================================================
@@ -479,6 +482,17 @@ pub struct SweepInfo {
     /// clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// Read-only authentication and capacity state for daemon sweep dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchAuthReadiness {
+    pub pool_size: usize,
+    pub usable_tokens: usize,
+    pub single_account_mode: bool,
+    pub source: String,
+    pub concurrency_cap: usize,
+    pub running_single_account_sweeps: usize,
 }
 
 // ========================================================================
