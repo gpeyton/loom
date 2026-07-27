@@ -818,6 +818,16 @@ or `/loom-sweep 42`. Each shim reads the same canonical
   Child Supervision Contract" section for the full patience contract and
   cancellation-outcome taxonomy (`cancelled_by_operator` /
   `cancelled_by_parent` / `cancelled_by_deadline`, distinct from `failed`).
+- **Active Loom delivery keeps the Codex turn in the foreground** (issue
+  #83): a Codex supervisor waits on the runner's blocking join instead of
+  returning between status checks. To observe a wave that is already
+  running, use `defaults/scripts/spawn-codex-wave.sh --monitor`. It follows
+  only the local structured status file with bounded
+  30s → 60s → 120s → 300s backoff, makes zero recurring GitHub API calls,
+  and returns when the queue is terminal. Stopping that observer does not
+  cancel the wave or mark a child failed. Codex shows its normal Working
+  indicator while the turn remains pending; Loom cannot pin or recreate the
+  indicator after the turn ends.
 
 See the [Epic #30](https://github.com/gpeyton/loom/issues/30) tracker for
 the dual-runtime full-autonomy work this section reflects.

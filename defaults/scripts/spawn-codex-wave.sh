@@ -96,6 +96,16 @@
 #          spawn-codex-wave.sh --status
 #      Reading the status file is always safe: it never mutates anything and
 #      never triggers cancellation.
+#   5. A Codex supervisor that needs to keep its foreground turn alive while
+#      an already-running wave settles can use:
+#          spawn-codex-wave.sh --monitor
+#      This is a real, read-only local monitor: it reads the structured status
+#      file with a bounded 30s -> 60s -> 120s -> 300s backoff (capped at
+#      300s), makes zero GitHub API calls, and returns only when every child
+#      has a terminal outcome. Interrupting the observer stops only the
+#      observer; it never signals the owning wave or rewrites child outcomes.
+#      Prefer the wave runner's existing blocking join when this process
+#      launched the work. Never add no-op activity merely to animate a UI.
 #
 # Cancellation-outcome taxonomy (the exact vocabulary; issue #53's atomic
 # reclaim/resume work is expected to consume this verbatim):
@@ -239,6 +249,7 @@
 #   .loom/scripts/spawn-codex-wave.sh <issue-number> [<issue-number> ...]
 #   LOOM_CODEX_MULTI_WAVE=1 .loom/scripts/spawn-codex-wave.sh 100 101 102
 #   .loom/scripts/spawn-codex-wave.sh --status   # non-destructive status read
+#   .loom/scripts/spawn-codex-wave.sh --monitor  # foreground local wait
 #
 # Env vars:
 #   LOOM_CODEX_MULTI_WAVE    Opt-in concurrency gate (see above). Default: off.
@@ -367,6 +378,49 @@ if [[ "${1:-}" == "--status" ]]; then
         cat "$STATUS_FILE"
     fi
     exit 0
+fi
+
+# --- Foreground local monitor (read-only; zero GitHub polling) ---
+# This mode is intentionally handled before mkdir/argument validation and
+# before the wave runner installs any cancellation traps. It observes an
+# already-running wave; it does not own that wave. Therefore an INT/TERM sent
+# to this observer exits the observer with the shell's normal signal status
+# and cannot be forwarded to a child or recorded as child failure.
+if [[ "${1:-}" == "--monitor" ]]; then
+    if [[ ! -f "$STATUS_FILE" ]]; then
+        echo "spawn-codex-wave: no status file found at $STATUS_FILE (no wave is available to monitor)" >&2
+        exit 1
+    fi
+    if [[ "$JQ_AVAILABLE" != "1" ]]; then
+        log_error "--monitor requires jq to read the structured local status file"
+        exit 78  # EX_CONFIG
+    fi
+
+    MONITOR_DELAYS=(30 60 120 300)
+    monitor_delay_index=0
+    monitor_last_index=$((${#MONITOR_DELAYS[@]} - 1))
+
+    log_info "spawn-codex-wave: foreground monitor attached to $STATUS_FILE (local structured state only; zero GitHub polling)"
+    while true; do
+        if ! jq -e '.children | type == "array"' "$STATUS_FILE" >/dev/null 2>&1; then
+            log_error "structured status file is missing or invalid: $STATUS_FILE"
+            exit 1
+        fi
+
+        if ! jq -e '[.children[] | select(.outcome == "running")] | length > 0' \
+            "$STATUS_FILE" >/dev/null 2>&1; then
+            log_info "spawn-codex-wave: foreground monitor reached a terminal queue state"
+            jq '.' "$STATUS_FILE"
+            exit 0
+        fi
+
+        monitor_delay="${MONITOR_DELAYS[$monitor_delay_index]}"
+        log_info "spawn-codex-wave: delivery is still running; next local status read in ${monitor_delay}s"
+        sleep "$monitor_delay"
+        if [[ "$monitor_delay_index" -lt "$monitor_last_index" ]]; then
+            monitor_delay_index=$((monitor_delay_index + 1))
+        fi
+    done
 fi
 
 mkdir -p "$LOG_DIR"

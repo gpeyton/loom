@@ -25,4 +25,15 @@ Loom agents," invoke spawn-codex-wave.sh (LOOM_CODEX_MULTI_WAVE=1), never
 spawn_agent. Do not mix native-agent spawning with process-level fan-out
 or daemon dispatch in the same run. See sweep.md's "Codex backend policy"
 section for the full rationale.
+
+Foreground liveness (issue #83): while Loom-owned delivery remains active,
+keep this Codex turn open on real foreground work. Prefer the runner's
+blocking join and wait on its execution handle. For an already-running wave,
+use ./.loom/scripts/spawn-codex-wave.sh --monitor, which reads only local
+structured state with bounded 30/60/120/300-second backoff and makes zero
+recurring GitHub API calls. Do not return a final response between checks,
+busy-poll, or manufacture no-op work. End only at a terminal queue state or
+an explicit operator observer-stop; stopping observation is not child
+cancellation or failure. Loom cannot pin Codex's Working indicator after the
+turn ends.
 """
