@@ -855,6 +855,16 @@ def spawn_agent(
             )
             log_info("Injected CLAUDE_CODE_OAUTH_TOKEN from workspace token pool")
 
+    # Forward LOOM_MODEL so per-agent model tiering works (the wrapper reads it
+    # and emits `claude --model <value>`). agent-spawn otherwise forwards only a
+    # fixed set of vars, so an exported LOOM_MODEL never reaches the tmux command.
+    model_prefix = ""
+    _loom_model = os.environ.get("LOOM_MODEL", "").strip()
+    if _loom_model:
+        _safe_model = _loom_model.replace("'", "'\"'\"'")
+        model_prefix = f"LOOM_MODEL='{_safe_model}' "
+        log_info(f"Injecting LOOM_MODEL={_loom_model}")
+
     # Build the Claude CLI command
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
@@ -863,11 +873,11 @@ def spawn_agent(
             f"{max_retries_prefix}{shepherd_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
-            f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
+            f"{model_prefix}'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
         )
     else:
         claude_cmd = (
-            f"{token_prefix}claude --dangerously-skip-permissions \"{role_cmd}\""
+            f"{token_prefix}{model_prefix}claude --dangerously-skip-permissions \"{role_cmd}\""
         )
         log_warning("claude-wrapper.sh not found, using claude directly (no retry logic)")
 
