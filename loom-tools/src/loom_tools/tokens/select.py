@@ -44,13 +44,20 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
 from loom_tools.common.config import env_int
 from loom_tools.tokens.bad_tokens import is_bad
 from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
+from loom_tools.tokens.providers import (
+    DEFAULT_PROVIDER,
+    KNOWN_PROVIDERS,
+    env_var_for_provider,
+    load_provider_map,
+    provider_of,
+)
 from loom_tools.tokens.rotation import next_rotation_index
 
 # Ranking file is considered fresh for this many seconds.
@@ -111,6 +118,7 @@ class SelectedToken:
     file: Path  # absolute path to .token file
     key: str  # token contents (whitespace-stripped)
     mode: str  # "ranked" | "allowlist" | "random"
+    provider: str = DEFAULT_PROVIDER  # account provider (from index.json)
 
 
 def _shared_pool_hint() -> str:
@@ -278,6 +286,7 @@ def _try_ranking(
     ranking_file: Path,
     workspace_path: Path,
     rng: random.Random,
+    eligible_names: set[str],
 ) -> SelectedToken | None:
     """Strategy 1: read .ranking, rotate one-per-account across eligible entries.
 
@@ -316,6 +325,8 @@ def _try_ranking(
     def _collect(*, healthy_only: bool) -> list[SelectedToken]:
         out: list[SelectedToken] = []
         for name, status in _read_ranking(ranking_file):
+            if name not in eligible_names:
+                continue
             # Hard-excluded in every pass: the probe flagged the account dead.
             if status in _TIER1_HARD_EXCLUDED:
                 continue
@@ -388,6 +399,7 @@ def _try_allowlist(
     allowlist_file: Path,
     workspace_path: Path,
     rng: random.Random,
+    eligible_names: set[str],
     exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
     """Strategy 2: random pick from allowlist.
@@ -400,7 +412,7 @@ def _try_allowlist(
     names = _read_allowlist(allowlist_file)
     eligible: list[Path] = []
     for name in names:
-        if name in exclude:
+        if name not in eligible_names or name in exclude:
             continue
         token_file = tokens_dir / f"{name}.token"
         if token_file.is_file() and not is_bad(workspace_path, name):
@@ -428,6 +440,7 @@ def _try_random(
     tokens_dir: Path,
     workspace_path: Path,
     rng: random.Random,
+    eligible_names: set[str],
     exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
     """Strategy 3: random pick from all tokens.
@@ -438,7 +451,11 @@ def _try_random(
     candidates = [
         p
         for p in _list_token_files(tokens_dir)
-        if not is_bad(workspace_path, p.stem) and p.stem not in exclude
+        if (
+            p.stem in eligible_names
+            and not is_bad(workspace_path, p.stem)
+            and p.stem not in exclude
+        )
     ]
     if not candidates:
         return None
@@ -462,6 +479,7 @@ def _try_random(
 def select_token(
     workspace_path: Path | str,
     *,
+    provider: str = DEFAULT_PROVIDER,
     rng: random.Random | None = None,
 ) -> SelectedToken:
     """Select an OAuth token using the 3-tier algorithm.
@@ -470,15 +488,21 @@ def select_token(
         workspace_path: Repo root containing ``.loom/tokens/``. When called
             from a worktree, pass the canonical (main checkout) root, not
             the worktree path.
+        provider: Only consider accounts belonging to this provider
+            (default ``anthropic`` — unchanged behavior for existing
+            callers). Accounts absent from ``index.json``, or recorded
+            without a provider field, are treated as ``anthropic``.
         rng: Optional random.Random instance for deterministic testing.
             Defaults to a module-level Random seeded from os.urandom.
 
     Returns:
-        SelectedToken with name, absolute file path, key, and selection mode.
+        SelectedToken with name, absolute file path, key, selection mode,
+        and provider.
 
     Raises:
         EmptyTokenPoolError: When ``.loom/tokens/`` is missing, contains no
-            ``.token`` files, or every token is marked bad.
+            ``.token`` files, no token belongs to *provider*, or every
+            eligible token is marked bad.
             The bash wrapper hard-fails (exit 78) and prompts the user to
             run ``loom-tokens bootstrap`` — never silently falls back.
     """
@@ -506,15 +530,34 @@ def select_token(
             f"(or `loom-tokens bootstrap --shared` for the machine-level pool).",
         )
 
+    # Filter the effective pool (per-repo or shared) by the provider map stored
+    # beside its token files. Legacy pools without provider metadata remain
+    # anthropic by default, preserving pre-provider behavior.
+    provider_map = load_provider_map(tokens_dir)
+    eligible_names = {
+        token.stem
+        for token in all_tokens
+        if provider_of(token.stem, provider_map) == provider
+    }
+    if not eligible_names:
+        raise EmptyTokenPoolError(
+            f"No tokens for provider '{provider}' in {tokens_dir} "
+            f"({len(all_tokens)} token(s) belong to other providers). "
+            f"Add ACCOUNT_PROVIDER_N={provider} accounts to .env and run "
+            f"`loom-tokens bootstrap`.",
+        )
+
     if rng is None:
         rng = random.Random(os.urandom(16))
 
     ranking_file = tokens_dir / ".ranking"
     allowlist_file = tokens_dir / ".allowlist"
 
-    selected = _try_ranking(tokens_dir, ranking_file, workspace_path, rng)
+    selected = _try_ranking(
+        tokens_dir, ranking_file, workspace_path, rng, eligible_names
+    )
     if selected is not None:
-        return selected
+        return replace(selected, provider=provider)
 
     # Tier-1 declined: .ranking is absent or stale. If a stale ranking exists,
     # carry its exhausted/blocked entries forward as an advisory exclusion set
@@ -523,29 +566,41 @@ def select_token(
     exclude = _stale_ranking_exclusions(ranking_file)
 
     selected = _try_allowlist(
-        tokens_dir, allowlist_file, workspace_path, rng, exclude=exclude,
+        tokens_dir,
+        allowlist_file,
+        workspace_path,
+        rng,
+        eligible_names,
+        exclude=exclude,
     )
     if selected is not None:
-        return selected
+        return replace(selected, provider=provider)
 
-    selected = _try_random(tokens_dir, workspace_path, rng, exclude=exclude)
+    selected = _try_random(
+        tokens_dir, workspace_path, rng, eligible_names, exclude=exclude
+    )
     if selected is not None:
-        return selected
+        return replace(selected, provider=provider)
 
     # Fail-safe: the advisory exclusions emptied the pool (e.g. a stale
     # "everything exhausted" ranking). Retry ignoring them so a live pool can
     # never hard-fail on stale advice — better to spawn into a possibly-tired
     # account than to refuse all work.
     if exclude:
-        selected = _try_allowlist(tokens_dir, allowlist_file, workspace_path, rng)
+        selected = _try_allowlist(
+            tokens_dir, allowlist_file, workspace_path, rng, eligible_names
+        )
         if selected is not None:
-            return selected
-        selected = _try_random(tokens_dir, workspace_path, rng)
+            return replace(selected, provider=provider)
+        selected = _try_random(
+            tokens_dir, workspace_path, rng, eligible_names
+        )
         if selected is not None:
-            return selected
+            return replace(selected, provider=provider)
 
     raise EmptyTokenPoolError(
-        f"All {len(all_tokens)} tokens in {tokens_dir} are marked bad or empty. "
+        f"All {len(eligible_names)} '{provider}' tokens in {tokens_dir} are "
+        f"marked bad or empty. "
         f"Inspect .bad_tokens or run `loom-tokens bootstrap --force`.",
     )
 
@@ -559,19 +614,32 @@ def _main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="python -m loom_tools.tokens.select",
-        description="Select a Claude Code OAuth token from .loom/tokens/.",
+        description="Select an account token from .loom/tokens/.",
     )
     parser.add_argument(
         "--workspace",
         required=True,
         help="Repo root containing .loom/tokens/.",
     )
+    parser.add_argument(
+        "--provider",
+        choices=KNOWN_PROVIDERS,
+        default=DEFAULT_PROVIDER,
+        help=(
+            "Only select accounts for this provider "
+            f"(default: {DEFAULT_PROVIDER})."
+        ),
+    )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="Emit JSON (default).")
     fmt.add_argument(
         "--export",
         action="store_true",
-        help="Emit shell `export CLAUDE_CODE_OAUTH_TOKEN=...` lines.",
+        help=(
+            "Emit shell `export <VAR>=...` lines. The variable is "
+            "provider-specific: CLAUDE_CODE_OAUTH_TOKEN for anthropic, "
+            "OPENAI_API_KEY for openai."
+        ),
     )
     parser.add_argument(
         "--no-key",
@@ -581,23 +649,38 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        sel = select_token(args.workspace)
+        sel = select_token(args.workspace, provider=args.provider)
     except EmptyTokenPoolError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EX_CONFIG
 
     if args.export:
+        env_var = env_var_for_provider(sel.provider)
+        if env_var is None:  # pragma: no cover - argparse choices prevent this
+            print(
+                f"error: no export env var known for provider "
+                f"'{sel.provider}'",
+                file=sys.stderr,
+            )
+            return EX_CONFIG
         if args.no_key:
-            print(f"# selected={sel.name} mode={sel.mode} file={sel.file}")
+            print(
+                f"# selected={sel.name} mode={sel.mode} "
+                f"provider={sel.provider} file={sel.file}"
+            )
         else:
-            print(f"export CLAUDE_CODE_OAUTH_TOKEN={sel.key!r}")
-            print(f"# selected={sel.name} mode={sel.mode} file={sel.file}")
+            print(f"export {env_var}={sel.key!r}")
+            print(
+                f"# selected={sel.name} mode={sel.mode} "
+                f"provider={sel.provider} file={sel.file}"
+            )
         return 0
 
     payload = {
         "name": sel.name,
         "file": str(sel.file),
         "mode": sel.mode,
+        "provider": sel.provider,
     }
     if not args.no_key:
         payload["key"] = sel.key

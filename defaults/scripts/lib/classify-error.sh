@@ -85,10 +85,10 @@ _classify_error_set_patterns() {
 
     case "$provider" in
         claude)
-            # Verbatim patterns from the pre-refactor (#3233) implementation.
+            # Claude CLI/API-specific failure vocabulary.
             _CE_PAT_CWD_DELETED="current working directory was deleted"
             _CE_PAT_TOKEN_EXPIRED="401[^a-z]*authentication_error|OAuth token has expired|token has expired"
-            _CE_PAT_TOKEN_EXHAUSTED="hit your (limit|weekly limit)|hit.your.limit"
+            _CE_PAT_TOKEN_EXHAUSTED="hit your (limit|session limit|weekly limit)|hit\\.your\\.limit|monthly usage limit|out of extra usage"
             _CE_PAT_NO_MESSAGES="No messages returned"
             ;;
         codex)
@@ -211,9 +211,10 @@ classify_error() {
     # session limit", "hit your weekly limit", an org's "monthly usage limit",
     # and "out of extra usage". A naive `hit.your.limit` pattern misses the
     # "session"/multi-word forms (there is filler between "your" and "limit").
-    # This regex is kept in lockstep with claude-wrapper.sh, which sources this
-    # file rather than duplicating the pattern (issue #3738).
-    if echo "$output" | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage"; then
+    # The provider table carries both Claude and Codex quota vocabularies.
+    # Keep the session-limit capacity check above this branch so concurrent
+    # capacity faults are never mistaken for exhausted quota.
+    if [[ -n "$_CE_PAT_TOKEN_EXHAUSTED" ]] && echo "$output" | grep -qiE "$_CE_PAT_TOKEN_EXHAUSTED"; then
         echo "TOKEN_EXHAUSTED"
         return
     fi

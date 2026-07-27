@@ -734,6 +734,23 @@ def _make_shared_pool(tmp_path: Path, accounts: dict[str, str]) -> Path:
     return shared
 
 
+def _write_provider_index(tokens_dir: Path, providers: dict[str, str]) -> None:
+    index = {
+        "version": 1,
+        "accounts": [
+            {
+                "name": name,
+                "file": f"{name}.token",
+                "provider": provider,
+            }
+            for name, provider in providers.items()
+        ],
+    }
+    (tokens_dir / "index.json").write_text(
+        json.dumps(index), encoding="utf-8"
+    )
+
+
 def test_falls_back_to_shared_pool_when_repo_has_none(tmp_path, monkeypatch):
     """A consumer repo with no per-repo pool selects from the shared pool."""
     repo = tmp_path / "consumer"
@@ -745,6 +762,27 @@ def test_falls_back_to_shared_pool_when_repo_has_none(tmp_path, monkeypatch):
     assert sel.name == "shared-a"
     assert sel.key == "key-shared-a"
     assert sel.file == shared / "shared-a.token"
+
+
+def test_shared_pool_selection_filters_by_provider(tmp_path, monkeypatch):
+    """Provider filtering uses metadata from the resolved shared pool."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    shared = _make_shared_pool(
+        tmp_path,
+        {"claude-1": "key-anthropic", "codex-1": "key-openai"},
+    )
+    _write_provider_index(
+        shared,
+        {"claude-1": "anthropic", "codex-1": "openai"},
+    )
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    assert select_token(repo).name == "claude-1"
+    selected = select_token(repo, provider="openai")
+    assert selected.name == "codex-1"
+    assert selected.provider == "openai"
+    assert selected.key == "key-openai"
 
 
 def test_per_repo_pool_wins_over_shared(tmp_path, monkeypatch):

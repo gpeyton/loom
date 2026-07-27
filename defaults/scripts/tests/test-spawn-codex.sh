@@ -413,6 +413,42 @@ STUB
     assert_contains "codex-1 auth" "$bad_contents" \
         ".bad_tokens records 'codex-1 auth'"
 
+    # Explicit quota exhaustion marks a selected OpenAI account with the
+    # existing `exhausted` reason rather than treating it as a transient 429.
+    QUOTA_WS="$POOL_WS/quota-workspace"
+    QUOTA_STUB_DIR="$POOL_WS/quota-bin"
+    mkdir -p "$QUOTA_WS/.loom/tokens" "$QUOTA_STUB_DIR"
+    printf 'sk-openai-quota' > "$QUOTA_WS/.loom/tokens/codex-quota.token"
+    cat > "$QUOTA_WS/.loom/tokens/index.json" <<'JSON'
+{
+  "version": 1,
+  "accounts": [
+    {"name": "codex-quota", "file": "codex-quota.token", "provider": "openai"}
+  ]
+}
+JSON
+    cat > "$QUOTA_STUB_DIR/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "rate_limit_exceeded" >&2
+exit 1
+STUB
+    chmod +x "$QUOTA_STUB_DIR/codex"
+    set +e
+    output=$(PATH="$QUOTA_STUB_DIR:$NOCODEX_PATH" \
+        LOOM_WORKSPACE="$QUOTA_WS" LOOM_PACKAGE_PATH="$PKG_PATH" \
+        "$SCRIPTS_DIR/spawn-codex.sh" -p "hello" 2>&1)
+    exit_code=$?
+    set -e
+    assert_eq "1" "$exit_code" \
+        "quota-exhausted codex child exit code is propagated"
+    assert_contains "marking bad (reason=exhausted)" "$output" \
+        "quota exhaustion marks the selected pool account exhausted"
+    quota_bad_contents="$(
+        cat "$QUOTA_WS/.loom/tokens/.bad_tokens" 2>/dev/null || echo ""
+    )"
+    assert_contains "codex-quota exhausted" "$quota_bad_contents" \
+        ".bad_tokens records 'codex-quota exhausted'"
+
     # With codex-1 now bad, the pool has no usable openai account:
     # fall through to ambient auth — NO hard-fail (asymmetry vs spawn-claude)
     set +e
