@@ -1,3 +1,15 @@
+# BEGIN LOOM LABELS
+# ============================================================================
+# LOOM-MANAGED BLOCK -- do not edit between the BEGIN/END LOOM LABELS markers.
+#
+# Everything inside these markers is owned by Loom and is replaced wholesale on
+# every install and upgrade. Edits made in here WILL be lost.
+#
+# Your own labels belong OUTSIDE the markers (above or below this block).
+# Content outside the markers is consumer-owned: install, upgrade, and
+# uninstall all leave it untouched. Uninstall removes only this marked block;
+# if consumer labels remain, the file itself is kept.
+# ============================================================================
 # Loom Workflow Labels
 # These labels coordinate the Loom AI agent workflow
 # Sync with: .loom/scripts/sync-labels.sh (from the installed repo root)
@@ -140,3 +152,4 @@
 - name: external
   description: "Submitted by a non-collaborator; requires maintainer approval before Curator/Builder process it. Applied by: humans only."
   color: "E5E7EB"  # gray-200 - external/hold marker
+# END LOOM LABELS
