@@ -825,11 +825,9 @@ fn output_with_timeout(
 pub struct SweepRegistryConfig {
     /// Absolute path to the workspace root (parent of `.loom/`).
     pub workspace_root: PathBuf,
-    /// Optional override for the spawn binary. Defaults to resolving
-    /// `spawn-worker.sh` (preferred) or `spawn-claude.sh` (legacy fallback)
-    /// under `<workspace_root>/.loom/scripts/` or
-    /// `<workspace_root>/defaults/scripts/`. See
-    /// [`resolve_spawn_bin`](Self::resolve_spawn_bin) for the full order.
+    /// Optional override for the spawn binary. Defaults to
+    /// `<workspace_root>/defaults/scripts/spawn-claude.sh` or, if absent,
+    /// `<workspace_root>/.loom/scripts/spawn-claude.sh`.
     pub spawn_bin: Option<PathBuf>,
     /// Override the `gh` binary (for tests). Defaults to `gh` from `PATH`.
     pub gh_bin: Option<PathBuf>,
@@ -869,34 +867,14 @@ impl SweepRegistryConfig {
     /// Resolve the spawn binary, preferring (in order):
     /// 1. `spawn_bin` explicit override.
     /// 2. `LOOM_SWEEP_SPAWN_BIN` env var.
-    /// 3. `<workspace>/.loom/scripts/spawn-worker.sh` (worker-runner
-    ///    dispatcher, issue #2 of epic #1).
-    /// 4. `<workspace>/defaults/scripts/spawn-worker.sh`.
-    /// 5. `<workspace>/.loom/scripts/spawn-claude.sh` (legacy fallback for
-    ///    installs that predate the `spawn-worker.sh` dispatcher).
-    /// 6. `<workspace>/defaults/scripts/spawn-claude.sh`.
+    /// 3. `<workspace>/.loom/scripts/spawn-claude.sh`.
+    /// 4. `<workspace>/defaults/scripts/spawn-claude.sh`.
     pub fn resolve_spawn_bin(&self) -> Result<PathBuf> {
         if let Some(ref p) = self.spawn_bin {
             return Ok(p.clone());
         }
         if let Ok(path) = std::env::var(SPAWN_BIN_ENV) {
             return Ok(PathBuf::from(path));
-        }
-        let installed_worker = self
-            .workspace_root
-            .join(".loom")
-            .join("scripts")
-            .join("spawn-worker.sh");
-        if installed_worker.exists() {
-            return Ok(installed_worker);
-        }
-        let defaults_worker = self
-            .workspace_root
-            .join("defaults")
-            .join("scripts")
-            .join("spawn-worker.sh");
-        if defaults_worker.exists() {
-            return Ok(defaults_worker);
         }
         let installed = self
             .workspace_root
@@ -915,8 +893,8 @@ impl SweepRegistryConfig {
             return Ok(defaults);
         }
         Err(anyhow!(
-            "neither spawn-worker.sh nor spawn-claude.sh found under {} (looked in \
-             .loom/scripts and defaults/scripts; set {SPAWN_BIN_ENV} to override)",
+            "spawn-claude.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
+             set {SPAWN_BIN_ENV} to override)",
             self.workspace_root.display()
         ))
     }
@@ -1231,11 +1209,6 @@ impl SweepRegistry {
     /// When `None`, no `--model` flag is emitted at all — the session/CLI
     /// default is preserved end-to-end.
     ///
-    /// `worker_type` (issue #2, Phase 1 of epic #1): when `Some` and
-    /// non-empty, the spawned child receives `LOOM_WORKER=<value>` in its
-    /// environment so `spawn-worker.sh` resolves to the matching runner.
-    /// When `None` or empty, no `LOOM_WORKER` env var is set at all — the
-    /// spawn layer's own default (`claude`) applies end-to-end.
     /// `effort` (issue #3716): mirrors `model` exactly. When `Some` and
     /// non-empty, the spawned child receives `--effort <level>` appended to
     /// the argv (immediately after any `--model`). When `None` or empty, no
@@ -1253,7 +1226,6 @@ impl SweepRegistry {
         kind: &SweepKind,
         idempotency_key: Option<String>,
         model: Option<&str>,
-        worker_type: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
     ) -> Result<DispatchOutcome> {
@@ -1307,8 +1279,6 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (pid, token_name) = self
-            .spawn_child(issue_number, &log_path, &sweep_id, model, worker_type)
         let (child, token_name) = self
             .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
             .context("failed to spawn sweep child")?;
@@ -1941,8 +1911,6 @@ impl SweepRegistry {
         log_path: &Path,
         sweep_id: &str,
         model: Option<&str>,
-        worker_type: Option<&str>,
-    ) -> Result<(u32, String)> {
         effort: Option<&str>,
         depends_on: Option<u32>,
     ) -> Result<(Child, String)> {
@@ -1978,13 +1946,7 @@ impl SweepRegistry {
             .with_context(|| format!("failed to open log {}", log_path.display()))?;
         let log_clone = log_file.try_clone()?;
 
-        // Child-prompt encoding is runtime-aware (issue #19, Phase 3 of
-        // epic #1). The Claude path is byte-identical to the pre-#19
-        // hardcoded `/loom:sweep {issue}`; the Codex path receives an
-        // invocation its `codex exec` runtime can actually resolve — Codex
-        // does NOT expand slash-command custom prompts in exec mode
-        // (openai/codex#3641). See [`encode_child_prompt`].
-        let prompt = encode_child_prompt(issue, worker_type);
+        let prompt = format!("/loom:sweep {issue}");
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -1994,16 +1956,6 @@ impl SweepRegistry {
         if let Some(m) = model {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);
-            }
-        }
-        // Worker-type selection (issue #2, Phase 1 of epic #1): set
-        // LOOM_WORKER only when a non-empty value was supplied, exactly
-        // mirroring the --model rule above. spawn-worker.sh reads this env
-        // var to resolve the runner; when unset it defaults to "claude" —
-        // zero behavior change for dispatches that don't specify one.
-        if let Some(w) = worker_type {
-            if !w.is_empty() {
-                cmd.env("LOOM_WORKER", w);
             }
         }
         // Reasoning-effort selection (issue #3716): the dispatch-param tier,
@@ -3493,64 +3445,6 @@ pub struct CancelOutcome {
     pub was_running: bool,
 }
 
-/// Encode the `-p <prompt>` argument for a dispatched sweep child,
-/// runtime-aware (issue #19, Phase 3 of epic #1).
-///
-/// The `worker_type` seam is the same one `dispatch` threads into the
-/// child's `LOOM_WORKER` env (issue #2). This function maps it to the
-/// invocation string the child's runtime can actually resolve:
-///
-/// # Claude (default — load-bearing production path)
-///
-/// Any `worker_type` that is `None`, an empty string, or the literal
-/// `"claude"` (case-insensitive) yields `/loom:sweep <issue>` — **byte
-/// for byte** the pre-#19 hardcoded string. This is the strict default:
-/// every non-Codex value falls here, so no Claude dispatch changes.
-///
-/// # Codex
-///
-/// Selected **only** when `worker_type` equals `"codex"`
-/// (case-insensitive). `spawn-codex.sh` runs the child via
-/// `codex exec "<prompt>"`, and `codex exec` does **not** expand
-/// slash-command custom prompts (openai/codex#3641) — so handing it
-/// `/loom-sweep <issue>` (the repo's Codex prompt name) would be treated
-/// as literal prose, not resolved. Instead we pass a natural-language
-/// instruction that points Codex at the canonical Codex entry point
-/// (`.agents/skills/loom-sweep/SKILL.md`, shipped by #35/PR#43), which
-/// documents the sequential-in-session Codex lifecycle and references the
-/// canonical sweep skill at `.claude/commands/loom/sweep.md`. This mirrors
-/// the established pattern in `.github/workflows/loom-role.yml`, which
-/// inlines role prompt text for Codex rather than relying on slash
-/// resolution.
-///
-/// **Issue #53 note**: this used to point at `.codex/prompts/loom-sweep.md`
-/// (#16's original shim). That file still exists and still works during the
-/// transition window, but #35/PR#43 made the skill the documented onboarding
-/// path, and `defaults/scripts/spawn-codex-wave.sh`'s own child-prompt
-/// encoding (a separate, hand-kept-in-sync copy — see that script's
-/// `_encode_prompt`) was found still pointing at the retired prompt in the
-/// same #51/#53 reproduction that motivated the claim/lease work in this
-/// module's neighbourhood. Both copies now agree.
-#[must_use]
-pub fn encode_child_prompt(issue: u32, worker_type: Option<&str>) -> String {
-    match worker_type {
-        Some(w) if w.eq_ignore_ascii_case("codex") => format!(
-            "Read the file .agents/skills/loom-sweep/SKILL.md in this repository and \
-             follow it exactly to run a Loom sweep for issue {issue} (treat its \
-             arguments as: {issue}). You are running under the Codex runtime: \
-             `codex exec` cannot resolve Claude slash commands or Codex \
-             slash-prompts, so drive the Curator -> Builder -> Judge -> Doctor \
-             -> Merge lifecycle sequentially in this one session per that skill's \
-             Codex guidance — do not attempt Claude Code Task-tool subagents, and \
-             do not use native Codex agent-collaboration primitives (spawn_agent, \
-             wait_agent, interrupt_agent) for this lifecycle either — they are not \
-             a supported Loom backend (issue #54); a request for parallel Loom \
-             work routes to spawn-codex-wave.sh, not to native agent primitives."
-        ),
-        _ => format!("/loom:sweep {issue}"),
-    }
-}
-
 /// Generate a stable sweep ID for the given kind. Format follows the
 /// spawn-loop log naming convention so operators can correlate.
 #[must_use]
@@ -4111,7 +4005,6 @@ mod tests {
   printf 'argv: %s\n' "$*"
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
-  printf 'LOOM_WORKER=%s\n' "${{LOOM_WORKER:-unset}}"
   printf 'PWD=%s\n' "$(pwd -P)"
   printf 'LOOM_MODEL_EXPERIMENT=%s\n' "${{LOOM_MODEL_EXPERIMENT:-unset}}"
   printf 'LOOM_MODEL_EXPERIMENT_CANARY=%s\n' "${{LOOM_MODEL_EXPERIMENT_CANARY:-unset}}"
@@ -4254,7 +4147,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(42), None, None, None)
             .dispatch(&SweepKind::Issue(42), None, None, None, None)
             .expect("dispatch should succeed");
 
@@ -4537,7 +4429,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None)
             .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None, None)
             .expect("dispatch should succeed");
 
@@ -4570,7 +4461,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(44), None, Some(""), None)
             .dispatch(&SweepKind::Issue(44), None, Some(""), None, None)
             .expect("dispatch should succeed");
 
@@ -4592,38 +4482,6 @@ exit 0
         );
     }
 
-    /// Issue #2 (Phase 1 of epic #1): a `worker_type` dispatch param threads
-    /// through to the spawn command's environment as `LOOM_WORKER=<value>`.
-    #[test]
-    #[serial]
-    fn dispatch_with_worker_type_sets_loom_worker_env() {
-        let dir = tempdir().unwrap();
-        let (mut registry, record_log) = fixture_registry(dir.path());
-
-        let outcome = registry
-            .dispatch(&SweepKind::Issue(45), None, None, Some("codex"))
-            .expect("dispatch should succeed");
-
-        // The fixture script writes LOOM_WORKER last, so waiting for its
-        // exact expected value guarantees the whole record is flushed.
-        let needle = "LOOM_WORKER=codex";
-        assert!(
-            wait_for_contents(&record_log, needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("LOOM_WORKER=codex"),
-            "expected LOOM_WORKER=codex in recorded env; got: {recorded}"
-        );
-    }
-
-    /// Issue #2: `worker_type = None` must NOT set LOOM_WORKER at all — the
-    /// spawn layer's own default (`claude`) applies (zero-behavior-change
-    /// criterion, mirroring the `model = None` rule).
-    #[test]
-    #[serial]
-    fn dispatch_with_none_worker_type_emits_no_loom_worker_env() {
     // ========================================================================
     // Issue #3944 — dispatch-model resolution (precedence + source)
     // ========================================================================
@@ -4720,7 +4578,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(46), None, None, None)
             .dispatch(&SweepKind::Issue(45), None, None, Some("xhigh"), None)
             .expect("dispatch should succeed");
 
@@ -4729,24 +4586,6 @@ exit 0
             wait_for_contents(&record_log, &needle, 10000),
             "fake spawn-claude.sh did not finish writing within 10s"
         );
-        // Give the fixture script time to flush its final LOOM_WORKER line
-        // (written after LOOM_TERMINAL_ID/LOOM_WORKSPACE).
-        assert!(
-            wait_for_contents(&record_log, "LOOM_WORKER=", 10000),
-            "fake spawn-claude.sh did not finish writing LOOM_WORKER line within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("LOOM_WORKER=unset"),
-            "worker_type=None must not set LOOM_WORKER; got: {recorded}"
-        );
-    }
-
-    /// Issue #2: an empty-string worker_type is treated as unset — no
-    /// `LOOM_WORKER` env var at all, matching the empty-model rule.
-    #[test]
-    #[serial]
-    fn dispatch_with_empty_worker_type_emits_no_loom_worker_env() {
         let recorded = std::fs::read_to_string(&record_log).unwrap();
         assert!(
             recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
@@ -4770,7 +4609,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(47), None, None, Some(""))
             .dispatch(&SweepKind::Issue(46), None, Some("claude-sonnet-4-6"), Some("xhigh"), None)
             .expect("dispatch should succeed");
 
@@ -4779,95 +4617,6 @@ exit 0
             wait_for_contents(&record_log, &needle, 10000),
             "fake spawn-claude.sh did not finish writing within 10s"
         );
-        assert!(
-            wait_for_contents(&record_log, "LOOM_WORKER=", 10000),
-            "fake spawn-claude.sh did not finish writing LOOM_WORKER line within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("LOOM_WORKER=unset"),
-            "empty worker_type must not set LOOM_WORKER; got: {recorded}"
-        );
-    }
-
-    /// Issue #19 (Phase 3): the Claude child-prompt encoding is byte-for-byte
-    /// identical to the pre-#19 hardcoded string for every non-Codex
-    /// worker_type value (None / empty / "claude" / arbitrary). This is the
-    /// "do not regress the Claude path" acceptance criterion at the unit level.
-    #[test]
-    fn encode_child_prompt_claude_default_is_byte_identical() {
-        assert_eq!(encode_child_prompt(42, None), "/loom:sweep 42");
-        assert_eq!(encode_child_prompt(42, Some("")), "/loom:sweep 42");
-        assert_eq!(encode_child_prompt(42, Some("claude")), "/loom:sweep 42");
-        assert_eq!(encode_child_prompt(42, Some("CLAUDE")), "/loom:sweep 42");
-        // Any unknown runtime also defaults to the Claude slash command —
-        // Codex is the ONLY branch that diverges.
-        assert_eq!(encode_child_prompt(42, Some("gemini")), "/loom:sweep 42");
-    }
-
-    /// Issue #19 (Phase 3), repointed by issue #53: the Codex child-prompt
-    /// encoding does NOT emit a slash command (`codex exec` can't resolve
-    /// them — openai/codex#3641), points the child at the canonical
-    /// `.agents/skills/loom-sweep/SKILL.md` entry point (not the retired
-    /// `.codex/prompts/loom-sweep.md` shim), and carries the issue number.
-    #[test]
-    fn encode_child_prompt_codex_points_at_shim() {
-        let p = encode_child_prompt(19, Some("codex"));
-        // Must not be the Claude slash-command invocation. (The shim *path*
-        // legitimately contains "loom-sweep", so we only reject the Claude
-        // `/loom:sweep` command form — the thing codex exec can't resolve.)
-        assert!(
-            !p.contains("/loom:sweep"),
-            "codex prompt must not be the Claude slash command: {p}"
-        );
-        assert!(
-            p.starts_with("Read the file"),
-            "codex prompt must be a natural-language instruction, not a slash command: {p}"
-        );
-        assert!(
-            p.contains(".agents/skills/loom-sweep/SKILL.md"),
-            "codex prompt must reference the canonical loom-sweep skill: {p}"
-        );
-        assert!(
-            !p.contains(".codex/prompts/loom-sweep.md"),
-            "codex prompt must NOT reference the retired loom-sweep prompt shim: {p}"
-        );
-        assert!(p.contains("19"), "codex prompt must carry the issue number: {p}");
-        // Case-insensitive on the worker_type token.
-        assert_eq!(encode_child_prompt(19, Some("Codex")), encode_child_prompt(19, Some("codex")));
-    }
-
-    /// Issue #54: the Codex child prompt must also prohibit native Codex
-    /// agent-collaboration primitives (`spawn_agent` et al.), not just
-    /// Claude Code Task-tool subagents. This is the single source of truth
-    /// every Codex child actually receives on argv, so the prohibition
-    /// needs to be load-bearing here, not just in sweep.md prose.
-    #[test]
-    fn encode_child_prompt_codex_prohibits_native_agent_primitives() {
-        let p = encode_child_prompt(54, Some("codex"));
-        assert!(
-            p.contains("spawn_agent"),
-            "codex prompt must explicitly name spawn_agent as prohibited: {p}"
-        );
-        assert!(
-            p.contains("not a supported Loom backend")
-                || p.contains("not a supported Loom orchestration backend"),
-            "codex prompt must state native agent primitives are not a supported backend: {p}"
-        );
-        assert!(
-            p.contains("spawn-codex-wave.sh"),
-            "codex prompt must name the actual required routing target for parallel work: {p}"
-        );
-    }
-
-    /// Issue #19 (Phase 3): end-to-end dispatch with worker_type="codex" puts
-    /// the runtime-aware prompt on the spawned child's argv (AND still sets
-    /// LOOM_WORKER=codex via the existing #2 seam). The complementary
-    /// byte-identical Claude argv is covered by
-    /// `dispatch_happy_path_records_entry` (`argv: -p /loom:sweep 42`).
-    #[test]
-    #[serial]
-    fn dispatch_codex_worker_type_emits_shim_prompt_argv() {
         let recorded = std::fs::read_to_string(&record_log).unwrap();
         assert!(
             recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
@@ -4887,12 +4636,6 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(48), None, None, Some("codex"))
-            .expect("dispatch should succeed");
-
-        let needle = "LOOM_WORKER=codex";
-        assert!(
-            wait_for_contents(&record_log, needle, 10000),
             .dispatch(&SweepKind::Issue(47), None, None, Some(""), None)
             .expect("dispatch should succeed");
 
@@ -4903,12 +4646,6 @@ exit 0
         );
         let recorded = std::fs::read_to_string(&record_log).unwrap();
         assert!(
-            recorded.contains(".agents/skills/loom-sweep/SKILL.md"),
-            "codex dispatch must pass the skill-pointing prompt on argv; got: {recorded}"
-        );
-        assert!(
-            !recorded.contains("argv: -p /loom:sweep"),
-            "codex dispatch must NOT pass the Claude slash command; got: {recorded}"
             !recorded.contains("--effort"),
             "empty effort must not emit --effort; got: {recorded}"
         );
@@ -5194,10 +4931,6 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(&SweepKind::Issue(7), None, None, None);
-        assert!(first.is_ok());
-
-        let second = registry.dispatch(&SweepKind::Issue(7), None, None, None);
         let first = registry.dispatch(&SweepKind::Issue(7), None, None, None, None);
         assert!(first.is_ok());
 
@@ -5214,7 +4947,6 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None, None)
             .unwrap();
         assert!(first.was_new);
@@ -5223,7 +4955,6 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None, None)
             .unwrap();
         assert!(!second.was_new);
@@ -5235,7 +4966,6 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None);
         let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None, None);
         assert!(outcome.is_err());
         assert!(outcome
@@ -5251,7 +4981,6 @@ exit 0
 
         // Dispatch and then poke an entry into Exited state directly.
         let outcome = registry
-            .dispatch(&SweepKind::Issue(11), None, None, None)
             .dispatch(&SweepKind::Issue(11), None, None, None, None)
             .unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
@@ -6340,7 +6069,6 @@ exit 0
         let mut registry = SweepRegistry::new(config);
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(123), None, None, None)
             .dispatch(&SweepKind::Issue(123), None, None, None, None)
             .unwrap();
         assert!(outcome.was_new);

@@ -146,26 +146,6 @@ pub fn merge_dir_with_report(
     prefix: &str,
     report: &mut InitReport,
 ) -> io::Result<()> {
-    merge_dir_with_report_filtered(src, dst, prefix, report, &|_| false)
-}
-
-/// Merge directory recursively with reporting, honoring a skip predicate.
-///
-/// Identical to [`merge_dir_with_report`] but consults `skip` for every file.
-/// Skipped source files are neither copied nor reported — the caller takes full
-/// ownership of that path.
-///
-/// See [`copy_dir_with_report_filtered`] for predicate semantics. Used by
-/// `setup_repository_scaffolding` so `.github/labels.yml` can go through the
-/// marker-scoped merge in [`super::labels`] instead of the directory-level
-/// preserve/overwrite rules (issue #68).
-pub fn merge_dir_with_report_filtered(
-    src: &Path,
-    dst: &Path,
-    prefix: &str,
-    report: &mut InitReport,
-    skip: &dyn Fn(&str) -> bool,
-) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
     // Collect files in source for comparison
@@ -199,10 +179,7 @@ pub fn merge_dir_with_report_filtered(
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            merge_dir_with_report_filtered(&src_path, &dst_path, &rel_path, report, skip)?;
-        } else if skip(&rel_path) {
-            // Caller owns this path (e.g. the marker-scoped labels.yml merge) —
-            // neither copy it nor report it.
+            merge_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
         } else if dst_path.exists() {
             // File exists - preserve it (don't overwrite)
             report.preserved.push(rel_path);
@@ -349,25 +326,6 @@ pub fn verify_copied_files(
     report: &mut InitReport,
     template_ctx: Option<&TemplateContext>,
 ) {
-    verify_copied_files_filtered(src, dst, prefix, report, template_ctx, &|_| false);
-}
-
-/// Verify copied files, skipping paths the caller owns by other means.
-///
-/// Byte-equality with `defaults/` is the wrong invariant for files that are
-/// *merged* rather than copied — `.github/labels.yml` legitimately differs from
-/// its source because consumer-authored labels live alongside Loom's marked
-/// block (issue #68). Such paths are skipped here rather than being laundered
-/// through `report.preserved`, which would misreport them in the install
-/// summary.
-pub fn verify_copied_files_filtered(
-    src: &Path,
-    dst: &Path,
-    prefix: &str,
-    report: &mut InitReport,
-    template_ctx: Option<&TemplateContext>,
-    skip: &dyn Fn(&str) -> bool,
-) {
     if !src.exists() || !dst.exists() {
         return;
     }
@@ -386,19 +344,8 @@ pub fn verify_copied_files_filtered(
         let dst_path = dst.join(&file_name);
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
-        if skip(&rel_path) {
-            continue;
-        }
-
         if file_type.is_dir() {
-            verify_copied_files_filtered(
-                &src_path,
-                &dst_path,
-                &rel_path,
-                report,
-                template_ctx,
-                skip,
-            );
+            verify_copied_files(&src_path, &dst_path, &rel_path, report, template_ctx);
         } else if dst_path.exists() {
             // Compare file contents
             let src_contents = fs::read(&src_path);

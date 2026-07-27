@@ -22,13 +22,6 @@ pub enum Request {
         working_dir: Option<String>,
         role: Option<String>,
         instance_number: Option<u32>,
-        /// Worker runtime for this terminal (issue #21, epic #1). Selects the
-        /// per-worker-type environment preparer: `"codex"` uses the Codex
-        /// preparer (`CODEX_HOME`), anything else (including `None`, empty, or
-        /// absent on the wire) defaults to the Claude preparer. `#[serde(default)]`
-        /// keeps pre-#21 clients — which omit the field — compatible.
-        #[serde(default)]
-        worker_type: Option<String>,
     },
     ListTerminals,
     DestroyTerminal {
@@ -151,14 +144,6 @@ pub enum Request {
     /// existing clients compatible), NO `--model` flag is emitted and the
     /// session/CLI default is preserved.
     ///
-    /// `worker_type` (issue #2, Phase 1 of epic #1) optionally selects the
-    /// worker runner for the spawned child (e.g. `"claude"`). When `Some`
-    /// and non-empty, the daemon sets `LOOM_WORKER=<value>` in the spawned
-    /// child's environment so `spawn-worker.sh` resolves to the matching
-    /// runner. When `None` (or absent on the wire — `#[serde(default)]`
-    /// keeps existing clients compatible) or empty, NO `LOOM_WORKER` env var
-    /// is set at all and the spawn layer's own default (`claude`) applies.
-    ///
     /// `effort` (issue #3716) mirrors `model` exactly: it optionally selects
     /// the reasoning-effort level (`low|medium|high|xhigh|max`) for the
     /// spawned child. When `Some` and non-empty, the daemon appends
@@ -184,7 +169,6 @@ pub enum Request {
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
-        worker_type: Option<String>,
         effort: Option<String>,
         #[serde(default)]
         depends_on: Option<u32>,

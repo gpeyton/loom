@@ -9,7 +9,7 @@
 //! 1. Validates the target is a git repository
 //! 2. Detects self-installation (Loom source repo) and runs validation-only mode
 //! 3. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
-//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/, .agents/)
+//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/)
 //! 5. Updates .gitignore with Loom ephemeral patterns
 //! 6. Reports which files were preserved vs added
 //!
@@ -19,12 +19,10 @@
 //! - [`file_ops`]: File copy/merge/clean operations with reporting
 //! - [`templates`]: Template variable substitution
 //! - [`scaffolding`]: Repository scaffolding setup (CLAUDE.md, .claude/, etc.)
-//! - [`labels`]: Marker-scoped merge for the shared `.github/labels.yml` (#68)
 //! - [`post_init`]: Post-initialization operations (manifest, gitignore)
 
 mod file_ops;
 mod git;
-mod labels;
 mod post_init;
 mod retired;
 mod scaffolding;
@@ -36,13 +34,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use file_ops::{
-    clean_managed_dir, copy_dir_with_report, verify_copied_files, verify_copied_files_filtered,
-    TemplateContext,
-};
+use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
 use post_init::{find_overbroad_loom_patterns, generate_manifest, update_gitignore};
 use retired::cleanup_retired_files;
-use scaffolding::{setup_repository_scaffolding, LABELS_YML_REL_PATH};
+use scaffolding::setup_repository_scaffolding;
 
 // Re-export public types and functions
 pub use git::is_loom_source_repo;
@@ -74,10 +69,6 @@ pub struct InitReport {
 }
 
 /// Validation report for self-installation mode
-///
-/// The presence flags below are independent facts about the installed
-/// tree, not a state machine — a bool-per-file is the honest shape.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct ValidationReport {
     /// Role definitions found
@@ -90,17 +81,6 @@ pub struct ValidationReport {
     pub agents_found: Vec<String>,
     /// Whether CLAUDE.md exists
     pub has_claude_md: bool,
-    /// Whether AGENTS.md exists (issue #4, dual-runtime Phase 1). Unlike
-    /// `has_claude_md`, a missing AGENTS.md is NOT recorded as a validation
-    /// issue — it is not mandatory for pre-existing installs that predate
-    /// the dual-runtime work.
-    pub has_agents_md: bool,
-    /// Whether a `.codex/` directory exists (dual-runtime Phase 2, issue
-    /// #11). OPTIONAL like `has_agents_md`: absence is never recorded as a
-    /// validation issue. Only a *present* `.codex/` that is missing its
-    /// `config.toml` is flagged (present-and-valid or absent, never a hard
-    /// requirement).
-    pub has_codex_dir: bool,
     /// Whether .github/labels.yml exists
     pub has_labels_yml: bool,
     /// Issues found during validation
@@ -565,16 +545,10 @@ fn verify_all_copied_files(
     };
     let ctx = Some(&template_ctx);
 
-    for dir_name in &[".claude", ".codex", ".agents", ".github"] {
+    for dir_name in &[".claude", ".codex", ".github"] {
         let src = defaults.join(dir_name);
         let dst = workspace.join(dir_name);
-        // `.github/labels.yml` is merged, not copied: Loom owns only the
-        // `# BEGIN/END LOOM LABELS` block and consumer labels live outside it,
-        // so byte-equality with defaults/ is not the invariant (issue #68).
-        // Its own invariants are enforced by `init::labels`.
-        verify_copied_files_filtered(&src, &dst, dir_name, report, ctx, &|rel| {
-            rel == LABELS_YML_REL_PATH
-        });
+        verify_copied_files(&src, &dst, dir_name, report, ctx);
     }
 }
 
@@ -1549,17 +1523,10 @@ mod tests {
 
     #[test]
     fn test_preserved_files_excluded_from_verification_failures_end_to_end() {
-        // End-to-end: a customized .github/ file preserved by merge_dir_with_report
-        // on reinstall should not appear as a verification failure after init, even
+        // End-to-end: a customized .github/labels.yml (preserved by merge_dir_with_report
+        // on reinstall) should not appear as a verification failure after init, even
         // though its bytes differ from the source defaults. This is the regression case
         // from issue #3218.
-        //
-        // Issue #68 note: `.github/labels.yml` used to be the vehicle for this test.
-        // It is no longer routed through `preserved` — it is now merged through the
-        // marker-scoped path in `init::labels` and skipped by verification outright
-        // (byte-equality with defaults/ is not its invariant). This test now uses a
-        // sibling `.github/` file for the preserved→no-leak path, and separately
-        // asserts labels.yml stays clear of verification_failures.
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let defaults = temp_dir.path().join("defaults");
@@ -1571,22 +1538,18 @@ mod tests {
         fs::write(defaults.join("config.json"), "{}").unwrap();
         fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
 
-        // .github scaffolding defaults with content X
+        // .github scaffolding default with content X
         fs::create_dir_all(defaults.join(".github")).unwrap();
         fs::write(defaults.join(".github").join("labels.yml"), "- name: default\n  color: ffffff")
             .unwrap();
-        fs::write(defaults.join(".github").join("CONFIGURATION.md"), "shipped configuration")
-            .unwrap();
 
-        // Pre-existing customized .github/ files with content Y (different bytes)
+        // Pre-existing customized .github/labels.yml with content Y (different bytes)
         fs::create_dir_all(workspace.join(".github")).unwrap();
         fs::write(
             workspace.join(".github").join("labels.yml"),
             "- name: customized\n  color: 000000\n  description: user edit",
         )
         .unwrap();
-        fs::write(workspace.join(".github").join("CONFIGURATION.md"), "consumer configuration")
-            .unwrap();
 
         let result =
             initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
@@ -1595,10 +1558,8 @@ mod tests {
 
         // The customized file must be reported as preserved
         assert!(
-            report
-                .preserved
-                .contains(&".github/CONFIGURATION.md".to_string()),
-            "preserved should contain .github/CONFIGURATION.md, got: {:?}",
+            report.preserved.contains(&".github/labels.yml".to_string()),
+            "preserved should contain .github/labels.yml, got: {:?}",
             report.preserved
         );
 
@@ -1606,19 +1567,13 @@ mod tests {
         let leaked: Vec<&String> = report
             .verification_failures
             .iter()
-            .filter(|f| f.contains(".github/CONFIGURATION.md") || f.contains(".github/labels.yml"))
+            .filter(|f| f.contains(".github/labels.yml"))
             .collect();
         assert!(
             leaked.is_empty(),
-            "preserved/merged file leaked into verification_failures: {:?}",
+            "preserved file leaked into verification_failures: {:?}",
             report.verification_failures
         );
-
-        // Issue #68: the consumer's label survives, and Loom's shipped label is
-        // now present inside the marker block rather than having been dropped.
-        let labels = fs::read_to_string(workspace.join(".github").join("labels.yml")).unwrap();
-        assert!(labels.contains("- name: customized"), "consumer label lost: {labels}");
-        assert!(labels.contains("- name: default"), "Loom label not applied: {labels}");
     }
 
     #[cfg(unix)]

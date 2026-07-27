@@ -1,18 +1,6 @@
 //! Repository scaffolding setup
 //!
-//! Sets up CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, and .github/
-//! directories.
-//!
-//! `defaults/.codex/` ships as of dual-runtime Phase 2 (epic #1, issue #11):
-//! a project-scoped OpenAI Codex CLI `config.toml` (MCP server entry) plus
-//! thin role prompt shims under `prompts/`. The copy call below remains a
-//! silent no-op for defaults trees without a `.codex/` directory.
-//!
-//! `defaults/.agents/` ships as of Epic #30 Phase 2 (issue #35): the `$loom`
-//! / `$loom-sweep` Codex skills plus `.codex/agents/loom-<role>.toml` custom
-//! agents, replacing `.codex/prompts/*` as the documented Codex onboarding
-//! path during a one-release transition. Same silent-no-op guard as
-//! `.codex/`.
+//! Sets up CLAUDE.md, .claude/, .codex/, and .github/ directories.
 
 use std::collections::HashSet;
 use std::fs;
@@ -22,10 +10,9 @@ use serde_json::Value;
 
 use super::file_ops::{
     copy_dir_with_report, copy_dir_with_report_filtered, force_merge_dir_with_report,
-    force_merge_dir_with_report_filtered, merge_dir_with_report, merge_dir_with_report_filtered,
+    force_merge_dir_with_report_filtered, merge_dir_with_report,
 };
 use super::git::extract_repo_info;
-use super::labels::merge_labels_yml;
 use super::templates::{assert_no_placeholders, substitute_template_variables, LoomMetadata};
 use super::InitReport;
 
@@ -55,15 +42,6 @@ fn is_loom_hook_command(cmd: &str) -> bool {
     cmd.starts_with(LOOM_HOOK_PREFIX) || cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX)
 }
 
-/// Workspace-relative path of the shared label-definition file.
-///
-/// `.github/labels.yml` is deliberately excluded from the directory-level
-/// `.github/` copy and from post-install byte verification: it is a *shared*
-/// file whose Loom-owned portion is delimited by the
-/// `# BEGIN LOOM LABELS` / `# END LOOM LABELS` markers, with consumer-authored
-/// labels living outside them. See [`super::labels`] and issue #68.
-pub const LABELS_YML_REL_PATH: &str = ".github/labels.yml";
-
 /// Loom section markers for CLAUDE.md content preservation
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
 pub const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
@@ -83,32 +61,6 @@ pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
     format!("{}\n{}\n{}", LOOM_SECTION_START, content.trim(), LOOM_SECTION_END)
-}
-
-/// Loom section markers for AGENTS.md content preservation.
-///
-/// Deliberately a **separate** marker pair from [`LOOM_SECTION_START`] /
-/// [`LOOM_SECTION_END`] (not reused) so a repo's CLAUDE.md and AGENTS.md
-/// sections are independently detectable and replaceable. A repo could have
-/// Loom-managed content in one and hand-authored content in the other; using
-/// the same markers for both would let injection logic for one file
-/// accidentally match markers belonging to the other. See issue #4.
-pub const AGENTS_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->";
-pub const AGENTS_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION (AGENTS) -->";
-
-/// The short pointer injected into root AGENTS.md (between section markers).
-///
-/// The full Loom guide (runtime-neutral, with "Claude Code only today"
-/// callouts where behavior isn't yet portable) is written to
-/// `.loom/AGENTS.md` in the target repo. OpenAI Codex CLI (and other
-/// AGENTS.md-aware runtimes) auto-discover `AGENTS.md` via ancestor directory
-/// traversal, the direct analogue of Claude Code's `CLAUDE.md` discovery.
-pub const AGENTS_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code and OpenAI Codex). See `.loom/AGENTS.md` for the full guide (roles, labels, worktrees, configuration).";
-
-/// Wrap AGENTS.md content in its own section markers (kept separate from
-/// [`wrap_loom_content`]/CLAUDE.md's markers — see [`AGENTS_SECTION_START`]).
-pub fn wrap_agents_content(content: &str) -> String {
-    format!("{}\n{}\n{}", AGENTS_SECTION_START, content.trim(), AGENTS_SECTION_END)
 }
 
 /// Telltale phrases that identify a root `CLAUDE.md` as Loom-managed legacy content.
@@ -359,29 +311,7 @@ fn merge_hooks(
     result
 }
 
-/// Normalize a hook command string for semantic-duplicate comparison.
-///
-/// Loom-generated hook commands are a single `${CLAUDE_PROJECT_DIR}`-prefixed
-/// path. Some installer generations wrapped that path in double quotes (to
-/// survive a project path containing spaces); the current template emits it
-/// unquoted. Byte-for-byte comparison treats
-/// `"${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh"` and
-/// `${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh` as different commands, so a
-/// reinstall over a quoted-form install appended a second, functionally
-/// identical hook entry on every run (issue #49 finding 5). Stripping quote
-/// characters and collapsing whitespace before comparing treats them as the
-/// same hook without discarding either side's original on-disk formatting.
-fn normalize_hook_command(cmd: &str) -> String {
-    cmd.chars()
-        .filter(|c| *c != '"' && *c != '\'')
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Merge hook commands within a single matcher entry, deduplicating by
-/// semantically-normalized command (see [`normalize_hook_command`]).
+/// Merge hook commands within a single matcher entry, deduplicating by command path.
 ///
 /// Also strips legacy Loom hook entries (bare `.loom/hooks/...` paths from pre-3265
 /// installs) so that re-running install does not leave duplicate hook invocations
@@ -406,21 +336,19 @@ fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
         !cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX) || cmd.starts_with(LOOM_HOOK_PREFIX)
     });
 
-    // Collect existing command paths for dedup, normalized so quoted and
-    // unquoted forms of the same command collide.
+    // Collect existing command paths for dedup
     let existing_commands: std::collections::HashSet<String> = existing_hooks
         .iter()
-        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
-        .map(normalize_hook_command)
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
         .collect();
 
-    // Add Loom hooks that aren't already present (by normalized command)
+    // Add Loom hooks that aren't already present
     for loom_hook in loom_hooks {
         let cmd = loom_hook
             .get("command")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if !existing_commands.contains(&normalize_hook_command(cmd)) {
+        if !existing_commands.contains(cmd) {
             existing_hooks.push(loom_hook.clone());
         }
     }
@@ -559,11 +487,11 @@ pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
 
 /// Setup repository scaffolding files
 ///
-/// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
+/// Copies CLAUDE.md, .claude/, .codex/, and .github/ to the workspace.
 /// - Fresh install: Copies all files from defaults
 /// - Reinstall without force (merge mode): Adds new files, preserves ALL existing files
 /// - Reinstall with force (force-merge mode): Updates default files, preserves custom files
-/// - Template variables: Substitutes variables in CLAUDE.md / AGENTS.md
+/// - Template variables: Substitutes variables in CLAUDE.md
 ///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 ///
@@ -574,12 +502,6 @@ pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
 /// - If existing root CLAUDE.md has no markers, Loom pointer is appended at the end
 /// - All existing root CLAUDE.md content is preserved exactly as-is
 /// - Claude Code auto-discovers `.loom/CLAUDE.md` in `.loom/worktrees/issue-N/` via ancestor dirs
-///
-/// **AGENTS.md Handling** (issue #4, dual-runtime Phase 1): identical mechanics to CLAUDE.md
-/// above (full guide in `.loom/AGENTS.md`, short pointer in root `AGENTS.md`), but with its own
-/// `AGENTS_SECTION_START`/`AGENTS_SECTION_END` marker pair so the two files' Loom-managed
-/// sections never cross-contaminate. OpenAI Codex CLI (and other AGENTS.md-aware runtimes)
-/// auto-discover root `AGENTS.md` the same way Claude Code discovers `CLAUDE.md`.
 ///
 /// Custom files (files in workspace that don't exist in defaults) are always preserved.
 #[allow(clippy::too_many_lines)]
@@ -622,30 +544,6 @@ pub fn setup_repository_scaffolding(
             }
             Ok(())
         };
-
-    // Same as `copy_directory`, but honors a skip predicate so a single file
-    // inside an otherwise directory-copied tree can be owned by bespoke merge
-    // logic. Used for `.github/labels.yml` (issue #68).
-    let copy_directory_filtered = |src: &Path,
-                                   dst: &Path,
-                                   name: &str,
-                                   report: &mut InitReport,
-                                   skip: &dyn Fn(&str) -> bool|
-     -> Result<(), String> {
-        if src.exists() {
-            if !dst.exists() {
-                copy_dir_with_report_filtered(src, dst, name, report, skip)
-                    .map_err(|e| format!("Failed to copy {name}: {e}"))?;
-            } else if force {
-                force_merge_dir_with_report_filtered(src, dst, name, report, skip)
-                    .map_err(|e| format!("Failed to force-merge {name}: {e}"))?;
-            } else {
-                merge_dir_with_report_filtered(src, dst, name, report, skip)
-                    .map_err(|e| format!("Failed to merge {name}: {e}"))?;
-            }
-        }
-        Ok(())
-    };
 
     // Handle Loom CLAUDE.md content:
     //
@@ -793,107 +691,6 @@ pub fn setup_repository_scaffolding(
         }
     }
 
-    // Handle Loom AGENTS.md content (issue #4 — dual-runtime Phase 1).
-    //
-    // Mirrors the CLAUDE.md handling above exactly, but with its own marker
-    // pair (AGENTS_SECTION_START/END) so the two files' Loom-managed sections
-    // are independently detectable. AGENTS.md has no historical "legacy
-    // full-guide-in-root" layout to migrate away from (unlike CLAUDE.md's
-    // pre-#3000 layout) — it was only ever removed (#2026/#2034) and is being
-    // reintroduced fresh here, so no `is_legacy_loom_managed_root`-style
-    // heuristic is needed for it.
-    //
-    // 1. Write full Loom guide to `<workspace>/.loom/AGENTS.md` (template substituted)
-    // 2. Inject short pointer into root `AGENTS.md` (between AGENTS section markers)
-    let agents_md_src = defaults_path.join(".loom").join("AGENTS.md");
-
-    if agents_md_src.exists() {
-        let agents_content = fs::read_to_string(&agents_md_src)
-            .map_err(|e| format!("Failed to read AGENTS.md template: {e}"))?;
-
-        let agents_substituted = substitute_template_variables(
-            &agents_content,
-            repo_owner.as_deref(),
-            repo_name.as_deref(),
-            &loom_metadata,
-        );
-
-        // --- Step 1: Write full guide to .loom/AGENTS.md ---
-        let loom_dir = workspace_path.join(".loom");
-        if !loom_dir.exists() {
-            fs::create_dir_all(&loom_dir)
-                .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
-        }
-        let loom_agents_md_dst = loom_dir.join("AGENTS.md");
-        let loom_agents_md_existed = loom_agents_md_dst.exists();
-        fs::write(&loom_agents_md_dst, &agents_substituted)
-            .map_err(|e| format!("Failed to write .loom/AGENTS.md: {e}"))?;
-        if loom_agents_md_existed {
-            report.updated.push(".loom/AGENTS.md".to_string());
-        } else {
-            report.added.push(".loom/AGENTS.md".to_string());
-        }
-
-        // --- Step 2: Inject short pointer into root AGENTS.md ---
-        let agents_md_dst = workspace_path.join("AGENTS.md");
-        let existed = agents_md_dst.exists();
-
-        let wrapped_agents_pointer = wrap_agents_content(AGENTS_ROOT_POINTER);
-
-        let final_agents_content = if existed {
-            let existing_content = fs::read_to_string(&agents_md_dst)
-                .map_err(|e| format!("Failed to read existing AGENTS.md: {e}"))?;
-
-            if existing_content.contains(AGENTS_SECTION_START) {
-                // Replace just the Loom section with the pointer, preserve everything else.
-                if let (Some(start_idx), Some(end_idx)) = (
-                    existing_content.find(AGENTS_SECTION_START),
-                    existing_content.find(AGENTS_SECTION_END),
-                ) {
-                    let before = &existing_content[..start_idx];
-                    let after_end = end_idx + AGENTS_SECTION_END.len();
-                    let after = if after_end < existing_content.len() {
-                        &existing_content[after_end..]
-                    } else {
-                        ""
-                    };
-                    format!("{}{}{}", before.trim_end(), wrapped_agents_pointer, after)
-                } else {
-                    // Malformed markers - append pointer at end.
-                    format!("{}\n\n{}", existing_content.trim(), wrapped_agents_pointer)
-                }
-            } else {
-                // No markers — preserve genuine user-authored content, append at end.
-                format!("{}\n\n{}", existing_content.trim(), wrapped_agents_pointer)
-            }
-        } else {
-            // New file - just use wrapped pointer.
-            wrapped_agents_pointer
-        };
-
-        // Defense-in-depth: refuse to write a root AGENTS.md that still
-        // contains unsubstituted template placeholders (mirrors the
-        // CLAUDE.md guard above; see issue #3325 for the original rationale).
-        assert_no_placeholders(&final_agents_content, "AGENTS.md")?;
-
-        if existed {
-            let current = fs::read_to_string(&agents_md_dst).unwrap_or_default();
-            if final_agents_content != current {
-                fs::write(&agents_md_dst, &final_agents_content)
-                    .map_err(|e| format!("Failed to write AGENTS.md: {e}"))?;
-                if !report.preserved.contains(&"AGENTS.md".to_string()) {
-                    report.updated.push("AGENTS.md".to_string());
-                }
-            } else if !report.preserved.contains(&"AGENTS.md".to_string()) {
-                report.preserved.push("AGENTS.md".to_string());
-            }
-        } else {
-            fs::write(&agents_md_dst, &final_agents_content)
-                .map_err(|e| format!("Failed to write AGENTS.md: {e}"))?;
-            report.added.push("AGENTS.md".to_string());
-        }
-    }
-
     // Copy .claude/ directory - always update default commands, preserve custom commands
     // - Fresh install: copy all from defaults
     // - Reinstall: always force-merge (update defaults, preserve custom)
@@ -957,11 +754,7 @@ pub fn setup_repository_scaffolding(
         }
     }
 
-    // Copy .codex/ directory (OpenAI Codex CLI config.toml + prompt shims;
-    // ships as of dual-runtime Phase 2 — epic #1, issue #11). The
-    // `copy_directory` closure's `if src.exists()` guard keeps this a
-    // silent no-op for defaults trees without a `.codex/` directory (see
-    // test_codex_directory_copy_is_silent_noop_when_absent).
+    // Copy .codex/ directory
     copy_directory(
         &defaults_path.join(".codex"),
         &workspace_path.join(".codex"),
@@ -969,62 +762,13 @@ pub fn setup_repository_scaffolding(
         report,
     )?;
 
-    // Copy .agents/ directory (Codex skills — `$loom` / `$loom-sweep`,
-    // replacing `.codex/prompts/*` as the documented Codex onboarding path;
-    // Epic #30 Phase 2, issue #35). Mirrors the `.codex/` copy above — the
-    // `copy_directory` closure's `if src.exists()` guard keeps this a
-    // silent no-op for defaults trees without an `.agents/` directory.
+    // Copy .github/ directory
     copy_directory(
-        &defaults_path.join(".agents"),
-        &workspace_path.join(".agents"),
-        ".agents",
-        report,
-    )?;
-
-    // Copy .github/ directory.
-    //
-    // `.github/labels.yml` is excluded from the directory copy and merged
-    // separately below. Both directory strategies are wrong for it:
-    //   - force-merge (`--force`, what Quick Install's reinstall always passes)
-    //     overwrote it wholesale, silently deleting consumer-authored labels;
-    //   - plain merge preserved it forever once it existed, so a repo that had
-    //     ever touched the file stopped receiving Loom's own label updates.
-    // See issue #68 and `super::labels`.
-    let labels_dst = workspace_path.join(LABELS_YML_REL_PATH);
-    // Snapshot BEFORE the copy — force-merge would otherwise destroy the
-    // consumer content we need to merge against.
-    let existing_labels = fs::read_to_string(&labels_dst).ok();
-
-    copy_directory_filtered(
         &defaults_path.join(".github"),
         &workspace_path.join(".github"),
         ".github",
         report,
-        &|rel| rel == LABELS_YML_REL_PATH,
     )?;
-
-    // Marker-scoped merge for .github/labels.yml (issue #68).
-    let labels_src = defaults_path.join(LABELS_YML_REL_PATH);
-    if labels_src.exists() {
-        let shipped = fs::read_to_string(&labels_src)
-            .map_err(|e| format!("Failed to read {LABELS_YML_REL_PATH} from defaults: {e}"))?;
-        let merged = merge_labels_yml(&shipped, existing_labels.as_deref());
-
-        if let Some(parent) = labels_dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create .github directory: {e}"))?;
-        }
-        fs::write(&labels_dst, &merged)
-            .map_err(|e| format!("Failed to write {LABELS_YML_REL_PATH}: {e}"))?;
-
-        match existing_labels {
-            None => report.added.push(LABELS_YML_REL_PATH.to_string()),
-            Some(previous) if previous != merged => {
-                report.updated.push(LABELS_YML_REL_PATH.to_string());
-            }
-            Some(_) => report.preserved.push(LABELS_YML_REL_PATH.to_string()),
-        }
-    }
 
     // Note: The label-external-issues.yml workflow is no longer installed by default.
     // It generated spammy "No jobs were run" emails in single-contributor repos.
@@ -1783,489 +1527,6 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         assert!(report.updated.contains(&".loom/CLAUDE.md".to_string()));
     }
 
-    // =========================================================================
-    // AGENTS.md tests (issue #4, dual-runtime Phase 1) — mirror the CLAUDE.md
-    // tests above, but exercised against `defaults/.loom/AGENTS.md` and the
-    // AGENTS-specific marker pair. No legacy-layout heuristic tests are needed
-    // here (unlike CLAUDE.md's pre-#3000 migration tests below) since AGENTS.md
-    // has no historical full-guide-in-root layout to migrate away from.
-    // =========================================================================
-
-    /// Helper to create a standard test setup with an AGENTS.md template in defaults.
-    fn setup_test_with_agents_template(
-        temp_dir: &TempDir,
-        template_content: &str,
-    ) -> (std::path::PathBuf, std::path::PathBuf) {
-        let workspace = temp_dir.path().to_path_buf();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(defaults.join(".loom").join("AGENTS.md"), template_content).unwrap();
-
-        (workspace, defaults)
-    }
-
-    #[test]
-    fn test_loom_agents_md_written_to_loom_dir() {
-        // Verifies full content goes to .loom/AGENTS.md on fresh install
-        let temp_dir = TempDir::new().unwrap();
-        let (workspace, defaults) = setup_test_with_agents_template(
-            &temp_dir,
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content here.",
-        );
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
-
-        assert!(workspace.join(".loom").join("AGENTS.md").exists());
-        let loom_agents_content =
-            fs::read_to_string(workspace.join(".loom").join("AGENTS.md")).unwrap();
-        assert!(loom_agents_content.contains("Full guide content here"));
-        assert!(report.added.contains(&".loom/AGENTS.md".to_string()));
-    }
-
-    #[test]
-    fn test_root_agents_md_contains_only_pointer() {
-        // Verifies root AGENTS.md has short pointer, not full guide, on fresh install
-        let temp_dir = TempDir::new().unwrap();
-        let (workspace, defaults) = setup_test_with_agents_template(
-            &temp_dir,
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content here.",
-        );
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        assert!(!workspace.join("AGENTS.md").exists());
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
-
-        assert!(workspace.join("AGENTS.md").exists());
-        let root_content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
-        assert!(root_content.contains(AGENTS_SECTION_START));
-        assert!(root_content.contains(AGENTS_SECTION_END));
-        assert!(root_content.contains(AGENTS_ROOT_POINTER));
-        // Full guide content must NOT be in root AGENTS.md
-        assert!(!root_content.contains("Full guide content here"));
-        assert!(report.added.contains(&"AGENTS.md".to_string()));
-
-        // AGENTS.md markers must be independent from CLAUDE.md's markers —
-        // the root AGENTS.md must not contain the CLAUDE.md marker pair.
-        assert!(!root_content.contains(LOOM_SECTION_START));
-        assert!(!root_content.contains(LOOM_SECTION_END));
-    }
-
-    #[test]
-    fn test_agents_md_preservation_new_install() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(
-            defaults.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nLoom content here.",
-        )
-        .unwrap();
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        assert!(!workspace.join("AGENTS.md").exists());
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
-
-        assert!(workspace.join("AGENTS.md").exists());
-        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
-        assert!(content.contains(AGENTS_SECTION_START));
-        assert!(content.contains(AGENTS_SECTION_END));
-        assert!(content.contains(AGENTS_ROOT_POINTER));
-        assert!(!content.contains("Loom content here"));
-        assert!(report.added.contains(&"AGENTS.md".to_string()));
-
-        assert!(workspace.join(".loom").join("AGENTS.md").exists());
-        let loom_content = fs::read_to_string(workspace.join(".loom").join("AGENTS.md")).unwrap();
-        assert!(loom_content.contains("Loom content here"));
-    }
-
-    #[test]
-    fn test_agents_md_preservation_existing_project_content() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(
-            defaults.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nNew Loom content.",
-        )
-        .unwrap();
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        // Existing AGENTS.md with project-specific content (no markers)
-        fs::write(
-            workspace.join("AGENTS.md"),
-            r"# My Awesome Project (Codex instructions)
-
-This project does amazing things with Rust.
-
-## Getting Started
-
-Run `cargo run` to start.",
-        )
-        .unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
-
-        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
-        assert!(content.contains("My Awesome Project (Codex instructions)"));
-        assert!(content.contains("amazing things with Rust"));
-        assert!(content.contains(AGENTS_SECTION_START));
-        assert!(content.contains(AGENTS_SECTION_END));
-        assert!(content.contains(AGENTS_ROOT_POINTER));
-        assert!(!content.contains("New Loom content"));
-
-        let project_pos = content
-            .find("My Awesome Project (Codex instructions)")
-            .unwrap();
-        let loom_pos = content.find(AGENTS_SECTION_START).unwrap();
-        assert!(project_pos < loom_pos);
-
-        assert_eq!(
-            content
-                .matches("My Awesome Project (Codex instructions)")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_agents_md_append_when_no_markers() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(
-            defaults.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nLoom content here.",
-        )
-        .unwrap();
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        // Existing AGENTS.md WITHOUT markers
-        fs::write(
-            workspace.join("AGENTS.md"),
-            r"# Lean Genius Project
-
-Formal mathematics in Lean 4.
-
-## Docker Build Safety
-
-WARNING: Never run `lake build` inside Docker - causes memory corruption.",
-        )
-        .unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
-
-        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
-        assert!(content.contains("Lean Genius Project"));
-        assert!(content.contains("Docker Build Safety"));
-
-        assert!(content.contains(AGENTS_SECTION_START));
-        assert!(content.contains(AGENTS_SECTION_END));
-        assert!(content.contains(AGENTS_ROOT_POINTER));
-        assert!(!content.contains("Loom content here"));
-
-        let project_pos = content.find("Lean Genius Project").unwrap();
-        let loom_pos = content.find(AGENTS_SECTION_START).unwrap();
-        assert!(project_pos < loom_pos);
-
-        assert_eq!(content.matches("Lean Genius Project").count(), 1);
-    }
-
-    #[test]
-    fn test_agents_md_preservation_update_loom_section_only() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(
-            defaults.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nUPDATED Loom content v2.0.",
-        )
-        .unwrap();
-
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-
-        // Existing AGENTS.md with markers already present (simulating a prior install)
-        let existing = format!(
-            "# My Project\n\nProject docs here.\n\n{AGENTS_SECTION_START}\nOld pointer text.\n{AGENTS_SECTION_END}"
-        );
-        fs::write(workspace.join("AGENTS.md"), existing).unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
-
-        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
-        assert!(content.contains("My Project"));
-        assert!(content.contains("Project docs here"));
-        assert!(!content.contains("Old pointer text"));
-        assert!(!content.contains("UPDATED Loom content v2.0"));
-        assert!(content.contains(AGENTS_ROOT_POINTER));
-
-        assert_eq!(
-            content.matches(AGENTS_SECTION_START).count(),
-            1,
-            "Should have exactly one AGENTS start marker"
-        );
-        assert_eq!(
-            content.matches(AGENTS_SECTION_END).count(),
-            1,
-            "Should have exactly one AGENTS end marker"
-        );
-
-        let loom_content = fs::read_to_string(workspace.join(".loom").join("AGENTS.md")).unwrap();
-        assert!(loom_content.contains("UPDATED Loom content v2.0"));
-    }
-
-    #[test]
-    fn test_loom_agents_md_updated_on_reinstall() {
-        // Verifies .loom/AGENTS.md is overwritten on reinstall with new template content
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".loom")).unwrap();
-        fs::write(
-            defaults.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration (AGENTS.md)\n\nUpdated content v2.",
-        )
-        .unwrap();
-
-        // Pre-existing .loom/AGENTS.md from previous install
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-        fs::write(
-            workspace.join(".loom").join("AGENTS.md"),
-            "# Loom Orchestration (AGENTS.md)\n\nOld content v1.",
-        )
-        .unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
-
-        let loom_content = fs::read_to_string(workspace.join(".loom").join("AGENTS.md")).unwrap();
-        assert!(loom_content.contains("Updated content v2"));
-        assert!(!loom_content.contains("Old content v1"));
-        assert!(report.updated.contains(&".loom/AGENTS.md".to_string()));
-    }
-
-    #[test]
-    fn test_codex_directory_copy_is_silent_noop_when_absent() {
-        // Issue #4: even though `defaults/.codex/` now ships (issue #11),
-        // scaffolding must stay a silent no-op for defaults trees WITHOUT a
-        // `.codex/` directory. Verify that running scaffolding setup with no
-        // `defaults/.codex/` present does not error, does not create
-        // `<workspace>/.codex/`, and does not add any report entries
-        // referencing `.codex`.
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(&defaults).unwrap();
-        // Deliberately do NOT create defaults/.codex/.
-        assert!(!defaults.join(".codex").exists());
-
-        let mut report = InitReport::default();
-        let result = setup_repository_scaffolding(workspace, &defaults, false, &mut report);
-        assert!(result.is_ok(), ".codex/ absence must not error: {result:?}");
-
-        assert!(
-            !workspace.join(".codex").exists(),
-            ".codex/ must not be created in the workspace when defaults/.codex/ is absent"
-        );
-        assert!(
-            !report
-                .added
-                .iter()
-                .chain(report.updated.iter())
-                .chain(report.preserved.iter())
-                .any(|p| p.contains(".codex")),
-            "no report entries should reference .codex when the source directory is absent"
-        );
-    }
-
-    #[test]
-    fn test_codex_directory_copied_when_present() {
-        // Issue #11 (dual-runtime Phase 2): now that `defaults/.codex/`
-        // ships (config.toml + prompt shims), the scaffolding copy path must
-        // materialize it in the workspace — complementing the
-        // absent-is-noop test above (#8).
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".codex").join("prompts")).unwrap();
-        fs::write(defaults.join(".codex").join("config.toml"), "# codex config").unwrap();
-        fs::write(defaults.join(".codex").join("prompts").join("builder.md"), "builder shim")
-            .unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
-
-        // Fresh install: both files copied verbatim and reported as added.
-        assert_eq!(
-            fs::read_to_string(workspace.join(".codex").join("config.toml")).unwrap(),
-            "# codex config"
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.join(".codex").join("prompts").join("builder.md"))
-                .unwrap(),
-            "builder shim"
-        );
-        assert!(report.added.contains(&".codex/config.toml".to_string()));
-        assert!(report
-            .added
-            .contains(&".codex/prompts/builder.md".to_string()));
-
-        // Reinstall without force (merge mode): existing files preserved,
-        // so re-install is idempotent and never clobbers a user-customized
-        // .codex/config.toml.
-        fs::write(workspace.join(".codex").join("config.toml"), "user-customized").unwrap();
-        let mut report2 = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report2).unwrap();
-        assert_eq!(
-            fs::read_to_string(workspace.join(".codex").join("config.toml")).unwrap(),
-            "user-customized",
-            "merge-mode reinstall must preserve an existing .codex/config.toml"
-        );
-        assert!(report2
-            .preserved
-            .contains(&".codex/config.toml".to_string()));
-    }
-
-    #[test]
-    fn test_agents_directory_copy_is_silent_noop_when_absent() {
-        // Issue #35 (Epic #30 Phase 2): mirrors
-        // test_codex_directory_copy_is_silent_noop_when_absent — scaffolding
-        // must stay a silent no-op for defaults trees WITHOUT an `.agents/`
-        // directory (older Loom versions, or a defaults tree that hasn't
-        // been upgraded yet).
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(&defaults).unwrap();
-        // Deliberately do NOT create defaults/.agents/.
-        assert!(!defaults.join(".agents").exists());
-
-        let mut report = InitReport::default();
-        let result = setup_repository_scaffolding(workspace, &defaults, false, &mut report);
-        assert!(result.is_ok(), ".agents/ absence must not error: {result:?}");
-
-        assert!(
-            !workspace.join(".agents").exists(),
-            ".agents/ must not be created in the workspace when defaults/.agents/ is absent"
-        );
-        assert!(
-            !report
-                .added
-                .iter()
-                .chain(report.updated.iter())
-                .chain(report.preserved.iter())
-                .any(|p| p.contains(".agents")),
-            "no report entries should reference .agents when the source directory is absent"
-        );
-    }
-
-    #[test]
-    fn test_agents_directory_copied_when_present() {
-        // Issue #35 (Epic #30 Phase 2): the `$loom` / `$loom-sweep` Codex
-        // skills under `defaults/.agents/skills/` must be materialized in
-        // the workspace on install — complementing the absent-is-noop test
-        // above, mirroring test_codex_directory_copied_when_present.
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = temp_dir.path();
-        let defaults = temp_dir.path().join("defaults");
-
-        fs::create_dir(workspace.join(".git")).unwrap();
-        fs::create_dir_all(defaults.join(".agents").join("skills").join("loom")).unwrap();
-        fs::write(
-            defaults
-                .join(".agents")
-                .join("skills")
-                .join("loom")
-                .join("SKILL.md"),
-            "loom skill",
-        )
-        .unwrap();
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
-
-        // Fresh install: the skill file is copied verbatim and reported as added.
-        assert_eq!(
-            fs::read_to_string(
-                workspace
-                    .join(".agents")
-                    .join("skills")
-                    .join("loom")
-                    .join("SKILL.md")
-            )
-            .unwrap(),
-            "loom skill"
-        );
-        assert!(report
-            .added
-            .contains(&".agents/skills/loom/SKILL.md".to_string()));
-
-        // Reinstall without force (merge mode): existing files preserved,
-        // so re-install is idempotent and never clobbers a user-customized
-        // skill.
-        fs::write(
-            workspace
-                .join(".agents")
-                .join("skills")
-                .join("loom")
-                .join("SKILL.md"),
-            "user-customized",
-        )
-        .unwrap();
-        let mut report2 = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, false, &mut report2).unwrap();
-        assert_eq!(
-            fs::read_to_string(
-                workspace
-                    .join(".agents")
-                    .join("skills")
-                    .join("loom")
-                    .join("SKILL.md")
-            )
-            .unwrap(),
-            "user-customized",
-            "merge-mode reinstall must preserve a user-customized .agents/skills/loom/SKILL.md"
-        );
-        assert!(report2
-            .preserved
-            .contains(&".agents/skills/loom/SKILL.md".to_string()));
-    }
-
     #[test]
     fn test_claude_commands_always_updated_on_reinstall() {
         // .claude/ commands should always be force-merged on reinstall (without --force flag)
@@ -2667,64 +1928,6 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
             .map(|h| h["command"].as_str().unwrap())
             .collect();
         assert!(commands.contains(&"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"));
-        assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
-    }
-
-    #[test]
-    fn test_merge_settings_deduplicates_hooks_with_quoted_paths() {
-        // Issue #49 finding 5: a prior installer generation wrote the
-        // Loom hook command wrapped in double quotes (to survive a project
-        // path containing spaces). Reinstalling with the current, unquoted
-        // template must recognize this as the SAME hook and not append a
-        // second, functionally identical entry.
-        let existing: serde_json::Value = serde_json::from_str(
-            r#"{
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [
-                        {"type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""},
-                        {"type": "command", "command": ".claude/hooks/custom-bash-guard.sh"}
-                    ]
-                }]
-            }
-        }"#,
-        )
-        .unwrap();
-
-        let loom_defaults: serde_json::Value = serde_json::from_str(
-            r#"{
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
-                }]
-            }
-        }"#,
-        )
-        .unwrap();
-
-        let merged = merge_settings_json(&existing, &loom_defaults);
-
-        let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
-        let hooks_arr = bash_hooks.as_array().unwrap();
-
-        // Exactly 2 entries: the original quoted Loom hook (preserved as-is,
-        // not rewritten) + the custom project hook. No unquoted duplicate.
-        assert_eq!(
-            hooks_arr.len(),
-            2,
-            "Should not append an unquoted duplicate of an existing quoted Loom hook: {hooks_arr:?}"
-        );
-
-        let commands: Vec<&str> = hooks_arr
-            .iter()
-            .map(|h| h["command"].as_str().unwrap())
-            .collect();
-        assert!(
-            commands.contains(&"\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""),
-            "Original quoted entry should be preserved unchanged"
-        );
         assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
     }
 
@@ -3436,189 +2639,5 @@ Run `cargo run` to start.";
         // must pass.
         let clean = wrap_loom_content(LOOM_ROOT_POINTER);
         assert!(assert_no_placeholders(&clean, "CLAUDE.md").is_ok());
-    }
-
-    // ------------------------------------------------------------------
-    // .github/labels.yml marker-scoped merge (issue #68)
-    // ------------------------------------------------------------------
-
-    const SHIPPED_LABELS: &str = "\
-# BEGIN LOOM LABELS
-# Loom Workflow Labels
-
-# Core Workflow States
-- name: loom:issue
-  description: Approved for work
-  color: \"3B82F6\"
-# END LOOM LABELS
-";
-
-    /// Build a workspace + defaults pair carrying a `.github/labels.yml`, and
-    /// optionally seed a pre-existing consumer file at the workspace path.
-    fn setup_labels_test(
-        temp_dir: &TempDir,
-        existing: Option<&str>,
-    ) -> (std::path::PathBuf, std::path::PathBuf) {
-        let (workspace, defaults) =
-            setup_test_with_claude_template(temp_dir, "# Loom Orchestration - Repository Guide");
-        fs::create_dir_all(workspace.join(".loom")).unwrap();
-        fs::create_dir_all(defaults.join(".github")).unwrap();
-        fs::write(defaults.join(LABELS_YML_REL_PATH), SHIPPED_LABELS).unwrap();
-        if let Some(content) = existing {
-            fs::create_dir_all(workspace.join(".github")).unwrap();
-            fs::write(workspace.join(LABELS_YML_REL_PATH), content).unwrap();
-        }
-        (workspace, defaults)
-    }
-
-    fn read_labels(workspace: &Path) -> String {
-        fs::read_to_string(workspace.join(LABELS_YML_REL_PATH)).unwrap()
-    }
-
-    /// The exact pre-#68 shape: a markerless labels.yml with consumer labels
-    /// appended below Loom's block. This is the file that lost 59 lines.
-    const MARKERLESS_WITH_CONSUMER_LABELS: &str = "\
-# Loom Workflow Labels
-
-# Core Workflow States
-- name: loom:issue
-  description: Approved for work
-  color: \"3B82F6\"
-
-# ---- project labels ----
-- name: feedback:static
-  description: Static feedback label
-  color: \"AABBCC\"
-";
-
-    #[test]
-    fn test_labels_yml_fresh_install_ships_marked_block() {
-        let temp_dir = TempDir::new().unwrap();
-        let (workspace, defaults) = setup_labels_test(&temp_dir, None);
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
-
-        let content = read_labels(&workspace);
-        assert_eq!(content, SHIPPED_LABELS);
-        assert!(report.added.contains(&LABELS_YML_REL_PATH.to_string()));
-    }
-
-    #[test]
-    fn test_labels_yml_force_reinstall_preserves_consumer_labels() {
-        // The failure mode Quick Install hits by default: `loom-daemon init
-        // --force` used to overwrite .github/labels.yml wholesale, deleting
-        // every consumer-authored label. This is the regression guard.
-        let temp_dir = TempDir::new().unwrap();
-        let existing = "\
-# BEGIN LOOM LABELS
-- name: loom:issue
-  description: STALE
-  color: \"000000\"
-# END LOOM LABELS
-
-# ---- project labels ----
-- name: feedback:static
-  description: Static feedback label
-  color: \"AABBCC\"
-";
-        let (workspace, defaults) = setup_labels_test(&temp_dir, Some(existing));
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
-
-        let content = read_labels(&workspace);
-        assert!(
-            content.contains("- name: feedback:static"),
-            "--force destroyed consumer labels: {content}"
-        );
-        assert!(content.contains("# ---- project labels ----"));
-        // Loom's own block was still updated (not frozen).
-        assert!(content.contains("description: Approved for work"), "{content}");
-        assert!(!content.contains("STALE"), "{content}");
-        assert!(report.updated.contains(&LABELS_YML_REL_PATH.to_string()));
-    }
-
-    #[test]
-    fn test_labels_yml_non_force_reinstall_still_applies_loom_updates() {
-        // The mirror-image failure mode: plain (non-force) merge preserved an
-        // existing labels.yml forever, so a customized file never received
-        // Loom's own label updates.
-        let temp_dir = TempDir::new().unwrap();
-        let existing = "\
-# BEGIN LOOM LABELS
-- name: loom:issue
-  description: STALE
-  color: \"000000\"
-# END LOOM LABELS
-
-- name: feedback:static
-  description: Static feedback label
-  color: \"AABBCC\"
-";
-        let (workspace, defaults) = setup_labels_test(&temp_dir, Some(existing));
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
-
-        let content = read_labels(&workspace);
-        assert!(
-            content.contains("description: Approved for work"),
-            "non-force reinstall froze Loom's own labels: {content}"
-        );
-        assert!(content.contains("- name: feedback:static"));
-    }
-
-    #[test]
-    fn test_labels_yml_markerless_migration_adds_markers_without_data_loss() {
-        // Highest-risk case: every repo installed on 0.10.x has a markerless
-        // labels.yml. The first post-fix upgrade must add markers around Loom's
-        // labels while keeping consumer labels and producing no duplicates.
-        for force in [false, true] {
-            let temp_dir = TempDir::new().unwrap();
-            let (workspace, defaults) =
-                setup_labels_test(&temp_dir, Some(MARKERLESS_WITH_CONSUMER_LABELS));
-
-            let mut report = InitReport::default();
-            setup_repository_scaffolding(&workspace, &defaults, force, &mut report).unwrap();
-
-            let content = read_labels(&workspace);
-            assert!(
-                content.contains(super::super::labels::LABELS_SECTION_START),
-                "force={force}: markers not added: {content}"
-            );
-            assert!(content.contains(super::super::labels::LABELS_SECTION_END));
-            assert!(
-                content.contains("- name: feedback:static"),
-                "force={force}: consumer label destroyed: {content}"
-            );
-            assert!(content.contains("# ---- project labels ----"));
-            assert_eq!(
-                super::super::labels::duplicate_label_names(&content),
-                Vec::<String>::new(),
-                "force={force}: migration produced duplicate label names: {content}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_labels_yml_repeated_upgrades_are_idempotent() {
-        let temp_dir = TempDir::new().unwrap();
-        let (workspace, defaults) =
-            setup_labels_test(&temp_dir, Some(MARKERLESS_WITH_CONSUMER_LABELS));
-
-        let mut report = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
-        let first = read_labels(&workspace);
-
-        let mut report2 = InitReport::default();
-        setup_repository_scaffolding(&workspace, &defaults, true, &mut report2).unwrap();
-        let second = read_labels(&workspace);
-
-        assert_eq!(first, second, "second upgrade produced a diff");
-        assert!(
-            report2.preserved.contains(&LABELS_YML_REL_PATH.to_string()),
-            "an unchanged labels.yml should report as preserved, got: {report2:?}"
-        );
     }
 }
