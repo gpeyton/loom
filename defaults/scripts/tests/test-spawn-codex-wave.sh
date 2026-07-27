@@ -211,7 +211,7 @@ echo ""
 echo "Testing opt-in gate (sequential degrade, issue #19 regression guard)..."
 
 START=$(date +%s.%N 2>/dev/null || date +%s)
-output=$(PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$LOG_DIR" \
+output=$(env -u LOOM_CODEX_MULTI_WAVE PATH="$STUB_DIR:$NOCODEX_PATH" LOOM_CODEX_WAVE_LOG_DIR="$LOG_DIR" \
     "$SCRIPTS_DIR/spawn-codex-wave.sh" 601 602 603 2>&1)
 END=$(date +%s.%N 2>/dev/null || date +%s)
 SEQ_ELAPSED=$(awk -v s="$START" -v e="$END" 'BEGIN { print e - s }')
