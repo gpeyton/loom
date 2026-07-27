@@ -63,6 +63,18 @@ That's it! Loom is non-invasive and everything important can be committed to ver
 
 ## Prerequisites
 
+## Single Claude account daemon setup
+
+Loom's daemon can run with one Claude Code account when token rotation has not
+been configured. Run `claude setup-token` once in an interactive terminal,
+place the resulting value in the workspace `.env` as
+`CLAUDE_CODE_OAUTH_TOKEN=...`, then restart `loom-daemon`. Without that value,
+the daemon uses Claude's inherited login (for example the macOS keychain).
+Single-account mode defaults to one concurrent sweep; set
+`LOOM_SINGLE_ACCOUNT_CONCURRENCY` only when the account can safely absorb more.
+Configured token pools never fall back to this path: an exhausted pool fails
+loudly so an authentication problem is not hidden.
+
 ### For End Users (Using Loom)
 
 Minimal requirements to use Loom:

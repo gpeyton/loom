@@ -802,6 +802,13 @@ fn handle_request(
             Response::SweepList { sweeps }
         }
 
+        Request::GetDispatchAuthReadiness => {
+            let sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            Response::DispatchAuthReadiness(sr.auth_readiness())
+        }
+
         // ====================================================================
         // Sweep Monitoring Handlers (Issue #3455 — Phase C of #3449)
         // ====================================================================

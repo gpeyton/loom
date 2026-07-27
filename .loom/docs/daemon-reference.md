@@ -16,7 +16,8 @@ maps each IPC request 1:1 to an MCP tool. The daemon is **the
 coordination point** for:
 
 - **Dispatching** `/loom:sweep` children with multi-account OAuth token
-  rotation (via `defaults/scripts/spawn-claude.sh`).
+  rotation (via `defaults/scripts/spawn-claude.sh`), or explicit
+  single-account degraded mode when no rotation pool is configured.
 - **Tracking** running sweeps in an in-memory registry (no on-disk state
   file — the forge is the source of truth for queue state).
 - **Publishing** sweep-lifecycle events on an in-memory pub/sub bus, and
@@ -133,6 +134,19 @@ Spawn a `/loom:sweep` child via the daemon's registry. The daemon shells
 out to `defaults/scripts/spawn-claude.sh` for token rotation and detaches
 the child. Returns the `sweep_id`, child PID, token-account name, and
 per-sweep log path.
+
+#### Single-account authentication
+
+When `.loom/tokens/` is absent or contains no `*.token` files, rotation is
+unconfigured and the spawn script enters **single-account mode**. It first
+uses `CLAUDE_CODE_OAUTH_TOKEN` already present in the daemon environment; if
+that is absent, it reads that one value from the workspace `.env`; otherwise
+it launches `claude` with its inherited login (for example, a macOS keychain
+login). Every fallback logs `single-account mode` so it is visible in the
+sweep log. Configure `CLAUDE_CODE_OAUTH_TOKEN` by running `claude setup-token`
+interactively once, adding the resulting value to `.env`, and restarting the
+daemon. This fallback is intentionally unavailable when a token pool exists:
+an exhausted or blocked pool remains a loud dispatch failure.
 
 Inputs:
 - `kind` (required) — `{"Issue": <N>}` or `{"PrSet": [<N>, ...]}`. Phase

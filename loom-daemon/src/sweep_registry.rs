@@ -38,7 +38,9 @@
 //! - Forge labels (`loom:issue` vs `loom:building`).
 
 use crate::event_bus::EventBus;
-use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
+use crate::types::{
+    DispatchAuthReadiness, Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState,
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -75,6 +77,7 @@ pub const WORKSPACE_ENV: &str = "LOOM_WORKSPACE";
 /// from the in-memory map. One hour matches the operator intuition that
 /// "recently exited sweeps should still show up in `list_sweeps`".
 pub const TERMINAL_RETENTION_SECS: i64 = 3600;
+pub const SINGLE_ACCOUNT_CONCURRENCY_ENV: &str = "LOOM_SINGLE_ACCOUNT_CONCURRENCY";
 
 // ============================================================================
 // Registry
@@ -292,6 +295,46 @@ impl SweepRegistry {
             .collect()
     }
 
+    /// Inspect token-pool state without spawning a worker.
+    pub fn auth_readiness(&self) -> DispatchAuthReadiness {
+        let token_dir = self.config.workspace_root.join(".loom/tokens");
+        let pool_size = std::fs::read_dir(&token_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "token"))
+            .count();
+        let usable_tokens = pool_size; // selector remains the authority for blocked/expired tokens at spawn time.
+        let single_account_mode = pool_size == 0;
+        let source = if !single_account_mode {
+            "rotation-pool".to_string()
+        } else if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok() {
+            "environment-token".to_string()
+        } else if workspace_env_token(&self.config.workspace_root).is_some() {
+            "workspace-env-token".to_string()
+        } else {
+            "inherited-claude-auth".to_string()
+        };
+        let concurrency_cap = single_account_cap();
+        let running_single_account_sweeps = if single_account_mode {
+            self.entries
+                .values()
+                .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+                .count()
+        } else {
+            0
+        };
+        DispatchAuthReadiness {
+            pool_size,
+            usable_tokens,
+            single_account_mode,
+            source,
+            concurrency_cap,
+            running_single_account_sweeps,
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Dispatch
     // ------------------------------------------------------------------------
@@ -328,6 +371,18 @@ impl SweepRegistry {
                     was_new: false,
                 });
             }
+        }
+
+        let readiness = self.auth_readiness();
+        if readiness.single_account_mode
+            && readiness.running_single_account_sweeps >= readiness.concurrency_cap
+        {
+            return Err(anyhow!(
+                "single-account dispatch cap reached ({}/{}); set {} to override",
+                readiness.running_single_account_sweeps,
+                readiness.concurrency_cap,
+                SINGLE_ACCOUNT_CONCURRENCY_ENV
+            ));
         }
 
         // 2. Phase A only fully implements Issue dispatch.
@@ -1023,6 +1078,26 @@ impl SweepRegistry {
     }
 }
 
+fn single_account_cap() -> usize {
+    std::env::var(SINGLE_ACCOUNT_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1)
+}
+
+fn workspace_env_token(workspace: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(workspace.join(".env")).ok()?;
+    body.lines()
+        .rev()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("CLAUDE_CODE_OAUTH_TOKEN=")
+                .map(|v| v.trim_matches(['\'', '"']).to_string())
+        })
+        .filter(|v| !v.is_empty())
+}
+
 // ============================================================================
 // Public helpers
 // ============================================================================
@@ -1396,6 +1471,44 @@ exit 0
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
         assert!(lock.exists(), "expected lock dir at {}", lock.display());
+    }
+
+    #[test]
+    #[serial]
+    fn auth_readiness_distinguishes_single_account_and_rotation_pool() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::write(workspace.join(".env"), "CLAUDE_CODE_OAUTH_TOKEN=fixture-token\n").unwrap();
+        let (registry, _) = fixture_registry(workspace);
+        let readiness = registry.auth_readiness();
+        assert!(readiness.single_account_mode);
+        assert_eq!(readiness.pool_size, 0);
+        assert_eq!(readiness.usable_tokens, 0);
+        assert_eq!(readiness.source, "workspace-env-token");
+        assert_eq!(readiness.concurrency_cap, 1);
+
+        std::fs::create_dir_all(workspace.join(".loom/tokens")).unwrap();
+        std::fs::write(workspace.join(".loom/tokens/account.token"), "token").unwrap();
+        let readiness = registry.auth_readiness();
+        assert!(!readiness.single_account_mode);
+        assert_eq!(readiness.source, "rotation-pool");
+        assert_eq!(readiness.pool_size, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn single_account_dispatch_cap_blocks_a_second_running_sweep() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _) = fixture_registry(dir.path());
+        registry
+            .dispatch(&SweepKind::Issue(501), None, None, None)
+            .unwrap();
+        let err = registry
+            .dispatch(&SweepKind::Issue(502), None, None, None)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("single-account dispatch cap reached"));
     }
 
     /// Issue #3477 (Phase 1): a `model` dispatch param threads through to
