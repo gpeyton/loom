@@ -256,8 +256,11 @@ fi
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
 - [ ] I am using `gh pr edit` for label changes
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
-- [ ] All CI checks pass (verified via `gh pr checks`)
-- [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
+- [ ] All CI checks pass (verified via `gh pr checks`) — or, if the workflows are
+      `disabled_manually` repo-wide, a clean local test run stands in for them
+      (see "When CI is disabled repo-wide"); never enable a disabled workflow
+- [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`) — not
+      required when CI is disabled repo-wide, since it can never reach CLEAN then
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
 
@@ -624,9 +627,30 @@ FEEDBACK
 
 ## CI Status Check (REQUIRED Before Approval)
 
-**CRITICAL: Never approve a PR until all CI checks pass.**
+**CRITICAL: Never approve a PR until all CI checks pass — unless CI is switched off repo-wide, in which case see "When CI is disabled" below.**
 
 Local tests passing is not sufficient - you MUST verify that GitHub Actions CI workflows have completed successfully. This prevents situations where a PR is approved while CI is still running or failing.
+
+### When CI is disabled repo-wide
+
+A repository owner may deliberately disable the CI workflows. `gh workflow list --all`
+reports those workflows as `disabled_manually`, `gh pr checks` reports no checks, and
+`mergeStateStatus` never reaches `CLEAN`.
+
+**This is a valid configuration, not a fault.** When you detect it:
+
+- **Do NOT run `gh workflow enable`.** Re-enabling a workflow the owner switched off
+  overrides a human decision, and CI settings are outside a Judge's remit.
+- **Do NOT stop and ask how to proceed, and do not push empty commits to retrigger
+  checks.** Waiting on an answer parks the whole sweep indefinitely; the lane looks
+  alive while nothing happens.
+- **Run the tests yourself and gate on that instead.** Execute the repository's test
+  command against the files the PR touches — plus the frontend build if it changes
+  frontend code — and treat a clean local run as the equivalent of a green required
+  check. State plainly in your review that CI is disabled repo-wide and that the gate
+  was a local run, and name the exact command and its result so the record is honest.
+- Everything else is unchanged: merge conflicts, `DIRTY`/`BEHIND` handling, and the
+  code-quality bar all still apply. A local run replaces the CI signal only.
 
 ### How to Check CI Status
 
