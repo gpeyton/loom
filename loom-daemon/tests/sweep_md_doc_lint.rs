@@ -349,15 +349,15 @@ fn sweep_md_documents_model_experiment_mode() {
 #[test]
 fn sweep_md_documents_experiment_tier_2_5_suppression() {
     let content = read_sweep_md();
-    // CONTRACT (prefix-tolerant): the suppression note is anchored by its
-    // `Experiment-mode suppression (issue #3725` title + issue ref. The prefix
-    // match (no closing paren) tolerates appended issue refs — e.g. a future
-    // edit turning `(issue #3725)` into `(issue #3725, #NNNN)`. See #3833/#3837
-    // for why exact-paren literals red main on doc edits.
+    // CONTRACT (title only): anchor the suppression note on its title alone.
+    // The previous anchor also required a trailing tracker reference, which
+    // forced the reader-facing doc to carry a tracker id purely to satisfy a
+    // test. Operator docs in this repo do not carry tracker ids, so that is not
+    // available as an anchor. The title plus the semantic tokens asserted below
+    // still fail if the note is deleted or hollowed out — which is the point.
     assert!(
-        content.contains("Experiment-mode suppression (issue #3725"),
-        "sweep.md must document the tier-2.5 suppression note (#3725 hard AC; \
-         tolerates appended issue refs)"
+        content.contains("Experiment-mode suppression"),
+        "sweep.md must document the tier-2.5 experiment-mode suppression note"
     );
     // CONTRACT: the caps `SUPPRESSES` verb and the `tier-2.5` target are the
     // load-bearing tokens of the suppression semantic. Assert both present

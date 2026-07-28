@@ -424,14 +424,14 @@ RESOLVED_MODEL="$(./.loom/scripts/resolve-model.sh "$LOGICAL_MODEL")"   # e.g. o
 
 | Marker | Builder | Judge |
 |---|---|---|
-| `mechanical` | `tierModels[<runtime>].mechanical` | unchanged |
-| `routine` / absent / malformed | `tierModels[<runtime>].routine` | unchanged |
-| `complex` | `tierModels[<runtime>].complex` | raised to match the Builder |
+| `<!-- loom:complexity=mechanical -->` | `tierModels[<runtime>].mechanical` | unchanged |
+| `<!-- loom:complexity=routine -->` / absent / malformed | `tierModels[<runtime>].routine` | unchanged |
+| `<!-- loom:complexity=complex -->` | `tierModels[<runtime>].complex` | raised to match the Builder |
 
 Resolve `<runtime>` (the dispatched worker type) and the tier against `sweep.tierModels` in config, then pass the result through `resolve-model.sh` like every other dispatch path. **Never hardcode a model name here.** No entry for that runtime or tier ⇒ resolve nothing and fall through to tier 3.
 
 - `complex` is the only value that touches the Judge — expensive-to-be-wrong work must never be reviewed by a weaker model than built it. `mechanical` never lowers the Judge.
-- Never `fable`; that is reached only via the escalation ladder or an explicit operator param.
+- One bump maximum, and never to `fable`: the marker can lift a dispatch one tier and never reaches the top rung. `fable` is reached only via the escalation ladder or an explicit operator param.
 - It is not a label and creates none.
 - Tier-1 and tier-2 pins still win.
 - The Curator's own dispatch ignores the marker — it produces the classification.
@@ -443,6 +443,8 @@ Resolve `<runtime>` (the dispatched worker type) and the tier against `sweep.tie
 
   Pass `$MODEL` to the Task tool's `model` parameter for in-session role dispatch, and export it as `LOOM_MODEL` (or pass `--model "$MODEL"`) for any spawned child process. Exit code 3 means no mapping exists — fall through to tier 3. A dispatch that never ran this command has not applied the tier.
 - Log the resolved model and reason per dispatch, e.g. `model: builder=haiku (complexity=mechanical)`.
+
+**Experiment-mode suppression.** While the model-cost experiment is in `experiment` mode the forced arm wins: it SUPPRESSES this tier-2.5 bump, so a `complex`-marked issue assigned to Arm B stays on Arm B's model instead of being raised. Otherwise the bump would pull every hard issue into the expensive arm and the two arms would stop being comparable. In `off` and `observe` modes the bump applies normally. See "Model-cost experiment mode".
 
 **No-Fable-Judge hard invariant (issue #3702)**: **Judge model resolution can never resolve to `fable`, regardless of `sweep.escalation` contents or any marker.** The escalation ladder and the tier-2.5 marker apply only to the Curator-marker→Builder path and to the rejection-triggered Doctor — never to Judge. The Judge is the escalation sensor (see #3481); reviewing security-adjacent diffs is precisely Fable's refusal surface, and a refusing Judge would deadlock the control loop. If a resolved Judge model would ever be `fable` (alias or pinned ID), fall back to `opus` for the Judge dispatch and log the substitution.
 
