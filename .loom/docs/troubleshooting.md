@@ -413,6 +413,30 @@ grep -c dispatch_sweep dist/index.js   # should now be > 0
 
 `scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](../../mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
 
+### MCP tools hang with no response (~1800s), then abort
+
+**Symptom**: `mcp__loom__dispatch_sweep`, `mcp__loom__get_sweep_status`, `mcp__loom__list_sweeps`, or `mcp__loom__cancel_sweep` return **no response and no progress**, and are eventually aborted by the client (`sent no response or progress for 1800s; aborting`) — even though the underlying operation **succeeded** (the sweep child spawned, the PR opened, etc.). The CLI path (`loom-daemon status` / `dispatch`) stays fast throughout, which isolates the fault to the MCP/IPC response path, not a wedged daemon.
+
+**Cause** (#4043): the MCP bridge's unary request transport (`mcp-loom/src/shared/daemon.ts` `sendDaemonRequest`) historically settled its promise only in the socket's `end` handler. The real `loom-daemon` holds each connection **open by design** (a persistent per-connection read loop, `loom-daemon/src/ipc.rs` `handle_client`): it writes one newline-delimited JSON response frame per request and never closes after answering. So the response sat complete-but-unparsed in the client buffer while the promise waited forever for an `end` that never came. A **stale bundle** (`mcp-loom/dist/` older than `mcp-loom/src/`) compounds it by discarding the per-call timeout, turning a diagnosable failure into the full ~1800s idle hang.
+
+**Diagnose** — probe the raw socket (bypassing the MCP layer) and check the bundle for the timeout string:
+
+```bash
+# Does the bundle even carry the bounded-timeout fix? 0 => stale, pre-timeout bundle
+grep -c "did not respond within" mcp-loom/dist/index.js
+
+# Is dist/ older than src/? (any output => stale, rebuild needed)
+find mcp-loom/src -type f -newer mcp-loom/dist/index.js
+```
+
+**Fix** — the transport now settles on the **first newline-delimited response frame** (in the `data` handler) and closes the socket after settling, so it no longer depends on the daemon closing the connection. If you are on a pre-fix bundle, rebuild and reconnect:
+
+```bash
+cd mcp-loom && npm install && npm run build   # then restart the Claude Code session
+```
+
+The `claude-wrapper.sh` MCP pre-flight (`check_mcp_server`) now rebuilds a stale bundle before the smoke test, so a fresh session on an up-to-date checkout self-heals; the regression is guarded by `mcp-loom/scripts/verify-daemon-timeout.mjs`'s respond-without-close stub case (`npm run verify:daemon-timeout`).
+
 ### Inspect running sweeps
 
 ```bash
@@ -482,6 +506,69 @@ Note: by default the daemon does not poll the forge for `loom:issue` items — d
 For now, trigger them manually when the queue is empty:
 
 ```bash
-claude -p "/architect" --dangerously-skip-permissions
-claude -p "/hermit"    --dangerously-skip-permissions
+claude -p "/loom:architect" --dangerously-skip-permissions
+claude -p "/loom:hermit"    --dangerously-skip-permissions
 ```
+
+## Overnight / long-running orchestration
+
+### Keeping the host awake (#3350)
+
+`/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup
+and warns when the host can sleep. This is **advisory only** — Loom never blocks
+on it. Heed the warning before walking away from a long run.
+
+- **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.)
+  do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset
+  -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow
+  system sleep when display is off" toggle to OFF. Restore with `sudo pmset -c
+  sleep 1` afterwards.
+- **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep
+  --who=loom --why=loom -- <cmd>`.
+
+Manual invocation:
+
+```bash
+./.loom/scripts/check-host-sleep.sh         # full warning (or success line)
+./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
+```
+
+### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777 resync)
+
+The installed `.loom/hooks/` and `.loom/scripts/` copies the harness actually
+executes are synced from `defaults/` **at install time**. A `git pull` that merges
+a hook/script fix updates `defaults/` but **not** the installed copies — so a
+session can run stale hooks/scripts indefinitely (the incident: a merged
+`guard-destructive.sh` fix kept prompting until hand-copied).
+
+This is a **detect → fix** pair:
+
+- **Detect (#3770)** — `/loom:sweep` runs `./.loom/scripts/check-main-freshness.sh`
+  at startup. When local `main` is behind `origin/main` it prints a non-blocking
+  warning and flags any installed file that differs from its `defaults/`
+  counterpart. Advisory only; it never pulls, merges, or resets.
+- **Fix (#3777)** — `./.loom/scripts/resync-installed.sh` refreshes the installed
+  `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (a no-op when
+  in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only
+  ever touches files that exist in `defaults/` (repo-specific hooks with no
+  `defaults/` counterpart are left alone). One exception (#4041): the vendored
+  generic guard `hooks/guard-destructive-generic.sh` is **not** resynced (and any
+  stale copy is removed) in a repo where the canonical Repo Skills guard
+  (`.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29
+  fix) is installed — the `guard-destructive.sh` dispatcher defers to the canonical
+  guard there, so Loom does not resurrect its own generic copy.
+
+The intended flow is **"freshness warning says you're stale → run resync"**:
+
+```bash
+git merge --ff-only origin/main                 # bring defaults/ current
+./.loom/scripts/resync-installed.sh --dry-run   # preview what would change (exits 2 on drift)
+./.loom/scripts/resync-installed.sh             # apply
+```
+
+`--dry-run` makes no changes and exits `2` when drift is detected (so it doubles
+as a check). To pin an intentional per-repo customization so resync never
+overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`) — one
+per line — in `.loom/resync-ignore`; matching files are reported `skipped`. A full
+`loom-daemon init` / installer run already performs the equivalent recursive copy,
+so a normal reinstall keeps the copies current too.

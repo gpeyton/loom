@@ -353,6 +353,60 @@ pub enum Request {
     RemoveWatch {
         id: String,
     },
+    // ========================================================================
+    // Supervised restart primitive (Issue #4054 — Phase 2 of #4017)
+    // ========================================================================
+    /// Deliberately restart the daemon by ending the current process so the
+    /// supervisor (macOS launchd) relaunches it — the manually-triggerable
+    /// restart primitive #4017 Phase 3 will call to complete an auto-roll.
+    ///
+    /// This is the ONLY path that exits the process with status `0`. Under the
+    /// launchd `KeepAlive: { SuccessfulExit: true }` contract (see
+    /// `render_launchd_plist` in `loom-daemon-start.sh`), a clean exit-0
+    /// triggers a relaunch, while every operator/signal/crash exit is non-zero
+    /// and does NOT relaunch. The relaunched process re-reads the same plist, so
+    /// it comes back with EXACTLY the flags/env it was started with — never
+    /// wider.
+    ///
+    /// The daemon only ends the process when it can prove it is supervised
+    /// (`LOOM_DAEMON_SUPERVISOR=launchd`, baked into the plist by the start
+    /// script). On an unsupervised host (nohup / Linux / `--foreground`) it
+    /// refuses: it logs loudly, leaves itself running, and returns a
+    /// `DaemonRestart { scheduled: false, .. }` — there is no supervisor that
+    /// would bring it back, and exiting would be strictly worse than the status
+    /// quo (#4017).
+    ///
+    /// It never fires on its own — nothing in the daemon issues this request.
+    RestartDaemon,
+    /// Scheduled drain-and-restart (Issue #4090): stop admitting *new* work
+    /// immediately, wait for every in-flight sweep to finish, then exit
+    /// [`EXIT_RESTART`](crate::ipc::EXIT_RESTART) for a supervised relaunch —
+    /// no sweep killed, no orphan left behind.
+    ///
+    /// A deliberately **separate** variant from [`Request::RestartDaemon`] (a
+    /// unit variant) rather than fields on it: the wire window where an older
+    /// `loom-daemon restart` client and a newer daemon disagree is *precisely a
+    /// roll*, so `{"type":"RestartDaemon"}` must keep deserializing unchanged.
+    ///
+    /// - `timeout_secs`: bound on how long to wait for the registry to empty.
+    ///   `None` ⇒ the daemon's default (tens of minutes; a sweep is ~10–20 min).
+    /// - `force_after_timeout`: when the deadline passes with sweeps still in
+    ///   flight, `true` cancels the stragglers via the existing `cancel_sweep`
+    ///   path and restarts anyway; `false` (fail-safe) refuses the restart,
+    ///   resumes dispatch, and stays up.
+    ///
+    /// On an unsupervised host the daemon refuses immediately (before pausing
+    /// dispatch) with `DaemonDrain { accepted: false, .. }`, mirroring
+    /// [`Request::RestartDaemon`]'s refusal contract.
+    DrainAndRestartDaemon {
+        timeout_secs: Option<u64>,
+        force_after_timeout: bool,
+    },
+    /// Abort an in-progress drain (Issue #4090): clear the drain flag so new
+    /// dispatch resumes, and stop the drain-supervisor task so no later restart
+    /// fires — even if the in-flight count subsequently reaches zero on its own.
+    /// A no-op (idempotent) when no drain is in progress.
+    AbortDrain,
     Shutdown,
 }
 
@@ -485,6 +539,34 @@ pub enum Response {
     /// Result of a `DaemonStatus` request — the autonomous-mode operability
     /// snapshot rendered by `loom-daemon status`.
     DaemonStatus(DaemonStatusReport),
+    /// Result of a `RestartDaemon` request (Issue #4054).
+    ///
+    /// `scheduled` is `true` when the daemon is supervised and is about to exit
+    /// `0` for a supervised relaunch (the process ends immediately after this
+    /// frame is flushed). It is `false` when the daemon is NOT supervised and
+    /// therefore refused to exit — the daemon stays running. `supervisor` names
+    /// the detected supervisor (`Some("launchd")`) or `None` when unsupervised,
+    /// and `message` is a human-readable explanation for operator output.
+    DaemonRestart {
+        scheduled: bool,
+        supervisor: Option<String>,
+        message: String,
+    },
+    /// Result of a `DrainAndRestartDaemon` / `AbortDrain` request (Issue #4090).
+    ///
+    /// `accepted` is `true` when the drain was scheduled (or the abort took
+    /// effect); `false` on an unsupervised host (a drain would have nowhere to
+    /// relaunch into) or an abort with no drain in progress. `supervisor` names
+    /// the detected supervisor (`Some("launchd")`) or `None` when unsupervised.
+    /// `in_flight` is the cross-root non-terminal sweep count at request time,
+    /// so the operator immediately sees how much work the drain must wait for.
+    /// `message` is a human-readable explanation for operator output.
+    DaemonDrain {
+        accepted: bool,
+        supervisor: Option<String>,
+        in_flight: usize,
+        message: String,
+    },
     // ========================================================================
     // Workspace Registry Responses (Issue #3926 — phase 1 of #3835)
     // ========================================================================
@@ -741,6 +823,27 @@ pub struct DaemonStatusReport {
     /// pre-#3978 wire data compatible.
     #[serde(default)]
     pub loadavg_1m: Option<f64>,
+    /// The measured CPU idle fraction (`0.0..=1.0`) feeding [`Self::cpu_headroom`]
+    /// (#4031), via [`crate::cpu_headroom::cached_cpu_idle_fraction`]. This is the
+    /// signal that replaced the 1-minute load average as the source of "consumed
+    /// cores" — load average overstated consumption by ~1.5× on macOS because it
+    /// counts network-I/O-blocked `claude` sessions that consume no core. `None`
+    /// when no idle sample has been taken yet (the term then falls back to
+    /// [`Self::loadavg_1m`], then to static capacity — see the
+    /// [`crate::cpu_headroom`] module docs). `#[serde(default)]` keeps pre-#4031
+    /// wire data / older clients compatible.
+    #[serde(default)]
+    pub cpu_idle_fraction: Option<f64>,
+    /// Whether in-flight occupancy has actually reached the dynamic cap
+    /// (`in_flight.len() >= dynamic_cap`) — i.e. the cap is *currently binding*,
+    /// not merely the smallest ceiling (#4031). When `false`, no resource term
+    /// (tokens/disk/CPU) is the limiter — the limiter is **work availability**,
+    /// and the status renderer suppresses the "token-bound" diagnosis rather than
+    /// misreporting a bottleneck at, say, 1 in-flight against a cap of 7.
+    /// `#[serde(default)]` keeps pre-#4031 wire data / older clients compatible
+    /// (an absent field parses as `false` — "not capacity-bound").
+    #[serde(default)]
+    pub capacity_bound: bool,
     /// Dynamic-cap input 4: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,
@@ -762,7 +865,12 @@ pub struct DaemonStatusReport {
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
     /// dispatch (in-flight sweeps keep running); `false` means dispatch is
-    /// allowed. Always `false` when the gate loop is not enabled.
+    /// allowed — which covers three distinct conditions the gate loop cannot
+    /// tell apart from this flag alone: the gate is disabled, the gate is
+    /// enabled but has not completed a first evaluation yet ("pending"), or
+    /// the gate's last completed run verified `main` green ("clear"). See
+    /// [`Self::main_health_gate_enabled`] and [`Self::main_health_gate_verdict_at`]
+    /// (#4012) for the fields that disambiguate those three.
     pub main_health_gate_halted: bool,
     /// Whether the gate's most recent tick for this workspace was
     /// `Unevaluated` rather than a completed Green/Red run — "not evaluated",
@@ -783,6 +891,32 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps pre-#3974 wire data compatible.
     #[serde(default)]
     pub main_health_gate_not_evaluated_reason: Option<String>,
+    /// Whether the reactive main-health gate is actually enabled for this
+    /// workspace root (#4012) — `resolve_enabled(..)` **and** a usable
+    /// `buildGate` block, so a root that is nominally `enabled: true` but has
+    /// no command configured (the gate loop treats that as always-green,
+    /// `main_health_gate.rs`) also reports `Some(false)` here. `Some(true)` /
+    /// `Some(false)` are resolved daemon-side (reading the daemon's own
+    /// environment and `.loom/config.json`, never the CLI client's); `None`
+    /// only for a pre-#4012 wire payload that never reported this field.
+    /// Deliberately `Option<bool>` rather than `bool`: a legacy payload
+    /// deserializing a missing `bool` field defaults to `false`, which would
+    /// misreport an older, perfectly healthy daemon as "gate disabled" —
+    /// `None` honestly means "unknown, older daemon" instead. `#[serde(default)]`
+    /// keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub main_health_gate_enabled: Option<bool>,
+    /// Wall-clock time of the most recent **completed** (Green/Red) gate
+    /// verdict for this workspace root (#4012), or `None` when no verdict has
+    /// landed yet this daemon process — the disambiguator between "pending"
+    /// (enabled, no verdict yet) and "clear" (verified green), and the
+    /// recency evidence a `clear` reading otherwise lacks. Stamped only on a
+    /// completed run, never on the #3984 SHA-memo skip path (a skip proves
+    /// nothing new). `#[serde(default)]` keeps pre-#4012 wire data compatible
+    /// (an absent field parses as `None`, which reads as "pending" — the
+    /// conservative choice for data an older daemon never populated).
+    #[serde(default)]
+    pub main_health_gate_verdict_at: Option<DateTime<Utc>>,
     /// Token-capacity backpressure snapshot (#3902): account health derived from
     /// the rotation ranking (`.loom/tokens/.ranking`) and whether the token axis
     /// is the binding constraint on the dynamic cap. `#[serde(default)]` keeps
@@ -799,6 +933,38 @@ pub struct DaemonStatusReport {
     /// pre-#3930 wire data / older clients compatible (an empty vec).
     #[serde(default)]
     pub per_repo: Vec<RepoStatus>,
+    /// Startup forge-credential preflight snapshot (#4005): resolved once at
+    /// daemon boot, before the claim-reconciliation startup pass (the
+    /// daemon's first `gh` consumer) — see
+    /// [`crate::credential_preflight::run`]. `None` only for a pre-#4005 wire
+    /// payload from an older daemon binary that never computed one.
+    /// `#[serde(default)]` keeps that wire data compatible.
+    #[serde(default)]
+    pub credential_preflight: Option<CredentialPreflightReport>,
+    /// Whether a scheduled drain-and-restart (Issue #4090) is currently in
+    /// progress: new dispatch is paused and the daemon is waiting for the
+    /// in-flight sweep count ([`Self::in_flight`]) to reach zero before exiting
+    /// for a supervised relaunch. `false` in the common no-drain case.
+    /// `#[serde(default)]` keeps pre-#4090 wire data / older clients compatible
+    /// (an absent field parses as `false` — "not draining"), mirroring the
+    /// `capacity_bound` forward-compat convention.
+    #[serde(default)]
+    pub draining: bool,
+    /// Wall-clock deadline at which an in-progress drain (Issue #4090) gives up
+    /// waiting: without `--force-after-timeout` it refuses the restart and
+    /// resumes dispatch; with it, the stragglers are cancelled and the daemon
+    /// restarts anyway. `None` when no drain is active. `#[serde(default)]`
+    /// keeps pre-#4090 wire data compatible.
+    #[serde(default)]
+    pub drain_deadline: Option<DateTime<Utc>>,
+    /// A short human-readable note about the most recent drain transition
+    /// (Issue #4090) — e.g. why a drain timed out and was refused, or that a
+    /// drain was aborted by the operator. Surfaced so `loom-daemon status`
+    /// never leaves a drain that quietly ended unexplained. `None` when no
+    /// drain has run this process. `#[serde(default)]` keeps pre-#4090 wire
+    /// data compatible.
+    #[serde(default)]
+    pub drain_note: Option<String>,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
@@ -846,6 +1012,18 @@ pub struct RepoStatus {
     /// [`DaemonStatusReport::main_health_gate_not_evaluated_reason`].
     #[serde(default)]
     pub health_gate_not_evaluated_reason: Option<String>,
+    /// Whether this repo's gate is actually enabled (#4012). See
+    /// [`DaemonStatusReport::main_health_gate_enabled`] for the `Option<bool>`
+    /// rationale and the "enabled but no usable `buildGate` block ⇒ `false`"
+    /// rule. `#[serde(default)]` keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub health_gate_enabled: Option<bool>,
+    /// Wall-clock time of this repo's most recent completed gate verdict
+    /// (#4012), or `None` before the first one this process. See
+    /// [`DaemonStatusReport::main_health_gate_verdict_at`]. `#[serde(default)]`
+    /// keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub health_gate_verdict_at: Option<DateTime<Utc>>,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).
@@ -872,6 +1050,47 @@ pub struct CapacityReport {
     /// Whether the token axis is the binding (minimum) constraint on the dynamic
     /// cap — i.e. tokens, not disk or the operator ceiling, are the bottleneck.
     pub token_bound: bool,
+}
+
+/// Startup forge-credential preflight snapshot (#4005) — see
+/// [`crate::credential_preflight`] for the resolution logic. Resolved exactly
+/// once, before the daemon's first `gh` consumer, so headless/SSH-only
+/// operation (no unlockable GUI login keychain) is diagnosed loudly at boot
+/// instead of surfacing as an unexplained per-tick `401` on every forge call.
+///
+/// GitHub-only: the daemon's own forge calls all shell out to `gh`, which
+/// resolves GitHub credentials exclusively. `GITEA_TOKEN`/`FORGE_TOKEN`
+/// forwarding (`loom-daemon-start.sh`) exists only for dispatched sweep
+/// children targeting a Gitea-backed repo — the daemon process itself never
+/// calls a Gitea API, so there is nothing here to preflight for it.
+///
+/// **Never carries a token value** — only a resolution-mechanism label and a
+/// non-secret fingerprint (last 4 chars of an env-sourced token, or the
+/// authenticated `gh` login for a credential-store resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialPreflightReport {
+    /// `true` when a usable GitHub credential was resolved; `false` when
+    /// none was found, or the probe itself could not complete within its
+    /// bound (`gh` missing from `PATH`, timed out, spawn failure, …) — see
+    /// [`Self::mechanism`] `"unknown"` for that latter case.
+    pub ok: bool,
+    /// Which mechanism resolved the credential: `"GH_TOKEN"` / `"GITHUB_TOKEN"`
+    /// (the daemon's own process environment) or `gh`'s own `tokenSource`
+    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`.
+    /// `"none"` when nothing resolved; `"unknown"` when the probe itself
+    /// failed to run. NEVER a token value.
+    pub mechanism: String,
+    /// A non-secret fingerprint: the last 4 characters of an env-sourced
+    /// token, or the authenticated `gh` login for a credential-store
+    /// resolution. `None` when no credential resolved.
+    pub fingerprint: Option<String>,
+    /// Human-readable, log/print-safe summary — never contains a token.
+    /// Names both remediations (export `GH_TOKEN` before starting the
+    /// daemon, or unlock the login keychain from a GUI session) when `ok` is
+    /// `false`.
+    pub message: String,
+    /// Wall-clock time this snapshot was taken (daemon startup).
+    pub checked_at: DateTime<Utc>,
 }
 
 // ========================================================================

@@ -1,11 +1,14 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
 use loom_daemon::claim_reconciliation;
+use loom_daemon::credential_preflight;
+use loom_daemon::daemon_heartbeat;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
+use loom_daemon::quarantine_reconciliation;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
@@ -19,6 +22,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::io::Write;
@@ -179,6 +183,53 @@ enum Commands {
         action: WatchAction,
     },
 
+    /// Deliberately restart the running daemon (Issue #4054 — the supervised
+    /// restart primitive). Sends a `RestartDaemon` request over the Unix socket;
+    /// when the daemon is supervised by launchd it exits 0 for a clean
+    /// `KeepAlive:SuccessfulExit` relaunch (a new pid, exactly its start flags,
+    /// in-flight sweeps preserved). On an unsupervised host (nohup / Linux /
+    /// `--foreground`) the daemon refuses and stays running, and this command
+    /// prints the refusal and exits non-zero. This is the primitive #4017 Phase
+    /// 3 will call after a rebuild — it does nothing on its own.
+    ///
+    /// With `--drain` (Issue #4090) the daemon instead stops admitting new work
+    /// immediately and waits for every in-flight sweep to finish before
+    /// restarting — no sweep killed, no orphan left behind. `--abort-drain`
+    /// cancels an in-progress drain and resumes normal dispatch.
+    Restart {
+        /// Finish all in-flight sweeps before restarting, instead of restarting
+        /// immediately (#4090). New dispatch is paused for the duration.
+        #[arg(long)]
+        drain: bool,
+        /// Max seconds to wait for in-flight sweeps to drain (with `--drain`).
+        /// Defaults to the daemon's built-in timeout (tens of minutes).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// On drain timeout, cancel the remaining sweeps and restart anyway
+        /// (with `--drain`). Without this, a timeout refuses the restart and
+        /// keeps the daemon running (fail-safe).
+        #[arg(long)]
+        force_after_timeout: bool,
+        /// Abort an in-progress drain and resume normal dispatch (no restart).
+        #[arg(long)]
+        abort_drain: bool,
+    },
+
+    /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
+    /// #4082/#4108, epic #4081 "eliminate Python from Loom"). Native Rust
+    /// port of the token pool: the 3-tier selection algorithm, the HTTP
+    /// rate-limit probe (`check`), and the operator-facing pin/unpin/unblock
+    /// bookkeeping CLI. As of #4080 (Phase 2) `check` is also the
+    /// implementation `probe-tokens.sh` and the daemon's own ranking
+    /// self-refresh invoke natively; `spawn-claude.sh` (selection) and
+    /// `bootstrap`/`import-from-monitor` remain Python-only (deferred to
+    /// follow-up issues — see `loom-daemon/src/tokens_pool/mod.rs`). Purely
+    /// file-based; does not require a running daemon.
+    Tokens {
+        #[command(subcommand)]
+        action: TokensAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -303,6 +354,136 @@ enum QuarantineAction {
     },
 }
 
+/// Sub-actions for `loom-daemon tokens`.
+#[derive(Subcommand)]
+enum TokensAction {
+    /// Select an OAuth token from the pool using the 3-tier algorithm
+    /// (ranking -> allowlist -> random), skipping bad-marked tokens at every
+    /// tier. Mirrors `python3 -m loom_tools.tokens.select`.
+    Select {
+        /// Repo root containing `.loom/tokens/` (the canonical main-checkout
+        /// root when called from a worktree — no upward `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit `export CLAUDE_CODE_OAUTH_TOKEN=...` shell lines instead of
+        /// JSON.
+        #[arg(long)]
+        export: bool,
+
+        /// Omit the secret key from output (safe inspection).
+        #[arg(long)]
+        no_key: bool,
+    },
+
+    /// Probe each bootstrapped account for rate-limit headers and rank by
+    /// available quota, optionally writing `.loom/tokens/.ranking`. A
+    /// byte-compatible port of the historical Python `loom-tokens check` CLI
+    /// (issue #4108) — as of #4080 this is also what `probe-tokens.sh` and
+    /// the daemon's own ranking self-refresh invoke natively. The HTTP probe
+    /// shells to `curl` (no HTTP-client crate — see `tokens_pool::check`).
+    Check {
+        /// Repo root containing `.loom/tokens/` (plain path, default `.` — no
+        /// upward `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Write `.loom/tokens/.ranking` atomically (consumed by the spawn
+        /// wrapper, #3235).
+        #[arg(long)]
+        ranking: bool,
+
+        /// Where to source the ranking (#3697): `auto` (default) uses
+        /// claude-monitor's `ranking.json` when fresh, else probes; `monitor`
+        /// uses claude-monitor only (no probe); `probe` always live-probes.
+        /// Overrides `$LOOM_RANKING_SOURCE`.
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+
+        /// Override the probe prompt (default `"hi"`). The probe always uses
+        /// `max_tokens=1` regardless of prompt.
+        #[arg(long, value_name = "TEXT")]
+        probe_prompt: Option<String>,
+
+        /// Emit the full report as JSON to stdout (instead of a human table).
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the 0.5-1.5s jitter between probes (mostly for tests).
+        #[arg(long)]
+        no_stagger: bool,
+    },
+
+    /// Manage the `.allowlist` file constraining which accounts `select` may
+    /// pick.
+    Pin {
+        #[command(subcommand)]
+        action: PinAction,
+
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".", global = true)]
+        workspace: String,
+    },
+
+    /// Clear the allowlist (all accounts become eligible).
+    Unpin {
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit a JSON status instead of a human message.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove auth-reason entries for the given accounts from `.bad_tokens`
+    /// (e.g. after re-authenticating).
+    Unblock {
+        /// Account names to unblock (exact match).
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Also drop non-auth entries (TTL-style, exhausted/expired).
+        /// Default is auth-reason only.
+        #[arg(long)]
+        all_reasons: bool,
+
+        /// Emit JSON status.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon tokens pin`.
+#[derive(Subcommand)]
+enum PinAction {
+    /// Replace the allowlist with exactly the given accounts.
+    Set {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Add account(s) to the existing allowlist.
+    Add {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Remove account(s) from the allowlist.
+    Remove {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Show the current allowlist and all available accounts.
+    Status {
+        /// Emit JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -328,6 +509,15 @@ async fn main() -> Result<()> {
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
+            // `restart` connects to the running daemon over its Unix socket to
+            // trigger the supervised restart primitive (Issue #4054), or a
+            // scheduled drain-and-restart (Issue #4090).
+            Commands::Restart {
+                drain,
+                timeout,
+                force_after_timeout,
+                abort_drain,
+            } => handle_restart_command(drain, timeout, force_after_timeout, abort_drain).await,
             other => handle_cli_command(other),
         };
     }
@@ -343,15 +533,10 @@ async fn main() -> Result<()> {
     let (loom_dir, socket_path) = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         // For testing, use the parent directory of the provided socket path
         let socket_path = std::path::PathBuf::from(path);
-        let loom_dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
-            .to_path_buf();
+        let loom_dir = resolve_loom_dir()?;
         (loom_dir, socket_path)
     } else {
-        let loom_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("No home directory"))?
-            .join(".loom");
+        let loom_dir = resolve_loom_dir()?;
         fs::create_dir_all(&loom_dir)?;
         let socket_path = loom_dir.join("loom-daemon.sock");
         (loom_dir, socket_path)
@@ -462,6 +647,19 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
 
+    // Startup forge-credential preflight (Issue #4005). Resolved once, here —
+    // immediately before the claim-reconciliation pass below, the daemon's
+    // first `gh` consumer — so a headless/SSH-only start with neither an
+    // exported GH_TOKEN/GITHUB_TOKEN nor an unlockable GUI login keychain is
+    // diagnosed loudly at boot instead of surfacing as silent per-tick 401s
+    // for the life of the process. Non-fatal and bounded (same posture as the
+    // reconciliation pass itself): a `gh` hiccup here never blocks startup.
+    let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
+        gh_bin: "gh".to_string(),
+        cwd: sweep_workspace.clone(),
+    };
+    let credential_preflight = credential_preflight::run(&credential_preflight_probe);
+
     // Stale-`loom:building`-claim reconciliation across every managed
     // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
     // entries this registry itself owns evidence for (locks/checkpoints); it
@@ -511,6 +709,50 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Stranded-quarantine reconciliation across every managed workspace
+    // (Issue #4110). The insta-crash quarantine (#3939) is memory-only, so a
+    // restart drops the in-memory pause while the `loom:blocked` label it
+    // applied survives on the forge — with nothing left to release it, the
+    // issue is permanently invisible to the work finder. This pass scans
+    // every registered workspace's open `loom:blocked` issues and releases
+    // the ones carrying a daemon-authored quarantine comment back to
+    // `loom:issue`; a human's manual `loom:blocked` (no such comment) is
+    // never touched. Reuses the same `workspace_registry` roots resolved
+    // above for claim reconciliation.
+    if quarantine_reconciliation::reconciliation_enabled() {
+        let workspace_registry =
+            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+        let roots = workspace_registry.effective_roots(&sweep_workspace);
+        let gh_bin = std::path::PathBuf::from("gh");
+        let mut total_checked = 0usize;
+        let mut total_released = 0usize;
+        for root in &roots {
+            let (checked, released) =
+                quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
+            total_checked += checked;
+            total_released += released;
+        }
+        if total_released > 0 {
+            log::info!(
+                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
+                 issue(s) across {} workspace(s), released {total_released} stranded \
+                 quarantine(s) (#4110)",
+                roots.len()
+            );
+        } else {
+            log::debug!(
+                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
+                 issue(s) across {} workspace(s), nothing to release",
+                roots.len()
+            );
+        }
+    } else {
+        log::info!(
+            "quarantine_reconciliation: startup pass disabled ({}=0)",
+            quarantine_reconciliation::RECONCILE_ENABLED_ENV
+        );
+    }
+
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
     // watchdog knobs from `.loom/config.json → autonomous` with env override
     // (precedence env > config > default). The stagger serializes back-to-back
@@ -535,6 +777,21 @@ async fn main() -> Result<()> {
         quarantine_config.insta_crash_secs
     );
 
+    // Cross-host collision detection (#4085, Phase 0 of #4028): resolve env >
+    // config > default(off) for the default workspace so a shared-backlog
+    // deployment can measure the baseline duplicate-dispatch rate. Detection
+    // only — a detected collision is logged/counted, never acted on.
+    let detect_collisions = sweep_registry::resolve_collision_detection(&sweep_workspace);
+    sweep.set_collision_detection(detect_collisions);
+    log::info!(
+        "sweep_registry: cross-host collision detection {} (#4085)",
+        if detect_collisions {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
@@ -550,6 +807,11 @@ async fn main() -> Result<()> {
     let workspace_pool =
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
+
+    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
+    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
+    workspace_pool.start_safehouse_narration(&sweep_workspace);
 
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
     // any daemon-dispatched sweep that hangs at startup with no progress. On by
@@ -593,6 +855,14 @@ async fn main() -> Result<()> {
     // pre-#3930 single-flag behavior byte-for-byte.
     let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
 
+    // Shared drain-and-restart state (Issue #4090). Constructed here — before the
+    // epic supervisor, work-finder, and role runner — so its flag can be threaded
+    // into all three dispatch producers AND into the IPC server (which sets/aborts
+    // it and renders it in `loom-daemon status`). With no drain requested the flag
+    // stays `false`, so every producer's halt check is byte-for-byte unchanged.
+    let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
+    let drain_flag = drain_state.flag();
+
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
     // through its fork-join lifecycle by dispatching the enabled role each tick.
@@ -617,6 +887,7 @@ async fn main() -> Result<()> {
             event_bus.clone(),
             workspace_health_states.clone(),
             interval,
+            drain_flag.clone(),
         ) {
             Ok(handle) => {
                 log::info!(
@@ -671,9 +942,20 @@ async fn main() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
+        // CPU headroom knobs (#4032): resolved once at startup from the same
+        // `work_finder_config`, precedence env > config > default — matching
+        // `per_token_concurrency` exactly (single-root, startup-time; the
+        // dynamic cap is one global number per tick, computed before the
+        // workspace registry is even loaded, so there is no per-workspace
+        // variant of these knobs).
+        let cpu_utilization_target =
+            work_finder::resolve_cpu_utilization_target(&work_finder_config);
+        let cpu_est_cores_per_sweep =
+            work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             per_token_concurrency={per_token_concurrency}, \
+             per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
+             cpu_est_cores_per_sweep={cpu_est_cores_per_sweep}, \
              dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
              global across workspaces)",
             interval.as_secs()
@@ -687,8 +969,11 @@ async fn main() -> Result<()> {
             interval,
             configured_max,
             per_token_concurrency,
+            cpu_utilization_target,
+            cpu_est_cores_per_sweep,
             workspace_health_states.clone(),
             event_bus.clone(),
+            drain_flag.clone(),
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
@@ -766,6 +1051,31 @@ async fn main() -> Result<()> {
             None
         };
 
+    // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
+    // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
+    // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
+    // "a daemon should be running but isn't" WITHOUT talking to the daemon — a
+    // dead daemon cannot report its own death, so the reporter must live outside
+    // this process. Default-ON like the token-ranking refresh / watch-monitor
+    // loops (it only writes a small bookkeeping file with no dispatch side
+    // effect); opt out with `LOOM_DAEMON_HEARTBEAT=0` /
+    // `autonomous.heartbeat.enabled=false`. We deliberately do NOT reuse the
+    // token-ranking `.ranking` mtime as an accidental heartbeat: that is a
+    // config-disableable side effect, so a detector keyed to it would silently
+    // stop working when that loop is turned off.
+    let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
+    let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
+        let interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
+        log::info!("daemon_heartbeat: enabled (interval={}s)", interval.as_secs());
+        daemon_heartbeat::spawn_heartbeat_task(interval)
+    } else {
+        log::debug!(
+            "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
+             autonomous.heartbeat.enabled=true to opt in)"
+        );
+        None
+    };
+
     // Autonomous periodic support-role runner (Issue #4015): dispatches the
     // standalone support roles (Champion, Curator, Judge, Auditor, Guide)
     // host-side through `spawn-claude.sh` on their own per-role cadence,
@@ -796,7 +1106,12 @@ async fn main() -> Result<()> {
             .map(|spec| {
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
                 log::info!("role_runner: {} interval={}s", spec.name, interval.as_secs());
-                role_runner::spawn_multi_role_task(*spec, sweep_workspace.clone(), interval)
+                role_runner::spawn_multi_role_task(
+                    *spec,
+                    sweep_workspace.clone(),
+                    interval,
+                    drain_flag.clone(),
+                )
             })
             .collect();
         Some(handles)
@@ -845,7 +1160,9 @@ async fn main() -> Result<()> {
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
     // per-repo status breakdown — the same values the work-finder and gate loop
-    // share above.
+    // share above. `credential_preflight` (#4005) is threaded in so
+    // `DaemonStatus` can report the startup credential resolution computed
+    // once above, without reading logs.
     let server = IpcServer::new(
         socket_path.clone(),
         tm,
@@ -855,6 +1172,8 @@ async fn main() -> Result<()> {
         workspace_health_states.clone(),
         workspace_pool.clone(),
         sweep_workspace.clone(),
+        credential_preflight,
+        drain_state.clone(),
     );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
@@ -876,8 +1195,18 @@ async fn main() -> Result<()> {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = tokio::fs::remove_file(&socket_path_clone).await;
-        log::info!("Socket cleaned up, exiting");
-        std::process::exit(0);
+        // Exit code carries shutdown intent (Issue #4054, Curator Finding 1):
+        // under launchd `KeepAlive:SuccessfulExit` a clean exit(0) triggers a
+        // relaunch, so a signal-driven stop MUST exit non-zero — otherwise an
+        // operator stop would race launchd into relaunching the daemon. Only the
+        // `RestartDaemon` primitive exits 0. SIGTERM => 143, SIGINT => 130.
+        let code = if signal_name == "SIGTERM" {
+            loom_daemon::ipc::EXIT_SIGTERM
+        } else {
+            loom_daemon::ipc::EXIT_SIGINT
+        };
+        log::info!("Socket cleaned up, exiting {code} (operator stop — no supervised relaunch)");
+        std::process::exit(code);
     });
 
     log::info!("Loom daemon starting...");
@@ -938,10 +1267,43 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
-fn setup_logging() -> Result<()> {
-    let log_path = dirs::home_dir()
+/// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
+/// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
+/// effects (no directory creation), so it's safe to call from `setup_logging()`
+/// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
+/// as well as from `main()` and `resolve_socket_path()` without duplicating the
+/// branching logic three times over.
+fn resolve_loom_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        let socket_path = PathBuf::from(path);
+        let loom_dir = socket_path
+            .parent()
+            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
+            .to_path_buf();
+        return Ok(loom_dir);
+    }
+    let loom_dir = dirs::home_dir()
         .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom/daemon.log");
+        .join(".loom");
+    Ok(loom_dir)
+}
+
+/// Resolve the daemon log file path: `LOOM_DAEMON_LOG` (full override) when
+/// set, else `<loom dir>/daemon.log` derived from [`resolve_loom_dir`]. This
+/// means `LOOM_SOCKET_PATH`-style test isolation covers the log file for free
+/// — a test daemon pointed at a tempdir socket also logs into that tempdir,
+/// never into the operator's `~/.loom/daemon.log` (Issue #4010). Precedence is
+/// env > default only; see #4010 for why a config tier is out of scope here
+/// (`setup_logging()` runs before workspace/config resolution).
+fn resolve_log_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(resolve_loom_dir()?.join("daemon.log"))
+}
+
+fn setup_logging() -> Result<()> {
+    let log_path = resolve_log_path()?;
 
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -973,6 +1335,85 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod resolve_paths_tests {
+    //! Tests for [`resolve_loom_dir`] and [`resolve_log_path`] (Issue #4010).
+    //!
+    //! `setup_logging()` itself is deliberately NOT unit-tested here: it calls
+    //! `env_logger::Builder::...init()`, which panics if called a second time
+    //! in the same process. Splitting the pure path-resolution logic out into
+    //! these two functions is exactly what makes it testable at all.
+    //!
+    //! Both tests mutate the process-global `LOOM_SOCKET_PATH` / `LOOM_DAEMON_LOG`
+    //! env vars, so they're `#[serial]` (the crate already depends on
+    //! `serial_test` for this exact purpose — see `dispatch_tests` below) to
+    //! avoid racing other env-mutating tests in the same binary.
+    use super::{resolve_log_path, resolve_loom_dir};
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn resolve_loom_dir_defaults_to_home_loom() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        let expected = dirs::home_dir().expect("home dir").join(".loom");
+        assert_eq!(resolve_loom_dir().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_loom_dir_honors_socket_path_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+
+        let resolved = resolve_loom_dir().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_log_path_defaults_to_home_loom_daemon_log() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        let expected = dirs::home_dir()
+            .expect("home dir")
+            .join(".loom")
+            .join("daemon.log");
+        assert_eq!(resolve_log_path().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_log_path_honors_loom_daemon_log_override() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/some/d/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/some/d/daemon.log"));
+    }
+
+    /// `LOOM_DAEMON_LOG` must win even when `LOOM_SOCKET_PATH` is also set —
+    /// the explicit log override always takes precedence over the derived path.
+    #[test]
+    #[serial]
+    fn resolve_log_path_daemon_log_wins_over_socket_path_derivation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/explicit/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/explicit/daemon.log"));
+    }
+}
+
 /// Handle CLI commands (init, stats, validate modes)
 #[allow(clippy::too_many_lines)]
 fn handle_cli_command(command: Commands) -> Result<()> {
@@ -990,6 +1431,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             format,
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Workspace { action } => handle_workspace_command(action),
+        Commands::Tokens { action } => handle_tokens_command(action),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -1009,6 +1451,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Watch is handled in main() before handle_cli_command")
+        }
+        Commands::Restart { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Restart is handled in main() before handle_cli_command")
         }
         Commands::Init {
             workspace,
@@ -1193,10 +1640,7 @@ fn resolve_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return Ok(PathBuf::from(path));
     }
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    Ok(loom_dir.join("loom-daemon.sock"))
+    Ok(resolve_loom_dir()?.join("loom-daemon.sock"))
 }
 
 /// Connect to the running daemon over its Unix socket, send a single
@@ -1284,6 +1728,132 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+/// Handle the `restart` subcommand (Issue #4054 — the supervised restart
+/// primitive). Connects to the running daemon over its Unix socket and sends a
+/// single `RestartDaemon` request.
+///
+/// When the daemon is supervised (launchd) it replies `DaemonRestart {
+/// scheduled: true }` and then exits 0 for a `KeepAlive:SuccessfulExit`
+/// relaunch — we print the ack and exit 0. When it is unsupervised (nohup /
+/// Linux / `--foreground`) it replies `DaemonRestart { scheduled: false }` and
+/// keeps running — we print the refusal and exit non-zero, so an operator or
+/// Phase 3 can detect that no restart happened rather than assuming it did.
+async fn handle_restart_command(
+    drain: bool,
+    timeout: Option<u64>,
+    force_after_timeout: bool,
+    abort_drain: bool,
+) -> Result<()> {
+    let socket_path = resolve_socket_path()?;
+
+    // Drain-mode variants (Issue #4090) speak `DrainAndRestartDaemon` /
+    // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
+    // #4054 `RestartDaemon` / `DaemonRestart` contract byte-for-byte.
+    if abort_drain {
+        return handle_drain_reply(
+            &socket_path,
+            &Request::AbortDrain,
+            "loom-daemon drain aborted",
+            "no drain was in progress",
+        )
+        .await;
+    }
+    if drain {
+        return handle_drain_reply(
+            &socket_path,
+            &Request::DrainAndRestartDaemon {
+                timeout_secs: timeout,
+                force_after_timeout,
+            },
+            "loom-daemon drain scheduled",
+            "loom-daemon did NOT drain",
+        )
+        .await;
+    }
+
+    match query_daemon(&socket_path, &Request::RestartDaemon).await {
+        Ok(Response::DaemonRestart {
+            scheduled,
+            supervisor,
+            message,
+        }) => {
+            if scheduled {
+                println!(
+                    "loom-daemon restart scheduled (supervisor: {}).",
+                    supervisor.as_deref().unwrap_or("unknown")
+                );
+                println!("{message}");
+                Ok(())
+            } else {
+                eprintln!("loom-daemon did NOT restart: {message}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Shared reply handler for the drain-mode restart variants (Issue #4090): both
+/// `DrainAndRestartDaemon` and `AbortDrain` answer with a `DaemonDrain` frame.
+/// A refused request (unsupervised host, or abort with no drain in progress)
+/// exits non-zero so a script can detect that nothing happened.
+async fn handle_drain_reply(
+    socket_path: &Path,
+    request: &Request,
+    accepted_prefix: &str,
+    refused_prefix: &str,
+) -> Result<()> {
+    match query_daemon(socket_path, request).await {
+        Ok(Response::DaemonDrain {
+            accepted,
+            supervisor,
+            in_flight,
+            message,
+        }) => {
+            if accepted {
+                println!(
+                    "{accepted_prefix} (supervisor: {}, {in_flight} in-flight).",
+                    supervisor.as_deref().unwrap_or("unknown")
+                );
+                println!("{message}");
+                Ok(())
+            } else {
+                eprintln!("{refused_prefix}: {message}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
         }
     }
 }
@@ -1565,28 +2135,33 @@ async fn handle_dispatch_command(
     }
 }
 
-/// Collect per-token usage by shelling out to `loom-tokens check --json`,
-/// mirroring `probe-tokens.sh`: prefer the `loom-tokens` binary on PATH, else
-/// fall back to `python3 -m loom_tools.cli.loom_tokens`. Best-effort — returns
-/// `None` on any failure (binary absent, non-zero exit, unparseable output) so
-/// the status view still renders without the usage table.
+/// Collect per-token usage via an in-process call to
+/// [`loom_daemon::tokens_pool::check::run_check`] — the same native probe
+/// `loom-daemon tokens check --json` (`TokensAction::Check`) runs, called
+/// directly rather than shelled out to (issue #4080, epic #4081 Phase 2).
+/// `loom-daemon status` runs client-side with no supervision requirement, and
+/// the probe code is already linked into this binary, so there is no reason
+/// to pay a subprocess round-trip the way the historical `loom-tokens` /
+/// `python3 -m` two-tier shell-out did. Best-effort — never panics, never
+/// propagates an error, and returns `None` when the workspace can't be
+/// resolved so the status view still renders without the usage table.
 fn collect_token_usage() -> Option<serde_json::Value> {
-    let attempts: [(&str, &[&str]); 2] = [
-        ("loom-tokens", &["check", "--json"]),
-        ("python3", &["-m", "loom_tools.cli.loom_tokens", "check", "--json"]),
-    ];
-    for (bin, args) in attempts {
-        let Ok(output) = Command::new(bin).args(args).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            return Some(value);
-        }
-    }
-    None
+    use loom_daemon::tokens_pool::check::{
+        self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
+    };
+
+    let ws = resolve_tokens_workspace(".").ok()?;
+    let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+
+    let opts = CheckOptions {
+        source: check::resolve_source(None),
+        write_ranking: false,
+        probe_prompt: DEFAULT_PROBE_PROMPT,
+        model: DEFAULT_PROBE_MODEL,
+        stagger: true,
+    };
+    let report = check::run_check(&tokens_dir, &opts, &CurlTransport);
+    Some(report.to_json())
 }
 
 /// Handle the `status` subcommand — render the running daemon's autonomous-mode
@@ -1783,15 +2358,23 @@ fn print_status_json(
     let combined = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
+        // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
+        // once in-flight reaches it. `false` ⇒ the limiter is work availability,
+        // not any resource term, so scripted consumers don't misread the
+        // token/CPU ceiling as a bottleneck at low occupancy.
+        "capacity_bound": report.capacity_bound,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             "disk_headroom": report.disk_headroom,
-            // CPU/load headroom term (#3978) — see the field docs on
-            // `DaemonStatusReport::cpu_headroom` for the pre-#3978 `0` ⇒
-            // "field absent" wire-compat convention.
+            // CPU headroom term (#3978; measured-idle signal #4031) — see the
+            // field docs on `DaemonStatusReport::cpu_headroom` for the pre-#3978
+            // `0` ⇒ "field absent" wire-compat convention.
             "cpu_headroom": report.cpu_headroom,
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
+            // Measured CPU idle fraction (#4031), the signal that replaced
+            // loadavg as the source of consumed cores. `null` until sampled.
+            "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
             "per_token_concurrency": report.per_token_concurrency.max(1),
             "token_axis_effective": rc.token_axis_limit.saturating_mul(report.per_token_concurrency.max(1)),
@@ -1815,6 +2398,32 @@ fn print_status_json(
             "not_evaluated": report.main_health_gate_not_evaluated,
             // Which failure class actually blocked evaluation (#3974 AC2).
             "not_evaluated_reason": report.main_health_gate_not_evaluated_reason,
+            // Whether the gate is actually enabled for this root, and when its
+            // last completed verdict landed (#4012) — the disambiguators
+            // between "disabled", "pending" (enabled, no verdict yet), and
+            // "clear" (verified green), all three of which pre-#4012 rendered
+            // identically as `halted: false, not_evaluated: false`.
+            "enabled": report.main_health_gate_enabled,
+            "verdict_at": report.main_health_gate_verdict_at,
+        },
+        // Startup forge-credential preflight (#4005) — resolved once at
+        // daemon boot, before the daemon's first `gh` consumer. Never
+        // contains a token value; `null` only from a pre-#4005 daemon binary
+        // that never computed one.
+        "credential_preflight": report.credential_preflight.as_ref().map(|c| serde_json::json!({
+            "ok": c.ok,
+            "mechanism": c.mechanism,
+            "fingerprint": c.fingerprint,
+            "message": c.message,
+            "checked_at": c.checked_at,
+        })),
+        // Scheduled drain-and-restart state (#4090). `draining: false` in the
+        // common case; `note` carries the last transition (timeout refusal /
+        // abort) so a scripted consumer sees why a drain ended without a restart.
+        "drain": {
+            "draining": report.draining,
+            "deadline": report.drain_deadline,
+            "note": report.drain_note,
         },
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
@@ -1824,6 +2433,8 @@ fn print_status_json(
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
             "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
+            "health_gate_enabled": r.health_gate_enabled,
+            "health_gate_verdict_at": r.health_gate_verdict_at,
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -1851,31 +2462,152 @@ fn print_status_json(
     Ok(())
 }
 
+/// The reportable main-health-gate condition for one workspace root (#4012).
+///
+/// Pre-#4012, `loom-daemon status` derived its summary from just the
+/// `halted`/`not_evaluated` boolean pair — and `(false, false)` meant any of
+/// three genuinely different things: the gate is disabled, the gate is
+/// enabled but has not completed its first evaluation this process
+/// ("pending"), or the gate's last completed run verified `main` green
+/// ("clear"). Two booleans cannot encode three states, so this enum widens
+/// the reporting boundary rather than reusing the same pair for a fourth
+/// meaning. [`classify_gate_verdict`] builds one from the raw wire-report
+/// ingredients; [`format_gate_status`] (long form) and
+/// [`gate_status_short_label`] (13-char table column) both render it, so the
+/// top-level summary and the per-repo table can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateVerdict {
+    /// The gate is not enabled for this root — or is enabled but has no
+    /// usable `buildGate` block, which the gate loop treats identically
+    /// (always-green, never runs). Dispatch is allowed; nothing will ever
+    /// evaluate this root until it is turned on (and configured).
+    Disabled,
+    /// The gate is enabled but has not completed a first evaluation yet this
+    /// daemon process. Dispatch is allowed — this is NOT evidence that `main`
+    /// is healthy, only that nothing has said otherwise yet.
+    Pending,
+    /// The gate's most recent completed run verified `main` green. `since`
+    /// is the wall-clock time of that verdict, when known (#4012 AC4) — a
+    /// `clear` reading with no `since` predates the daemon populating it.
+    Clear { since: Option<DateTime<Utc>> },
+    /// The most recent tick could not produce a verdict at all (dirty tree,
+    /// timeout, missing tool, broken `git`, …) — NOT evidence about `main`
+    /// either way; dispatch is NOT halted by this.
+    NotEvaluated { reason: Option<String> },
+    /// A completed run verified `main` red — dispatch is paused (in-flight
+    /// sweeps keep running). `not_evaluated` records whether a *later* tick
+    /// also failed to produce a verdict (#3950 AC3): the two can co-occur,
+    /// since an unevaluated tick leaves the prior halt untouched.
+    Halted {
+        not_evaluated: bool,
+        reason: Option<String>,
+    },
+}
+
+/// Classify the reportable gate condition from a [`DaemonStatusReport`] /
+/// [`crate::types::RepoStatus`]'s raw fields (#4012).
+///
+/// `enabled` is `Some(false)` only when the daemon positively resolved this
+/// root's gate as off (or effectively off — enabled but no usable
+/// `buildGate` block, via [`main_health_gate::effective_enabled`]); `None`
+/// means an older daemon that never reported the flag at all, which must NOT
+/// be misread as "disabled" (a bare `bool`'s wire default would do exactly
+/// that — see the `Option<bool>` rationale on
+/// [`DaemonStatusReport::main_health_gate_enabled`]). `halted` and
+/// `not_evaluated` take priority over disabled/pending so a genuinely active
+/// halt is never hidden behind either newer state — a case that in practice
+/// only arises from a test poking the raw state directly, since the gate
+/// loop's own disabled path always clears `halted` first.
+fn classify_gate_verdict(
+    enabled: Option<bool>,
+    halted: bool,
+    not_evaluated: bool,
+    reason: Option<&str>,
+    verdict_at: Option<DateTime<Utc>>,
+) -> GateVerdict {
+    if halted {
+        return GateVerdict::Halted {
+            not_evaluated,
+            reason: reason.map(str::to_string),
+        };
+    }
+    if not_evaluated {
+        return GateVerdict::NotEvaluated {
+            reason: reason.map(str::to_string),
+        };
+    }
+    if enabled == Some(false) {
+        return GateVerdict::Disabled;
+    }
+    if verdict_at.is_none() {
+        return GateVerdict::Pending;
+    }
+    GateVerdict::Clear { since: verdict_at }
+}
+
 /// Render the main-health gate summary line for `loom-daemon status`.
 ///
-/// `halted` means a gate run **completed** and found `main` verified-red — the
-/// only state that pauses dispatch. `not_evaluated` means the most recent tick
-/// could not produce a verdict at all; `reason` (`"<class>: <detail>"`, #3974
-/// AC2) names *why*. Before #3974 this line asserted "workspace tree is dirty"
-/// for every skip, which reported a clean tree as dirty whenever the real cause
-/// was a timeout, a missing build tool, or a broken `git`.
-fn format_gate_status(halted: bool, not_evaluated: bool, reason: Option<&str>) -> String {
-    let cause =
-        reason.map_or_else(|| "cause unrecorded".to_string(), std::string::ToString::to_string);
-    match (halted, not_evaluated) {
-        (true, true) => format!(
-            "HALTED (main verified red — new dispatch paused) + NOT EVALUATED ({cause}) — \
-             the gate cannot currently confirm main is still red, or check for recovery"
-        ),
-        (true, false) => {
-            "HALTED (main verified red — new dispatch paused; in-flight sweeps keep running)"
-                .to_string()
+/// Before #3974 this line asserted "workspace tree is dirty" for every skip,
+/// which reported a clean tree as dirty whenever the real cause was a
+/// timeout, a missing build tool, or a broken `git`; before #4012 `clear` and
+/// "the gate has never run" were the same string.
+fn format_gate_status(verdict: &GateVerdict) -> String {
+    match verdict {
+        GateVerdict::Disabled => "disabled (gate not enabled; dispatch allowed)".to_string(),
+        GateVerdict::Pending => {
+            "pending (no verdict yet this process — dispatch allowed)".to_string()
         }
-        (false, true) => format!(
-            "not evaluated ({cause}) — the gate could not run, which is NOT evidence about \
-             main; dispatch is NOT halted by this"
-        ),
-        (false, false) => "clear (dispatch allowed)".to_string(),
+        GateVerdict::Clear { since } => match since {
+            Some(t) => {
+                format!("clear (dispatch allowed; last verified green at {})", t.to_rfc3339())
+            }
+            None => "clear (dispatch allowed)".to_string(),
+        },
+        GateVerdict::NotEvaluated { reason } => {
+            let cause = reason
+                .clone()
+                .unwrap_or_else(|| "cause unrecorded".to_string());
+            format!(
+                "not evaluated ({cause}) — the gate could not run, which is NOT evidence about \
+                 main; dispatch is NOT halted by this"
+            )
+        }
+        GateVerdict::Halted {
+            not_evaluated,
+            reason,
+        } => {
+            if *not_evaluated {
+                let cause = reason
+                    .clone()
+                    .unwrap_or_else(|| "cause unrecorded".to_string());
+                format!(
+                    "HALTED (main verified red — new dispatch paused) + NOT EVALUATED ({cause}) — \
+                     the gate cannot currently confirm main is still red, or check for recovery"
+                )
+            } else {
+                "HALTED (main verified red — new dispatch paused; in-flight sweeps keep running)"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Render `verdict` as a short label for the per-repo table's 13-char `GATE`
+/// column (#4012) — the short-form counterpart to [`format_gate_status`].
+fn gate_status_short_label(verdict: &GateVerdict) -> &'static str {
+    match verdict {
+        GateVerdict::Disabled => "disabled",
+        GateVerdict::Pending => "pending",
+        GateVerdict::Clear { .. } => "clear",
+        GateVerdict::NotEvaluated { .. } => "not-evaluated",
+        GateVerdict::Halted {
+            not_evaluated: true,
+            ..
+        } => "HALTED+UNEVAL",
+        GateVerdict::Halted {
+            not_evaluated: false,
+            ..
+        } => "HALTED",
     }
 }
 
@@ -1924,26 +2656,45 @@ fn print_status_human(
         report.cpu_headroom,
         report.configured_max
     );
-    // CPU/load headroom detail (#3978 AC4: "status shows current
-    // loadavg/CPU headroom next to disk headroom"). `cpu_headroom == 0` with
-    // `logical_cpus == 0` means an older daemon (pre-#3978) never sent these
-    // fields — nothing to show.
+    // CPU headroom detail (#3978 AC4; measured-idle signal #4031). The signal
+    // chain is measured idle → loadavg → static capacity, so the line names
+    // which signal actually fed the term. `logical_cpus == 0` means an older
+    // daemon (pre-#3978) never sent these fields — nothing to show.
     if report.logical_cpus > 0 {
-        match report.loadavg_1m {
-            Some(load) => println!(
-                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, 1m loadavg {load:.2})",
-                report.cpu_headroom, report.logical_cpus
+        let basis = match (report.cpu_idle_fraction, report.loadavg_1m) {
+            // Preferred: measured CPU consumption (#4031). Show consumed cores so
+            // the operator can see the term is tracking real usage, not loadavg.
+            (Some(idle), _) => {
+                let consumed = report.logical_cpus as f64 * (1.0 - idle.clamp(0.0, 1.0));
+                format!(
+                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed)",
+                    report.logical_cpus,
+                    idle * 100.0,
+                    consumed
+                )
+            }
+            // Fallback: 1-minute load average (#3978 behavior) until an idle
+            // sample exists (e.g. the first Linux cross-tick delta not yet taken).
+            (None, Some(load)) => format!(
+                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet — loadavg fallback)",
+                report.logical_cpus
             ),
-            None => println!(
-                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, loadavg \
-                 unavailable on this platform — static capacity only)",
-                report.cpu_headroom, report.logical_cpus
+            // Static capacity only: no CPU signal at all on this platform.
+            (None, None) => format!(
+                "{} logical cores, no CPU signal on this platform — static capacity only",
+                report.logical_cpus
             ),
-        }
+        };
+        println!("  cpu headroom: {} concurrent-sweep slot(s) ({basis})", report.cpu_headroom);
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
     println!("\nToken capacity:");
+    // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
+    // minimum of several ceilings, but a ceiling only *binds* once in-flight
+    // occupancy reaches it. Below the cap the limiter is work availability, not
+    // any resource term — so the token-bound diagnosis below is gated on this.
+    let capacity_bound = report.in_flight.len() >= rc.effective_cap;
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-tokens check --json"
@@ -1967,7 +2718,18 @@ fn print_status_human(
                 report.capacity.healthy_accounts
             );
         }
-        if rc.token_bound {
+        if !capacity_bound {
+            // In-flight is below the cap: nothing is binding. Naming tokens (or
+            // any resource) as "the bottleneck" here is the #4031 defect — at,
+            // say, 1 in-flight against a cap of 7 the limiter is simply how much
+            // ready work exists. Suppress the token-bound diagnosis.
+            println!(
+                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
+                 not tokens/disk/CPU)",
+                report.in_flight.len(),
+                rc.effective_cap
+            );
+        } else if rc.token_bound {
             if rc.healthy == 0 {
                 println!(
                     "  token-bound: NO healthy accounts — new dispatch deferred until capacity \
@@ -1989,6 +2751,14 @@ fn print_status_human(
              health basis)",
             report.token_pool_size
         );
+        if !capacity_bound {
+            println!(
+                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
+                 not tokens/disk/CPU)",
+                report.in_flight.len(),
+                rc.effective_cap
+            );
+        }
     }
 
     // "Halted" (a completed gate run found main verified-red) and "not
@@ -1998,12 +2768,55 @@ fn print_status_human(
     // cause is reported verbatim from the gate (#3974 AC2) — pre-#3974 this
     // line hard-coded "workspace tree is dirty" for every skip, which
     // misreported timeouts / missing tools / broken `git` as a dirty tree.
-    let gate = format_gate_status(
+    let verdict = classify_gate_verdict(
+        report.main_health_gate_enabled,
         report.main_health_gate_halted,
         report.main_health_gate_not_evaluated,
         report.main_health_gate_not_evaluated_reason.as_deref(),
+        report.main_health_gate_verdict_at,
     );
+    let gate = format_gate_status(&verdict);
     println!("\nMain-health gate: {gate}");
+
+    // Startup forge-credential preflight (#4005) — resolved once at daemon
+    // boot, before the daemon's first `gh` consumer, so a headless/SSH-only
+    // start with no usable credential is visible here rather than only as
+    // silent per-tick 401s in the logs. `None` only from a pre-#4005 daemon
+    // binary that never computed one.
+    match &report.credential_preflight {
+        Some(c) if c.ok => {
+            println!(
+                "Forge credential: OK — {} ({})",
+                c.mechanism,
+                c.fingerprint.as_deref().unwrap_or("no fingerprint")
+            );
+        }
+        Some(c) => println!("Forge credential: DEGRADED — {}", c.message),
+        None => {
+            println!("Forge credential: unknown (older daemon binary — restart to pick up #4005)")
+        }
+    }
+
+    // Scheduled drain-and-restart (#4090): a drain that quietly hangs is worse
+    // than no drain, so surface DRAINING with the remaining count + deadline.
+    // A `drain_note` (timeout refusal / abort) persists after a drain ends so
+    // the operator sees WHY the daemon is still up rather than restarted.
+    if report.draining {
+        let deadline = report.drain_deadline.map_or_else(
+            || "no deadline".to_string(),
+            |d| {
+                let secs = (d - Utc::now()).num_seconds();
+                if secs >= 0 {
+                    format!("deadline in {secs}s ({d})")
+                } else {
+                    format!("deadline passed {}s ago ({d})", -secs)
+                }
+            },
+        );
+        println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
+    } else if let Some(note) = &report.drain_note {
+        println!("Drain: not draining (last: {note})");
+    }
 
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own
@@ -2019,14 +2832,16 @@ fn print_status_human(
         println!("  {:>4}  {:>9}  {:<13}  REPO", "PRIO", "IN-FLIGHT", "GATE");
         println!("  {:-<60}", "");
         for r in &report.per_repo {
-            // Same halted/not-evaluated distinction as the top-level summary
-            // above, condensed for the table column (#3950 AC3).
-            let gate = match (r.health_gate_halted, r.health_gate_not_evaluated) {
-                (true, true) => "HALTED+UNEVAL",
-                (true, false) => "HALTED",
-                (false, true) => "not-evaluated",
-                (false, false) => "clear",
-            };
+            // Same classification as the top-level summary above, condensed
+            // for the table column (#3950 AC3, widened #4012).
+            let verdict = classify_gate_verdict(
+                r.health_gate_enabled,
+                r.health_gate_halted,
+                r.health_gate_not_evaluated,
+                r.health_gate_not_evaluated_reason.as_deref(),
+                r.health_gate_verdict_at,
+            );
+            let gate = gate_status_short_label(&verdict);
             println!(
                 "  {:>4}  {:>9}  {:<13}  {}",
                 r.priority,
@@ -2372,6 +3187,28 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                             canonical.display()
                         );
                     }
+                    // Issue #4027: `.git`/`.loom` alone does not mean the
+                    // `/loom:sweep` slash command is installed — those files
+                    // are install-not-committed (gitignored), so a bare
+                    // `git clone` passes the `looks_like_workspace` check
+                    // above while still being undispatchable. Dispatching
+                    // into it insta-crashes on `Unknown command:
+                    // /loom:sweep`, and because the reaper reverts
+                    // `loom:building` -> `loom:issue` on that insta-crash,
+                    // the work-finder re-dispatches every tick — an infinite
+                    // token-burning loop. `dispatch()` itself now refuses
+                    // this case (the load-bearing fix), but warn here too so
+                    // the operator sees it at registration time, before any
+                    // dispatch is attempted.
+                    if !SweepRegistryConfig::new(canonical.clone()).has_sweep_command() {
+                        eprintln!(
+                            "  warning: {} has no .claude/commands/loom/sweep.md — the \
+                             /loom:sweep command is not installed there. Dispatch into this \
+                             workspace will be refused until you run `loom-daemon init {}`.",
+                            canonical.display(),
+                            canonical.display()
+                        );
+                    }
                 }
             }
             Ok(())
@@ -2438,13 +3275,336 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
     }
 }
 
+/// Resolve the `--workspace` flag to an absolute path. No upward `.git`
+/// walk (unlike Python's `find_repo_root()`) — a deliberate Phase-1
+/// simplification since this CLI has no existing callers yet; pass the
+/// canonical repo root explicitly (as `spawn-claude.sh` already resolves via
+/// `git rev-parse --git-common-dir` for the Python selector).
+fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
+    let p = Path::new(workspace);
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+/// Handle `loom-daemon tokens <select|pin|unpin|unblock>` (Issue #4082,
+/// Phase 1 of epic #4081). Purely file-based — does not require a running
+/// daemon. See `loom-daemon/src/tokens_pool/mod.rs` for the ported subset
+/// and what is deliberately deferred.
+fn handle_tokens_command(action: TokensAction) -> Result<()> {
+    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
+
+    match action {
+        TokensAction::Select {
+            workspace,
+            export,
+            no_key,
+        } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            match select::select_token(&ws, None) {
+                Ok(sel) => {
+                    if export {
+                        if no_key {
+                            println!(
+                                "# selected={} mode={} file={}",
+                                sel.name,
+                                sel.mode,
+                                sel.file.display()
+                            );
+                        } else {
+                            // Tokens are base64/hex-like and never contain a
+                            // single quote in practice; this is a simple
+                            // wrap, not a full Python repr() escape (no
+                            // caller consumes --export in this phase — see
+                            // module docs).
+                            println!("export CLAUDE_CODE_OAUTH_TOKEN='{}'", sel.key);
+                            println!(
+                                "# selected={} mode={} file={}",
+                                sel.name,
+                                sel.mode,
+                                sel.file.display()
+                            );
+                        }
+                    } else {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("name".to_string(), serde_json::Value::String(sel.name));
+                        obj.insert(
+                            "file".to_string(),
+                            serde_json::Value::String(sel.file.display().to_string()),
+                        );
+                        obj.insert(
+                            "mode".to_string(),
+                            serde_json::Value::String(sel.mode.to_string()),
+                        );
+                        if !no_key {
+                            obj.insert("key".to_string(), serde_json::Value::String(sel.key));
+                        }
+                        println!("{}", serde_json::Value::Object(obj));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(select::EX_CONFIG);
+                }
+            }
+        }
+
+        TokensAction::Check {
+            workspace,
+            ranking,
+            source,
+            probe_prompt,
+            json,
+            no_stagger,
+        } => {
+            use loom_daemon::tokens_pool::check::{
+                self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
+            };
+
+            let ws = resolve_tokens_workspace(&workspace)?;
+            let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+
+            let source_flag = match source {
+                Some(raw) => match check::Source::parse(&raw) {
+                    Some(s) => Some(s),
+                    None => {
+                        eprintln!(
+                            "error: invalid --source {raw:?}; expected one of auto, monitor, probe"
+                        );
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let resolved_source = check::resolve_source(source_flag);
+            let prompt = probe_prompt.unwrap_or_else(|| DEFAULT_PROBE_PROMPT.to_string());
+
+            let opts = CheckOptions {
+                source: resolved_source,
+                write_ranking: ranking,
+                probe_prompt: &prompt,
+                model: DEFAULT_PROBE_MODEL,
+                stagger: !no_stagger,
+            };
+            let transport = CurlTransport;
+            let report = check::run_check(&tokens_dir, &opts, &transport);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                println!("{}", check::format_table(&report));
+            }
+
+            // Exit 1 only when every probe failed (selector has nothing usable).
+            if !report.accounts.is_empty()
+                && report
+                    .accounts
+                    .iter()
+                    .all(|a| a.status == "error" || a.status == "skipped")
+            {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+
+        TokensAction::Pin { action, workspace } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            handle_pin_action(action, &ws)
+        }
+
+        TokensAction::Unpin { workspace, json } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            let had_file = allowlist::clear_allowlist(&ws).map_err(|e| anyhow!(e))?;
+            let _ = failure_counts::reset_all(&ws);
+            if json {
+                println!("{}", serde_json::json!({ "cleared": had_file }));
+            } else if had_file {
+                println!("Allowlist cleared. All accounts are eligible.");
+            } else {
+                println!("No allowlist was active.");
+            }
+            Ok(())
+        }
+
+        TokensAction::Unblock {
+            names,
+            workspace,
+            all_reasons,
+            json,
+        } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+
+            let available = allowlist::list_accounts(&ws);
+            let available_set: std::collections::HashSet<&str> =
+                available.iter().map(String::as_str).collect();
+            let mut validated: Vec<String> = Vec::new();
+            for raw in &names {
+                let name = raw.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if !available_set.contains(name) {
+                    let avail = if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    };
+                    eprintln!("Unknown account '{name}'. Available: {avail}");
+                    std::process::exit(2);
+                }
+                validated.push(name.to_string());
+            }
+            if validated.is_empty() {
+                eprintln!("`unblock` requires at least one account name.");
+                std::process::exit(1);
+            }
+
+            let (removed, kept) =
+                bad_tokens::unblock(&ws, &validated, all_reasons).map_err(|e| anyhow!(e))?;
+            for name in &validated {
+                let _ = failure_counts::record_success(&ws, name);
+            }
+
+            if json {
+                println!("{}", serde_json::json!({ "removed": removed, "kept": kept }));
+            } else if removed > 0 {
+                let plural = if removed == 1 { "y" } else { "ies" };
+                println!("Removed {removed} bad-token entr{plural} for: {}", validated.join(", "));
+            } else {
+                println!(
+                    "No matching entries removed (use --all-reasons to drop non-auth entries \
+                     too)."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handle `loom-daemon tokens pin <set|add|remove|status>`.
+fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
+    use loom_daemon::tokens_pool::{allowlist, failure_counts};
+
+    match action {
+        PinAction::Set { names } => match allowlist::write_allowlist(ws, &names) {
+            Ok(written) => {
+                let _ = failure_counts::reset_all(ws);
+                if written.is_empty() {
+                    println!("Allowlist cleared (no names resolved). All accounts are eligible.");
+                } else {
+                    println!(
+                        "Allowlist set to {} account(s): {}",
+                        written.len(),
+                        written.join(", ")
+                    );
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Add { names } => match allowlist::add_to_allowlist(ws, &names) {
+            Ok((added, skipped)) => {
+                let _ = failure_counts::reset_all(ws);
+                if !added.is_empty() {
+                    println!("Added {} account(s): {}", added.len(), added.join(", "));
+                }
+                if !skipped.is_empty() {
+                    println!("Already present: {}", skipped.join(", "));
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Remove { names } => match allowlist::remove_from_allowlist(ws, &names) {
+            Ok((removed, skipped)) => {
+                let _ = failure_counts::reset_all(ws);
+                if !removed.is_empty() {
+                    println!("Removed {} account(s): {}", removed.len(), removed.join(", "));
+                }
+                if !skipped.is_empty() {
+                    println!("Not in allowlist: {}", skipped.join(", "));
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Status { json } => {
+            let all_accounts = allowlist::list_accounts(ws);
+            let active = allowlist::read_allowlist(ws);
+            if json {
+                let payload = serde_json::json!({
+                    "allowlist_active": !active.is_empty(),
+                    "allowlist": active,
+                    "accounts": all_accounts,
+                });
+                println!("{payload}");
+                return Ok(());
+            }
+            if active.is_empty() {
+                println!("No allowlist active — all accounts are eligible.");
+            } else {
+                println!("Allowlist active ({} account(s)):", active.len());
+                for name in &active {
+                    println!("  * {name}");
+                }
+            }
+            if all_accounts.is_empty() {
+                println!();
+                eprintln!("No .token files found. Run `loom-tokens bootstrap` first.");
+            } else {
+                println!();
+                println!("Available accounts ({}):", all_accounts.len());
+                let active_set: std::collections::HashSet<&str> =
+                    active.iter().map(String::as_str).collect();
+                for name in &all_accounts {
+                    let mark = if active_set.contains(name.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("  {mark} {name}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_validate_command(
     workspace: &str,
     format: &str,
     strict: bool,
     verbose: bool,
 ) -> Result<()> {
-    use role_validation::{format_validation_result, validate_from_file, ValidationMode};
+    use loom_daemon::config_resolver;
+    use role_validation::{format_validation_result, validate_from_config, ValidationMode};
 
     let workspace_path = std::path::Path::new(workspace);
     let absolute_workspace = if workspace_path.is_absolute() {
@@ -2453,13 +3613,62 @@ fn handle_validate_command(
         std::env::current_dir()?.join(workspace_path)
     };
 
-    let config_path = absolute_workspace.join(".loom").join("config.json");
+    // #4059: resolve the effective config through the full tier chain rather
+    // than reading the legacy `.loom/config.json` directly. Under tiering,
+    // "the legacy file is absent" no longer implies "there is no config" — a
+    // repo may configure `terminals` entirely from `.loom-project/project.json`
+    // or `.loom-local/local.json`.
+    let config = config_resolver::resolve_effective_config(&absolute_workspace);
 
-    if !config_path.exists() {
+    // The tiers searched, in precedence order — named in every "not found" error
+    // (Finding 5: both text and json branches).
+    let mut searched_tiers: Vec<String> = Vec::new();
+    if let Some(defaults) = config_resolver::private_defaults_path() {
+        searched_tiers.push(defaults.display().to_string());
+    }
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::LEGACY_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::PROJECT_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::LOCAL_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+
+    // Retargeted precondition (#4059) — stated verbatim for #4062 to mirror:
+    //   "A workspace is validatable iff resolve_effective_config(workspace)
+    //    yields a `terminals` array with at least one element; otherwise the
+    //    command exits 1, naming every tier it searched."
+    let has_terminals = config
+        .get("terminals")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+
+    if !has_terminals {
         if format == "json" {
-            println!(r#"{{"error": "Config file not found: {}"}}"#, config_path.display());
+            let err = serde_json::json!({
+                "error": "No Loom config with a non-empty terminals array found in any tier",
+                "searched": searched_tiers,
+            });
+            println!("{}", serde_json::to_string(&err)?);
         } else {
-            eprintln!("Error: Config file not found: {}", config_path.display());
+            eprintln!(
+                "Error: No Loom config with a non-empty `terminals` array found in any tier."
+            );
+            eprintln!("\nSearched (lowest to highest precedence):");
+            for tier in &searched_tiers {
+                eprintln!("  - {tier}");
+            }
             eprintln!("\nMake sure you're in a Loom workspace or specify the path:");
             eprintln!("  loom-daemon validate /path/to/workspace");
         }
@@ -2472,14 +3681,14 @@ fn handle_validate_command(
         ValidationMode::Warn
     };
 
-    let result = validate_from_file(&config_path, mode).map_err(|e| anyhow!("{e}"))?;
+    let result = validate_from_config(&config, mode);
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         if verbose {
             println!("\nValidating role configuration...");
-            println!("  Config: {}", config_path.display());
+            println!("  Workspace: {}", absolute_workspace.display());
             println!();
         }
 
@@ -2509,9 +3718,11 @@ mod dispatch_tests {
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
-        build_dispatch_request, format_gate_status, query_daemon_bounded,
-        resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
+        build_dispatch_request, classify_gate_verdict, format_gate_status, gate_status_short_label,
+        query_daemon_bounded, resolve_dispatch_ack_timeout, GateVerdict, DAEMON_IPC_TIMEOUT_ENV,
+        DISPATCH_ACK_TIMEOUT,
     };
+    use chrono::{DateTime, Utc};
     use loom_daemon::types::{Request, Response, SweepKind};
     use serial_test::serial;
     use std::time::Duration;
@@ -2797,16 +4008,32 @@ mod dispatch_tests {
     // Main-health gate status line (#3950 AC3 shape, #3974 AC2 cause)
     // ===================================================================
 
+    /// Build a [`GateVerdict`] the same way `print_status_human` /
+    /// `print_status_json` do, so these tests exercise the real classification
+    /// path rather than constructing variants by hand.
+    fn classify(
+        enabled: Option<bool>,
+        halted: bool,
+        not_evaluated: bool,
+        reason: Option<&str>,
+        verdict_at: Option<DateTime<Utc>>,
+    ) -> GateVerdict {
+        classify_gate_verdict(enabled, halted, not_evaluated, reason, verdict_at)
+    }
+
     #[test]
     fn format_gate_status_names_the_actual_not_evaluated_cause() {
         // Pre-#3974 this line asserted "workspace tree is dirty" for EVERY
         // skip, so a `git fetch` failure on a completely clean tree was
         // reported as a dirty tree. The cause is now passed through verbatim.
-        let s = format_gate_status(
+        let v = classify(
+            Some(true),
             false,
             true,
             Some("git-failure: `git -C /repo fetch origin main` failed (exit 128)"),
+            None,
         );
+        let s = format_gate_status(&v);
         assert!(s.contains("git-failure"), "got: {s}");
         assert!(s.contains("exit 128"), "got: {s}");
         assert!(!s.contains("dirty"), "must not assume a dirty tree: {s}");
@@ -2814,28 +4041,151 @@ mod dispatch_tests {
         assert!(s.contains("NOT halted"), "an unevaluated gate does not halt: {s}");
 
         // A dirty tree still reads as a dirty tree — because the gate said so.
-        let s = format_gate_status(false, true, Some("dirty-tree: [ M src/main.rs]"));
+        let v = classify(Some(true), false, true, Some("dirty-tree: [ M src/main.rs]"), None);
+        let s = format_gate_status(&v);
         assert!(s.contains("dirty-tree"), "got: {s}");
         assert!(s.contains("src/main.rs"), "got: {s}");
     }
 
     #[test]
-    fn format_gate_status_covers_all_four_states() {
-        assert_eq!(format_gate_status(false, false, None), "clear (dispatch allowed)");
+    fn format_gate_status_covers_all_halted_and_not_evaluated_states() {
+        let clear = classify(Some(true), false, false, None, Some(Utc::now()));
+        assert!(format_gate_status(&clear).starts_with("clear (dispatch allowed"));
 
-        let halted = format_gate_status(true, false, None);
-        assert!(halted.starts_with("HALTED"), "got: {halted}");
-        assert!(halted.contains("verified red"), "got: {halted}");
+        let halted = classify(Some(true), true, false, None, None);
+        let s = format_gate_status(&halted);
+        assert!(s.starts_with("HALTED"), "got: {s}");
+        assert!(s.contains("verified red"), "got: {s}");
 
         // Both at once: a prior verified-red halt persists while the next tick
         // cannot evaluate.
-        let both = format_gate_status(true, true, Some("timeout: gate command timed out"));
-        assert!(both.contains("HALTED"), "got: {both}");
-        assert!(both.contains("NOT EVALUATED"), "got: {both}");
-        assert!(both.contains("timeout"), "got: {both}");
+        let both = classify(Some(true), true, true, Some("timeout: gate command timed out"), None);
+        let s = format_gate_status(&both);
+        assert!(s.contains("HALTED"), "got: {s}");
+        assert!(s.contains("NOT EVALUATED"), "got: {s}");
+        assert!(s.contains("timeout"), "got: {s}");
 
         // A missing cause degrades gracefully rather than inventing one.
-        let no_cause = format_gate_status(false, true, None);
-        assert!(no_cause.contains("cause unrecorded"), "got: {no_cause}");
+        let no_cause = classify(Some(true), false, true, None, None);
+        let s = format_gate_status(&no_cause);
+        assert!(s.contains("cause unrecorded"), "got: {s}");
+    }
+
+    /// #4012: the core regression this issue fixes — a fresh, enabled gate
+    /// that has never completed an evaluation must render distinctly from a
+    /// verified-green gate, even though both allow dispatch (`halted: false`,
+    /// `not_evaluated: false` in both cases pre-#4012).
+    #[test]
+    fn format_gate_status_distinguishes_pending_from_clear() {
+        let pending = classify(Some(true), false, false, None, None);
+        assert_eq!(pending, GateVerdict::Pending);
+        let s = format_gate_status(&pending);
+        assert!(s.starts_with("pending"), "got: {s}");
+        assert!(s.contains("dispatch allowed"), "got: {s}");
+        assert!(!s.contains("clear"), "must not read as verified-green: {s}");
+
+        let now = Utc::now();
+        let clear = classify(Some(true), false, false, None, Some(now));
+        assert_eq!(clear, GateVerdict::Clear { since: Some(now) });
+        let s = format_gate_status(&clear);
+        assert!(s.starts_with("clear"), "got: {s}");
+        assert!(s.contains(&now.to_rfc3339()), "clear must carry its own recency evidence: {s}");
+        assert_ne!(
+            format_gate_status(&pending),
+            format_gate_status(&clear),
+            "pending and clear must never render identically"
+        );
+    }
+
+    /// #4012 AC2: the gate-disabled case must be distinguishable from both
+    /// `pending` and `clear`.
+    #[test]
+    fn format_gate_status_distinguishes_disabled() {
+        let disabled = classify(Some(false), false, false, None, None);
+        assert_eq!(disabled, GateVerdict::Disabled);
+        let s = format_gate_status(&disabled);
+        assert!(s.starts_with("disabled"), "got: {s}");
+        assert!(s.contains("dispatch allowed"), "got: {s}");
+
+        let pending = classify(Some(true), false, false, None, None);
+        assert_ne!(
+            format_gate_status(&disabled),
+            format_gate_status(&pending),
+            "disabled and pending must never render identically"
+        );
+
+        // A disabled root that (implausibly) still carries a stale verdict
+        // timestamp from before it was turned off still reports `Disabled` —
+        // the enabled flag takes priority over verdict presence.
+        let disabled_with_stale_verdict =
+            classify(Some(false), false, false, None, Some(Utc::now()));
+        assert_eq!(disabled_with_stale_verdict, GateVerdict::Disabled);
+    }
+
+    /// #4012 AC3: `pending` and `disabled` both still allow dispatch —
+    /// observability-only, no new halt path.
+    #[test]
+    fn pending_and_disabled_never_halt() {
+        for verdict in [
+            classify(Some(true), false, false, None, None),
+            classify(Some(false), false, false, None, None),
+        ] {
+            assert!(
+                !matches!(verdict, GateVerdict::Halted { .. }),
+                "{verdict:?} must never be classified as halted"
+            );
+            let s = format_gate_status(&verdict);
+            assert!(s.contains("dispatch allowed"), "got: {s}");
+        }
+    }
+
+    /// An older daemon that never populated `main_health_gate_enabled` (wire
+    /// field absent ⇒ `None`, #4012) must not be misread as "disabled" — that
+    /// is exactly the `bool::default() == false` trap the `Option<bool>` wire
+    /// type exists to avoid.
+    #[test]
+    fn format_gate_status_legacy_none_enabled_is_not_disabled() {
+        let v = classify(None, false, false, None, None);
+        assert_ne!(v, GateVerdict::Disabled);
+        // With no verdict either, it reads as pending (dispatch allowed) —
+        // the conservative reading, never a fabricated "clear".
+        assert_eq!(v, GateVerdict::Pending);
+    }
+
+    /// `halted`/`not_evaluated` always win over disabled/pending, matching the
+    /// gate loop's own soft-fail contract (its disabled path always clears
+    /// `halted` first) — this combination should only ever arise from a test
+    /// poking the raw state directly, and the renderer must still surface it
+    /// as halted rather than silently downgrading to "disabled".
+    #[test]
+    fn format_gate_status_halted_beats_disabled_and_pending() {
+        let v = classify(Some(false), true, false, None, None);
+        assert!(matches!(
+            v,
+            GateVerdict::Halted {
+                not_evaluated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gate_status_short_label_fits_table_width_and_matches_long_form() {
+        let cases = [
+            classify(Some(false), false, false, None, None),
+            classify(Some(true), false, false, None, None),
+            classify(Some(true), false, false, None, Some(Utc::now())),
+            classify(Some(true), false, true, Some("timeout"), None),
+            classify(Some(true), true, false, None, None),
+            classify(Some(true), true, true, Some("timeout"), None),
+        ];
+        for v in cases {
+            let short = gate_status_short_label(&v);
+            assert!(short.len() <= 13, "{short:?} exceeds the 13-char GATE column");
+        }
+        // The short label and long form must agree on the halted/not distinction.
+        let halted = classify(Some(true), true, false, None, None);
+        assert_eq!(gate_status_short_label(&halted), "HALTED");
+        assert!(format_gate_status(&halted).starts_with("HALTED"));
     }
 }

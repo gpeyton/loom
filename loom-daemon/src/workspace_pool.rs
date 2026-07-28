@@ -82,6 +82,20 @@ impl WorkspacePool {
         }
     }
 
+    /// Start the optional safehouse fleet-comms narration sink (#3997) for
+    /// `repo_root`. The sink subscribes the pool's shared [`Arc<EventBus>`] —
+    /// the single place the bus is owned — and spawns on the daemon runtime, so
+    /// every daemon-dispatched sweep's lifecycle transitions narrate into the
+    /// safehouse room with no per-role changes. **Byte-for-byte no-op** when
+    /// `safehouse.enabled` is false/absent: [`crate::safehouse::spawn_sink`]
+    /// returns without subscribing or touching a socket. Best-effort by
+    /// contract — a missing/refused peer degrades to a `warn`, never a sweep
+    /// failure. The handle is detached (daemon-lifetime).
+    pub fn start_safehouse_narration(&self, repo_root: &Path) {
+        let config = crate::safehouse::resolve_config(repo_root);
+        let _ = crate::safehouse::spawn_sink(config, &self.event_bus, &self.runtime);
+    }
+
     /// Seed the pool with a pre-built registry for `root` — used for the default
     /// workspace (the daemon's `sweep_workspace`), whose registry + reaper are
     /// already constructed and owned by `main` and are also used by the IPC
@@ -135,6 +149,10 @@ impl WorkspacePool {
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.
         registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
+        // Cross-host collision detection (#4085): resolve env > config >
+        // default(off) so a shared-backlog deployment measures the baseline
+        // duplicate-dispatch rate. Detection only — never changes dispatch.
+        registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
 
         let arc = Arc::new(Mutex::new(registry));
         // Spawn the reaper on the shared daemon runtime regardless of which
@@ -189,6 +207,25 @@ impl WorkspacePool {
         }
         match map.remove(root) {
             Some(pooled) => {
+                // Release any outstanding quarantine labels before the
+                // registry's reaper (the only thing that would otherwise
+                // retry a failed release) is aborted (Issue #4110) — without
+                // this, an evicted workspace's quarantined issues sit at
+                // `loom:blocked` until the *next* full daemon restart's
+                // startup reconciliation pass
+                // ([`crate::quarantine_reconciliation`]).
+                let flushed = pooled
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush_quarantines_for_eviction();
+                if flushed > 0 {
+                    log::info!(
+                        "workspace_pool: flushed {flushed} quarantine release(s) for {} before \
+                         eviction (#4110)",
+                        root.display()
+                    );
+                }
                 if let Some(reaper) = pooled._reaper {
                     reaper.abort();
                 }

@@ -85,7 +85,9 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::cpu_headroom::cpu_headroom_limit;
+use crate::cpu_headroom::{
+    cpu_headroom_limit, resolve_est_cores_per_sweep, resolve_utilization_target,
+};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
@@ -323,6 +325,17 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// Cumulative count of cross-host dispatch collisions this dispatcher's
+    /// registry has observed (Issue #4085, Phase 0 of #4028) — dispatches whose
+    /// pre-flip label read showed a peer host claimed the issue first. Read once
+    /// per tick and surfaced on the per-tick summary line so an operator can
+    /// watch the baseline collision rate. Defaults to `0` so a dispatcher that
+    /// does not model collision detection (e.g. a test fake, or a registry with
+    /// detection disabled) opts out with zero boilerplate.
+    fn collisions(&self) -> u64 {
+        0
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -358,6 +371,13 @@ pub struct TickReport {
     pub skipped_quarantined: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
+    /// of #4028). Unlike the other counters — which are per-tick tallies — this
+    /// is a **monotonic total** read from the dispatcher(s) at tick end, so an
+    /// operator watching successive summary lines sees the baseline collision
+    /// rate accumulate. Always `0` unless collision detection is enabled
+    /// (`LOOM_DETECT_COLLISIONS` / `autonomous.collisionDetection.enabled`).
+    pub collisions: u64,
     /// True when at least one workspace was gated this tick because the
     /// main-health gate (Phase C, #3812) had halted its dispatch (`main` was
     /// **verified** red — see [`crate::main_health_gate::GateOutcome`]). `seen`
@@ -406,6 +426,9 @@ pub fn tick(
     // Reactive backstop: a red `main` halts all new dispatch this tick.
     if halted {
         report.halted = true;
+        // Surface the running collision baseline even on a halted tick (#4085) —
+        // no dispatch happens, so the total is just carried forward.
+        report.collisions = dispatcher.collisions();
         return Ok(report);
     }
 
@@ -455,6 +478,10 @@ pub fn tick(
             }
         }
     }
+
+    // Read the cumulative cross-host collision total AFTER the dispatch loop so
+    // any collision recorded during this tick's dispatches is included (#4085).
+    report.collisions = dispatcher.collisions();
 
     Ok(report)
 }
@@ -638,6 +665,9 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     }
 
     report.halted = any_halted;
+    // Sum the cumulative cross-host collision totals across every workspace's
+    // dispatcher (#4085), read after pass 2 so this tick's collisions count.
+    report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();
     report
 }
 
@@ -702,7 +732,7 @@ pub fn resolve_max_concurrent() -> usize {
 /// consumes. Each field is `Option` so an absent key falls through to the
 /// env-var / built-in-default resolution — the precedence is **env > config >
 /// default** for every knob.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkFinderConfig {
     /// `autonomous.workFinder.enabled` — whether to run the loop at all.
     pub enabled: Option<bool>,
@@ -717,6 +747,17 @@ pub struct WorkFinderConfig {
     /// `autonomous` level (not under `workFinder`), so it is read even when no
     /// `workFinder` block is present. A zero/invalid value is dropped to `None`.
     pub per_token_concurrency: Option<usize>,
+    /// `autonomous.cpuUtilizationTarget` — the fraction of logical CPUs the CPU
+    /// headroom term (#3978) is willing to dedicate to sweep work (#4032). Also
+    /// lives at the `autonomous` level, alongside `perTokenConcurrency`. A
+    /// value outside `(0, 1]` (or the wrong JSON type) is dropped to `None`, so
+    /// it falls through to [`crate::cpu_headroom::DEFAULT_UTILIZATION_TARGET`].
+    pub cpu_utilization_target: Option<f64>,
+    /// `autonomous.estCoresPerSweep` — the estimated CPU cores a single
+    /// concurrent sweep consumes while building/testing (#3978, #4032). A
+    /// value `<= 0` (or the wrong JSON type) is dropped to `None`, so it falls
+    /// through to [`crate::cpu_headroom::DEFAULT_EST_CORES_PER_SWEEP`].
+    pub est_cores_per_sweep: Option<f64>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder`, soft-failing every field
@@ -730,25 +771,8 @@ pub struct WorkFinderConfig {
 /// so it falls through to the built-in default rather than a useless value.
 #[must_use]
 pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("work_finder: could not read config at {}: {e}", config_path.display());
-            return WorkFinderConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("work_finder: could not parse config at {}: {e}", config_path.display());
-            return WorkFinderConfig::default();
-        }
-    };
-
-    let Some(autonomous) = config.get("autonomous") else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(autonomous) = crate::config_resolver::get_path(&effective, "autonomous") else {
         return WorkFinderConfig::default();
     };
 
@@ -759,6 +783,21 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
         .and_then(serde_json::Value::as_u64)
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok());
+
+    // `cpuUtilizationTarget` / `estCoresPerSweep` (#4032) also live at the
+    // `autonomous` level, mirroring `perTokenConcurrency`. `Value::as_f64`
+    // accepts both integer and float JSON (`2` and `2.0`); range filters match
+    // the env-var resolvers in `cpu_headroom.rs` exactly so a config value
+    // that would be rejected there is dropped to `None` here too, rather than
+    // being clamped or silently applied out of range.
+    let cpu_utilization_target = autonomous
+        .get("cpuUtilizationTarget")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|&f| f > 0.0 && f <= 1.0);
+    let est_cores_per_sweep = autonomous
+        .get("estCoresPerSweep")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|&f| f > 0.0);
 
     // The `workFinder` sub-block is optional; each field independently falls
     // through to `None` (env/default resolution) when absent.
@@ -778,6 +817,8 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         per_token_concurrency,
+        cpu_utilization_target,
+        est_cores_per_sweep,
     }
 }
 
@@ -831,6 +872,25 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
     env_per_token_concurrency()
         .or(config.per_token_concurrency)
         .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
+}
+
+/// Resolve the CPU headroom term's utilization-target knob with precedence
+/// **env > config > default** (#4032). Thin wrapper over
+/// [`crate::cpu_headroom::resolve_utilization_target`] that reads the config
+/// half from this module's already-parsed [`WorkFinderConfig`], mirroring how
+/// [`resolve_per_token_concurrency`] reads `config.per_token_concurrency`.
+#[must_use]
+pub fn resolve_cpu_utilization_target(config: &WorkFinderConfig) -> f64 {
+    resolve_utilization_target(config.cpu_utilization_target)
+}
+
+/// Resolve the CPU headroom term's est-cores-per-sweep knob with precedence
+/// **env > config > default** (#4032). Thin wrapper over
+/// [`crate::cpu_headroom::resolve_est_cores_per_sweep`]; see
+/// [`resolve_cpu_utilization_target`].
+#[must_use]
+pub fn resolve_cpu_est_cores_per_sweep(config: &WorkFinderConfig) -> f64 {
+    resolve_est_cores_per_sweep(config.est_cores_per_sweep)
 }
 
 /// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
@@ -925,6 +985,8 @@ pub fn spawn_work_finder_task<S, D>(
     workspace_root: PathBuf,
     configured_max: usize,
     per_token_concurrency: usize,
+    cpu_utilization_target: f64,
+    cpu_est_cores_per_sweep: f64,
     health_state: Arc<MainHealthState>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()>
@@ -965,8 +1027,19 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&workspace_root);
-            // CPU/load headroom (#3978): the term the pre-#3978 formula lacked.
-            let cpu = cpu_headroom_limit();
+            // CPU headroom (#3978; measured-idle signal #4031): the term the
+            // pre-#3978 formula lacked. `cpu_headroom_limit()` refreshes the
+            // memoized idle sample, which sleeps ~1s on macOS (`iostat`), so it
+            // is moved off the runtime via `spawn_blocking`; a join error falls
+            // back to the policy floor of 1 (soft backoff, never a hard halt).
+            // `cpu_utilization_target` / `cpu_est_cores_per_sweep` are resolved
+            // once at startup (env > config > default, #4032) and captured by
+            // this task, mirroring `per_token_concurrency`.
+            let cpu = tokio::task::spawn_blocking(move || {
+                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
+            })
+            .await
+            .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
@@ -998,14 +1071,16 @@ where
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              cpu={cpu}, ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} deferred, {} error(s)",
+                             {} quarantine-skip, {} deferred, {} error(s), \
+                             {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
                             report.deferred_capacity,
-                            report.errors
+                            report.errors,
+                            report.collisions
                         );
                     }
                     // Token-capacity advisory (#3902) — surface on state change.
@@ -1067,14 +1142,20 @@ where
 /// the `(repo, issue)` key that disambiguates them is phase c (#3929). No new
 /// topic shape is introduced here (CLAUDE.md: "New topics require a follow-up
 /// issue").
+#[allow(clippy::too_many_arguments)] // dynamic-cap inputs (#4032 adds two more
+                                     // resolved-once-at-startup f64 knobs, mirroring
+                                     // per_token_concurrency) + shared state.
 pub fn spawn_multi_work_finder_task(
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
     per_token_concurrency: usize,
+    cpu_utilization_target: f64,
+    cpu_est_cores_per_sweep: f64,
     health_states: Arc<WorkspaceHealthStates>,
     event_bus: Arc<EventBus>,
+    drain: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
@@ -1098,9 +1179,19 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking(&fallback_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&fallback_root);
-            // CPU/load headroom (#3978) — also a machine-level resource, probed
-            // once per tick and shared across every workspace.
-            let cpu = cpu_headroom_limit();
+            // CPU headroom (#3978; measured-idle signal #4031) — also a
+            // machine-level resource, probed once per tick and shared across
+            // every workspace. Moved off the runtime via `spawn_blocking` since
+            // the macOS `iostat` refresh sleeps ~1s; a join error falls back to
+            // the policy floor of 1. `cpu_utilization_target` /
+            // `cpu_est_cores_per_sweep` are resolved once at startup (env >
+            // config > default, #4032) and captured by this task, mirroring
+            // `per_token_concurrency`.
+            let cpu = tokio::task::spawn_blocking(move || {
+                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
+            })
+            .await
+            .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
@@ -1123,7 +1214,13 @@ pub fn spawn_multi_work_finder_task(
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
-            let halted: Vec<bool> = roots.iter().map(|r| health_states.is_halted(r)).collect();
+            // A scheduled drain (#4090) is daemon-global: it pauses new dispatch
+            // in EVERY repo at once, so it is OR'd into every root's halt.
+            let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
+            let halted: Vec<bool> = roots
+                .iter()
+                .map(|r| health_states.is_halted(r) || draining)
+                .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -1162,7 +1259,8 @@ pub fn spawn_multi_work_finder_task(
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                      cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} deferred, {} error(s)",
+                     {} quarantine-skip, {} deferred, {} error(s), \
+                     {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
@@ -1170,7 +1268,8 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_in_flight,
                     report.skipped_quarantined,
                     report.deferred_capacity,
-                    report.errors
+                    report.errors,
+                    report.collisions
                 );
             }
 
@@ -1427,6 +1526,16 @@ pub mod forge {
             }
         }
 
+        fn collisions(&self) -> u64 {
+            match self.registry.lock() {
+                Ok(reg) => reg.collision_count(),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    0
+                }
+            }
+        }
+
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             let mut reg = self
                 .registry
@@ -1499,6 +1608,8 @@ mod tests {
         fail_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
+        /// Cumulative cross-host collision count this dispatcher reports (#4085).
+        collisions: u64,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -1507,6 +1618,9 @@ mod tests {
         }
         fn quarantined(&self) -> HashSet<u32> {
             self.quarantined.clone()
+        }
+        fn collisions(&self) -> u64 {
+            self.collisions
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             if self.fail_issues.contains(&issue) {
@@ -1543,6 +1657,7 @@ mod tests {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}" >> "{rec}"
+printf 'argv: %s\n' "$*" >> "{rec}"
 exit 0
 "#,
             rec = record_log.display()
@@ -1560,19 +1675,29 @@ exit 0
         (RegistryDispatcher::new(registry), dir, record_log)
     }
 
-    /// Issue #3967: the autonomous work finder's real dispatch path
+    /// Issue #3967 / #4111: the autonomous work finder's real dispatch path
     /// (`RegistryDispatcher`, the `WorkDispatcher` impl wired into
     /// production — as opposed to the `RecordingDispatcher` test fake used
     /// by every `tick`/`tick_multi` test above) must export
-    /// `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the spawned child exactly like
-    /// the IPC `DispatchSweep` path (`ipc.rs`) and the CLI `dispatch`
+    /// `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the spawned child's env, AND
+    /// (#4111) append `--claim-owned <issue>` to the child's own argv, exactly
+    /// like the IPC `DispatchSweep` path (`ipc.rs`) and the CLI `dispatch`
     /// subcommand (`main.rs`) do. `RegistryDispatcher::dispatch` forwards to
     /// `SweepRegistry::dispatch` → `spawn_child`, so this closes the
     /// dispatch-path-level regression coverage across all three daemon
-    /// dispatch entry points.
+    /// dispatch entry points — for both the env-var and the argv-flag signal.
     #[test]
     #[serial]
     fn test_registry_dispatcher_exports_claim_ownership_marker() {
+        // Issue #4044: mirrors `sweep_registry::tests::FIXTURE_CHILD_WAIT_MS`
+        // (that const is private to `sweep_registry`'s test module, so it
+        // can't be reused here directly). A short fixed poll bound falsely
+        // reddens this test under host exec-latency pressure (syspolicyd,
+        // AV scanners delaying the spawned child's launch) — the bound is a
+        // ceiling on a healthy-host-cheap poll, not a promptness assertion,
+        // so widening it is free.
+        const FIXTURE_CHILD_WAIT_MS: u128 = 120_000;
+
         let (mut dispatcher, _dir, record_log) = setup_registry_dispatcher_in_tempdir();
 
         let was_new = dispatcher.dispatch(3964).expect("dispatch should succeed");
@@ -1580,7 +1705,7 @@ exit 0
 
         let start = std::time::Instant::now();
         let mut recorded = String::new();
-        while start.elapsed().as_millis() < 5000 {
+        while start.elapsed().as_millis() < FIXTURE_CHILD_WAIT_MS {
             if let Ok(s) = std::fs::read_to_string(&record_log) {
                 if s.contains("LOOM_SWEEP_CLAIM_OWNED=") {
                     recorded = s;
@@ -1593,6 +1718,14 @@ exit 0
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
             "expected the work-finder's production RegistryDispatcher to export \
              the daemon-owned-child self-claim marker; got: {recorded:?}"
+        );
+        // #4111: the positional argv flag must also be present on this same
+        // dispatch (belt-and-suspenders — the env var alone was proven
+        // insufficient for a `/loom:sweep` child to actually notice).
+        assert!(
+            recorded.contains("--claim-owned 3964"),
+            "expected the work-finder's production RegistryDispatcher to append \
+             --claim-owned 3964 to the child argv (#4111); got: {recorded:?}"
         );
     }
 
@@ -1747,6 +1880,60 @@ exit 0
         assert_eq!(report.skipped_in_flight, 1, "#1 was an idempotency no-op");
         assert_eq!(report.deferred_capacity, 0);
         assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tick_surfaces_collision_total() {
+        // The dispatcher reports a cumulative cross-host collision count (#4085);
+        // the tick surfaces it on the report so the per-tick summary line can log
+        // the running baseline.
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher {
+            collisions: 3,
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 5, false).unwrap();
+        assert_eq!(report.collisions, 3, "collision total surfaced from dispatcher");
+        assert_eq!(report.dispatched, 1);
+    }
+
+    #[test]
+    fn test_tick_collision_total_surfaced_when_halted() {
+        // Even on a halted tick (no dispatch), the running collision baseline is
+        // carried forward onto the report.
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher {
+            collisions: 2,
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 5, true).unwrap();
+        assert!(report.halted);
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.collisions, 2);
+    }
+
+    #[test]
+    fn test_tick_multi_sums_collision_totals() {
+        // tick_multi sums the collision totals across every workspace's
+        // dispatcher (#4085).
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    collisions: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![issue(2)]),
+                RecordingDispatcher {
+                    collisions: 5,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+        assert_eq!(report.collisions, 7, "collision totals summed across workspaces");
     }
 
     #[test]
@@ -2505,7 +2692,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
-            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
+            r#"{"autonomous": {"perTokenConcurrency": 4, "cpuUtilizationTarget": 0.6, "estCoresPerSweep": 3.5, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
         );
         assert_eq!(
             read_work_finder_config(tmp.path()),
@@ -2514,8 +2701,90 @@ exit 0
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
                 per_token_concurrency: Some(4),
+                cpu_utilization_target: Some(0.6),
+                est_cores_per_sweep: Some(3.5),
             }
         );
+    }
+
+    // ===================================================================
+    // cpuUtilizationTarget / estCoresPerSweep config parsing (#4032)
+    // ===================================================================
+
+    #[test]
+    fn test_config_cpu_knobs_read_without_work_finder_block() {
+        // Both knobs live at the `autonomous` level (#4032), so they are read
+        // even when the `workFinder` sub-block is absent — mirroring
+        // `perTokenConcurrency`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"cpuUtilizationTarget": 0.5, "estCoresPerSweep": 1.5}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.cpu_utilization_target, Some(0.5));
+        assert_eq!(cfg.est_cores_per_sweep, Some(1.5));
+        assert_eq!(cfg.enabled, None);
+    }
+
+    #[test]
+    fn test_config_integer_cpu_knobs_parse_as_f64() {
+        // `Value::as_f64` handles integer JSON as well as float — assert it
+        // (#4032 AC: "estCoresPerSweep": 2 as well as 2.0).
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"estCoresPerSweep": 2}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.est_cores_per_sweep, Some(2.0));
+    }
+
+    #[test]
+    fn test_config_out_of_range_cpu_utilization_target_drops_to_none() {
+        for bad in ["0", "-1", "1.5"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(r#"{{"autonomous": {{"cpuUtilizationTarget": {bad}}}}}"#),
+            );
+            assert_eq!(
+                read_work_finder_config(tmp.path()).cpu_utilization_target,
+                None,
+                "cpuUtilizationTarget={bad} must drop to None, not be clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_out_of_range_est_cores_per_sweep_drops_to_none() {
+        for bad in ["0", "-2"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(r#"{{"autonomous": {{"estCoresPerSweep": {bad}}}}}"#),
+            );
+            assert_eq!(
+                read_work_finder_config(tmp.path()).est_cores_per_sweep,
+                None,
+                "estCoresPerSweep={bad} must drop to None, not be clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_wrong_json_type_cpu_knobs_drop_to_none() {
+        // A string, bool, or null where a number is expected must not panic
+        // and must resolve to None (soft-fail to env/default resolution).
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"cpuUtilizationTarget": "0.8", "estCoresPerSweep": true}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.cpu_utilization_target, None);
+        assert_eq!(cfg.est_cores_per_sweep, None);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        write_config(tmp2.path(), r#"{"autonomous": {"estCoresPerSweep": null}}"#);
+        assert_eq!(read_work_finder_config(tmp2.path()).est_cores_per_sweep, None);
     }
 
     #[test]
@@ -2562,6 +2831,70 @@ exit 0
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.interval_secs, None);
         assert_eq!(cfg.max_concurrent, None);
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    fn write_local_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "maxConcurrent": 5}}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.max_concurrent, Some(5));
+        assert_eq!(cfg.per_token_concurrency, Some(4));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"workFinder": {"enabled": true, "maxConcurrent": 5, "intervalSecs": 60}}}"#,
+        );
+        write_project_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 9}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `maxConcurrent` -> project tier wins.
+        assert_eq!(cfg.max_concurrent, Some(9));
+        // Non-overlapping keys still supplied by the legacy tier.
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.interval_secs, Some(60));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 5}}}"#);
+        write_project_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 9}}}"#);
+        write_local_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 2}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.max_concurrent, Some(2));
     }
 
     // ===================================================================
@@ -2685,6 +3018,60 @@ exit 0
         std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "nope");
         assert_eq!(resolve_per_token_concurrency(&cfg), 4);
         std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_cpu_utilization_target_precedence() {
+        use crate::cpu_headroom::{DEFAULT_UTILIZATION_TARGET, UTILIZATION_TARGET_ENV};
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+
+        // Default when neither env nor config set.
+        assert!(
+            (resolve_cpu_utilization_target(&WorkFinderConfig::default())
+                - DEFAULT_UTILIZATION_TARGET)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            cpu_utilization_target: Some(0.6),
+            ..Default::default()
+        };
+        assert!((resolve_cpu_utilization_target(&cfg) - 0.6).abs() < f64::EPSILON);
+
+        // Env overrides config.
+        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
+        assert!((resolve_cpu_utilization_target(&cfg) - 0.5).abs() < f64::EPSILON);
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_cpu_est_cores_per_sweep_precedence() {
+        use crate::cpu_headroom::{DEFAULT_EST_CORES_PER_SWEEP, EST_CORES_PER_SWEEP_ENV};
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
+
+        // Default when neither env nor config set.
+        assert!(
+            (resolve_cpu_est_cores_per_sweep(&WorkFinderConfig::default())
+                - DEFAULT_EST_CORES_PER_SWEEP)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            est_cores_per_sweep: Some(4.0),
+            ..Default::default()
+        };
+        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 4.0).abs() < f64::EPSILON);
+
+        // Env overrides config.
+        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "1.0");
+        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 1.0).abs() < f64::EPSILON);
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
     }
 
     // ===================================================================

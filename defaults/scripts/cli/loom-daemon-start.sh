@@ -142,12 +142,32 @@ resolve_launchd_label() {
 # (~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist): RunAtLoad=true
 # (the daemon also comes back after a reboot/re-login, not just a session
 # death -- strictly more durable than the pre-#3972 nohup contract, which
-# didn't survive a reboot either) and KeepAlive=false (launchd does not
-# auto-respawn a crashed daemon; that stays the reaper/operator's job, same as
-# before). Lifecycle (first start / explicit stop) is still entirely
-# operator-driven via loom-daemon-start.sh / loom-daemon-stop.sh -- bootout on
-# stop unloads the definition so it does NOT come back at the next login. The
-# PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
+# didn't survive a reboot either).
+#
+# KeepAlive is `{ SuccessfulExit: true }` as of the supervised restart primitive
+# (#4054, Phase 2 of #4017): launchd relaunches the job ONLY when it exits with
+# status 0, and leaves it down on any non-zero exit. This is what lets the
+# daemon END and reliably COME BACK on demand -- the `RestartDaemon` IPC request
+# (loom-daemon restart) is the ONLY path that exits 0, so it is the only thing
+# that trips a relaunch. Crucially this PRESERVES the old no-crash-loop semantics
+# of KeepAlive=false: a crashed/panicked daemon, a SIGTERM'd operator stop (exit
+# 143), and a SIGINT/Ctrl-C (exit 130) all exit NON-ZERO, so launchd does NOT
+# respawn them. Making the exit code carry intent (daemon side, #4054) is also
+# what closes the SuccessfulExit/bootout race (Curator Finding 1): an operator
+# stop exits non-zero, so launchd never relaunches it during the stop window --
+# "an operator stop stays stopped" no longer depends on bootout timing. The
+# bootout in loom-daemon-stop.sh is demoted to belt-and-braces (it still unloads
+# the definition so it does not come back at the next login).
+#
+# LOOM_DAEMON_SUPERVISOR=launchd is baked into the plist env so the daemon can
+# PROVE it is supervised before it will exit for a restart. It is hardcoded here
+# (not harvested from the caller's env) so it lands in EVERY rendered plist --
+# and, conversely, is ABSENT from the nohup path (which never renders a plist),
+# so an unsupervised daemon correctly refuses to exit on a restart request
+# (nothing would bring it back). Because it survives in the plist, the relaunched
+# daemon still sees it.
+#
+# The PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
 # Homebrew, standard bin dirs) so `gh`, `git`, `cargo`, and `python3` resolve
 # inside the LaunchAgent's minimal launchd environment even if the interactive
 # shell's PATH customizations aren't present there. Every already-exported
@@ -162,12 +182,20 @@ render_launchd_plist() {
     local env_entries=""
     env_entries+="        <key>PATH</key>\n        <string>$(xml_escape "$plist_path_value")</string>\n"
     env_entries+="        <key>HOME</key>\n        <string>$(xml_escape "$HOME")</string>\n"
+    # Mark the daemon as launchd-supervised so its RestartDaemon handler (#4054)
+    # will exit 0 for a supervised relaunch. Hardcoded (not env-harvested) so it
+    # is present in every rendered plist and its relaunch, and never leaks to the
+    # unsupervised nohup path.
+    env_entries+="        <key>LOOM_DAEMON_SUPERVISOR</key>\n        <string>launchd</string>\n"
 
     local line key value
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         key="${line%%=*}"
         value="${line#*=}"
+        # Never duplicate the supervisor key hardcoded above (a caller that
+        # exported LOOM_DAEMON_SUPERVISOR must not produce two plist entries).
+        [[ "$key" == "LOOM_DAEMON_SUPERVISOR" ]] && continue
         env_entries+="        <key>$(xml_escape "$key")</key>\n        <string>$(xml_escape "$value")</string>\n"
     done < <(env | grep -E '^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)=' || true)
 
@@ -181,11 +209,129 @@ render_launchd_plist() {
     printf '%b' "$env_entries"
     printf '    </dict>\n'
     printf '    <key>RunAtLoad</key>\n    <true/>\n'
-    printf '    <key>KeepAlive</key>\n    <false/>\n'
+    # KeepAlive:SuccessfulExit=true (#4054): relaunch ONLY on a clean exit 0 (the
+    # RestartDaemon primitive). A crash/SIGTERM/SIGINT exits non-zero and is NOT
+    # respawned -- preserving the pre-#4054 no-crash-loop semantics of KeepAlive=false.
+    printf '    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <true/>\n    </dict>\n'
     printf '    <key>ProcessType</key>\n    <string>Background</string>\n'
     printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
     printf '    <key>StandardErrorPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
     printf '</dict>\n</plist>\n'
+}
+
+# ---------- autonomy-desired intent marker (#4011) ----------
+# Write the durable "a daemon is EXPECTED to be running on this host" marker on a
+# successful start. Its LIFETIME is operator intent, NOT process liveness: only
+# an operator-initiated loom-daemon-stop.sh removes it, and it is deliberately
+# PRESERVED across the internal stop loom-daemon-update.sh performs (via
+# LOOM_DAEMON_STOP_KEEP_INTENT). The host-side watchdog (loom-daemon-watchdog.sh)
+# reads it to decide whether a missing daemon is a silent failure (marker present
+# ⇒ report) or a deliberate stop (marker absent ⇒ stay silent). Records the paths
+# and label the watchdog needs so it can probe reality without re-deriving them.
+# Args: <use_launchd true|false> <launchd_label>
+write_intent_marker() {
+    local use_launchd="$1" label="$2"
+    mkdir -p "$LOOM_DIR" 2>/dev/null || true
+    (
+        umask 077
+        cat > "$INTENT_MARKER" <<EOF
+# loom autonomy-desired marker (issue #4011)
+# Presence ⇒ a loom-daemon is EXPECTED to be running on this host. Written by
+# loom-daemon-start.sh on a successful start; removed ONLY by an
+# operator-initiated loom-daemon-stop.sh (preserved across update.sh restarts).
+# Do not hand-edit — delete via loom-daemon-stop.sh so the watchdog stays quiet.
+started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+repo_root=$REPO_ROOT
+pid_file=$PID_FILE
+heartbeat_file=$HEARTBEAT_FILE
+heartbeat_interval_secs=$HEARTBEAT_INTERVAL_SECS
+use_launchd=$use_launchd
+launchd_label=$label
+socket_path=$SOCKET_PATH
+EOF
+    )
+}
+
+# ---------- watchdog LaunchAgent (#4011) ----------
+# The watchdog is the payload of a SECOND launchd job that runs on a
+# StartInterval cadence, SEPARATE from the daemon job, and reports when intent
+# (the marker above) diverges from reality (daemon not loaded/alive, or heartbeat
+# stale). It uses StartInterval and NOT KeepAlive: a KeepAlive'd short-lived job
+# would busy-loop, whereas StartInterval already re-runs it every interval
+# regardless of how the last run exited — which is exactly what makes an interval
+# job unable to "crash and stay dead" (the who-watches-the-watchdog resolution).
+resolve_watchdog_label() {
+    echo "${LOOM_WATCHDOG_LABEL:-$(resolve_launchd_label)-watchdog}"
+}
+
+# Locate the installed watchdog script (installed copy first, then the defaults/
+# copy for a Loom source checkout that has not yet synced), mirroring the daemon
+# binary/script resolution elsewhere.
+locate_watchdog_script() {
+    local candidate
+    for candidate in \
+        "$REPO_ROOT/.loom/scripts/cli/loom-daemon-watchdog.sh" \
+        "$REPO_ROOT/defaults/scripts/cli/loom-daemon-watchdog.sh"; do
+        if [[ -f "$candidate" ]]; then echo "$candidate"; return 0; fi
+    done
+    echo ""
+}
+
+# render_watchdog_plist <label> <watchdog_script> <workdir> <log_path> <interval_secs>
+render_watchdog_plist() {
+    local label="$1" script="$2" workdir="$3" log_path="$4" interval="$5"
+    local plist_path_value="${PATH}:${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0">\n<dict>\n'
+    printf '    <key>Label</key>\n    <string>%s</string>\n' "$(xml_escape "$label")"
+    printf '    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/bash</string>\n        <string>%s</string>\n    </array>\n' "$(xml_escape "$script")"
+    printf '    <key>WorkingDirectory</key>\n    <string>%s</string>\n' "$(xml_escape "$workdir")"
+    printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
+    printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(xml_escape "$plist_path_value")"
+    printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(xml_escape "$HOME")"
+    printf '        <key>LOOM_AUTONOMY_MARKER</key>\n        <string>%s</string>\n' "$(xml_escape "$INTENT_MARKER")"
+    printf '        <key>LOOM_SOCKET_PATH</key>\n        <string>%s</string>\n' "$(xml_escape "$SOCKET_PATH")"
+    printf '        <key>LOOM_LAUNCHD_LABEL</key>\n        <string>%s</string>\n' "$(xml_escape "$(resolve_launchd_label)")"
+    printf '    </dict>\n'
+    printf '    <key>RunAtLoad</key>\n    <true/>\n'
+    printf '    <key>StartInterval</key>\n    <integer>%s</integer>\n' "$interval"
+    printf '    <key>ProcessType</key>\n    <string>Background</string>\n'
+    printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
+    printf '    <key>StandardErrorPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
+    printf '</dict>\n</plist>\n'
+}
+
+# Provision + (re)load the watchdog LaunchAgent. Best-effort and NON-FATAL: a
+# watchdog that fails to install must never fail the daemon start (the daemon
+# running without a watchdog is strictly better than no daemon at all).
+provision_watchdog_job() {
+    [[ "$IS_DARWIN" == "true" ]] || { warn "watchdog: not Darwin — skipping (marker+heartbeat still active; no scheduled checker on this platform)."; return 0; }
+    command -v launchctl >/dev/null 2>&1 || { warn "watchdog: launchctl not found — skipping."; return 0; }
+    local script; script="$(locate_watchdog_script)"
+    if [[ -z "$script" ]]; then
+        warn "watchdog: loom-daemon-watchdog.sh not found — skipping (autonomy-loss detection disabled)."
+        return 0
+    fi
+    local wd_label wd_service wd_plist wd_interval wd_log
+    wd_label="$(resolve_watchdog_label)"
+    wd_service="gui/$(id -u)/${wd_label}"
+    wd_plist="$HOME/Library/LaunchAgents/${wd_label}.plist"
+    wd_interval="${LOOM_WATCHDOG_INTERVAL_SECS:-300}"
+    wd_log="$LOOM_DIR/logs/daemon-watchdog.log"
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOOM_DIR/logs" 2>/dev/null || true
+    if ! render_watchdog_plist "$wd_label" "$script" "$REPO_ROOT" "$wd_log" "$wd_interval" > "$wd_plist" 2>/dev/null; then
+        warn "watchdog: could not write $wd_plist — skipping."
+        return 0
+    fi
+    if launchctl print "$wd_service" >/dev/null 2>&1; then
+        launchctl bootout "$wd_service" >/dev/null 2>&1 || true
+    fi
+    if launchctl bootstrap "gui/$(id -u)" "$wd_plist" >/dev/null 2>&1; then
+        echo "Watchdog:       $wd_label (StartInterval ${wd_interval}s) → $wd_log"
+    else
+        warn "watchdog: launchctl bootstrap failed for $wd_service — autonomy-loss detection not active (non-fatal)."
+    fi
 }
 
 # ---------- args ----------
@@ -236,6 +382,19 @@ PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
 SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
 START_LOG="$REPO_ROOT/.loom/logs/daemon-start.log"
 mkdir -p "$REPO_ROOT/.loom/logs"
+
+# ---------- autonomy-desired marker + heartbeat paths (#4011) ----------
+# LOOM_DIR is the machine-level dir the daemon uses for its socket/log/heartbeat
+# — the parent of SOCKET_PATH, matching the daemon's own resolve_loom_dir()
+# (LOOM_SOCKET_PATH parent, else ~/.loom). Pointing SOCKET_PATH at a tempdir (as
+# the lifecycle tests do) therefore isolates the marker + heartbeat there too,
+# never touching the operator's real ~/.loom.
+LOOM_DIR="$(dirname "$SOCKET_PATH")"
+INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
+HEARTBEAT_FILE="$LOOM_DIR/daemon.heartbeat"
+# Kept in sync with the daemon-side default (daemon_heartbeat.rs) so the
+# watchdog's derived staleness threshold matches the real cadence.
+HEARTBEAT_INTERVAL_SECS="${LOOM_DAEMON_HEARTBEAT_INTERVAL_SECS:-60}"
 
 # ---------- already-running guard (PID file) ----------
 if [[ -f "$PID_FILE" ]]; then
@@ -388,6 +547,18 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
 
     render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$PLIST_FILE"
 
+    # Harden the rendered plist when it carries a forwarded credential
+    # (#4005): the token-forwarding loop in render_launchd_plist writes any
+    # exported GH_TOKEN/GITEA_TOKEN/FORGE_TOKEN straight into
+    # EnvironmentVariables above, and the plain `>` redirect otherwise leaves
+    # the file at the process's umask (typically world-readable, 0644) --
+    # any local user could read the PAT straight out of
+    # ~/Library/LaunchAgents. Match the same env pattern the forwarding loop
+    # reads from.
+    if env | grep -qE '^(GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)=' 2>/dev/null; then
+        chmod 600 "$PLIST_FILE"
+    fi
+
     echo "Launchd label:  $LAUNCHD_LABEL"
     echo "Launchd plist:  $PLIST_FILE"
 
@@ -438,8 +609,12 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     fi
 
     echo "$daemon_pid" > "$PID_FILE"
+    # Record operator intent + arm the host-side autonomy-loss watchdog (#4011).
+    write_intent_marker "true" "$LAUNCHD_LABEL"
+    provision_watchdog_job
     ok "loom-daemon started under launchd (pid $daemon_pid, label $LAUNCHD_LABEL)."
     echo "PID file: $PID_FILE"
+    echo "Intent marker: $INTENT_MARKER"
     echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
     exit 0
 fi
@@ -464,6 +639,13 @@ if ! kill -0 "$daemon_pid" 2>/dev/null; then
 fi
 
 echo "$daemon_pid" > "$PID_FILE"
+# Record operator intent (#4011). The scheduled watchdog is a launchd job, so on
+# Linux / the nohup path there is no host-side checker to provision — the marker
+# + heartbeat are still written, and `loom-daemon-watchdog.sh` can be run by hand
+# or wired to a cron/systemd timer to consume them.
+write_intent_marker "false" ""
+provision_watchdog_job
 ok "loom-daemon started (pid $daemon_pid). PID file: $PID_FILE"
+echo "Intent marker: $INTENT_MARKER"
 echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
 exit 0

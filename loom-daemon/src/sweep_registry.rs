@@ -53,17 +53,19 @@
 
 use crate::event_bus::EventBus;
 use crate::sweep_journal;
+use crate::tokens_pool::bad_tokens;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -149,12 +151,8 @@ impl ModelSource {
 /// `main_health_gate::read_autonomous_gate_config`).
 #[must_use]
 pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
-    let path = repo_root.join(".loom").join("config.json");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let config: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    config
-        .get("autonomous")?
-        .get("model")?
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous.model")?
         .as_str()
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -201,29 +199,42 @@ pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (Stri
 /// Python default in `loom_tools/model_tiers.py::_DEFAULT_TIER_ALIASES`.
 const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
 
-/// Read the `sweep.modelAliases` override map from `<repo_root>/.loom/config.json`,
-/// soft-failing to an empty map on any error (missing file, malformed JSON, absent
-/// key, non-object value). Blank keys/values are dropped. Mirrors the soft-fail
-/// contract of [`read_autonomous_model`] and `model_tiers._config_overrides`.
+/// Read the `sweep.modelAliases` override map for `repo_root`, resolved through
+/// the full config tier chain (`config_resolver::resolve_effective_config`:
+/// private/shared defaults → legacy `.loom/config.json` →
+/// `.loom-project/project.json` → `.loom-local/local.json`). Soft-fails to an
+/// empty map on any error (missing/malformed tiers, absent key, non-object
+/// value). Blank keys/values are dropped. Mirrors the soft-fail contract of
+/// [`read_autonomous_model`] and `model_tiers._config_overrides`.
+///
+/// **Cross-tier merge (#4059):** `deep_merge` merges objects rather than
+/// replacing them, so a `sweep.modelAliases` map split across tiers now *unions*
+/// its keys, with the higher-precedence tier winning on any shared key. This is
+/// deliberate and desirable — a `.loom-project`/`.loom-local` tier can repoint
+/// an individual alias while inheriting the rest from the legacy tier — and is
+/// asserted explicitly by `read_model_aliases_merges_across_tiers`.
+///
+/// **Cross-language divergence (#4059, Finding 2):** blank keys are dropped
+/// here (`key.is_empty()` guard below), but the Python mirror in
+/// `model_tiers._config_overrides` KEEPS blank keys — it only guards blank
+/// *values*. This is a PRE-EXISTING, known-and-harmless divergence: a blank key
+/// can never match a lookup and [`resolve_model_alias`] returns early on an
+/// empty input model. It is intentionally left as-is here (the Python side is
+/// owned by #4060); do NOT normalize Rust to Python's laxer behavior. Both sides
+/// drop blank values.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let path = repo_root.join(".loom").join("config.json");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return out;
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return out;
-    };
-    let Some(aliases) = config
-        .get("sweep")
-        .and_then(|s| s.get("modelAliases"))
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(aliases) = crate::config_resolver::get_path(&config, "sweep.modelAliases")
         .and_then(serde_json::Value::as_object)
     else {
         return out;
     };
     for (key, val) in aliases {
         let key = key.trim().to_lowercase();
+        // #4059 Finding 2: blank keys dropped here; Python keeps them. Left as a
+        // known-and-harmless divergence — see the function doc comment above.
         if key.is_empty() {
             continue;
         }
@@ -434,7 +445,13 @@ pub const WATCHDOG_INTERVAL_ENV: &str = "LOOM_SWEEP_WATCHDOG_INTERVAL_SECS";
 /// written no checkpoint, and produced no log output past the spawn header
 /// within this window is treated as hung. Generous enough that a healthy sweep
 /// (which emits Curator-phase output well inside two minutes) never trips it.
-pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 120;
+///
+/// Raised from 120s to 300s (Issue #4088): under concurrency the normal
+/// dispatch→worktree latency was measured at 110–150s, so the old 120s default
+/// sat *inside* the healthy distribution and cancelled progressing sweeps. 300s
+/// clears that window with headroom while staying an order of magnitude below
+/// the review-stall timeout (2700s), keeping the three backstops well separated.
+pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 300;
 
 /// Default watchdog probe interval — matches the reaper cadence.
 pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
@@ -472,6 +489,21 @@ pub const REVIEW_STALL_ENABLE_ENV: &str = "LOOM_SWEEP_REVIEW_STALL";
 /// Env var overriding the review-phase stall timeout (log-silence window), in
 /// seconds.
 pub const REVIEW_STALL_TIMEOUT_ENV: &str = "LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS";
+
+/// Env var toggling cross-host dispatch-collision detection (Issue #4085,
+/// Phase 0 of #4028). Precedence **env > config > default**; default **off**
+/// because the probe adds one extra `gh issue view` round-trip per dispatch.
+/// `1`/`true`/`yes`/`on` enable; anything else disables. When enabled, the
+/// daemon does a pre-flip label read and records — but never acts on — the
+/// case where a peer host already claimed the issue. Detection only.
+pub const COLLISION_DETECT_ENV: &str = "LOOM_DETECT_COLLISIONS";
+
+/// Env var overriding this host's identity string in collision records (Issue
+/// #4085). Falls back to `$HOSTNAME`, then the `hostname` binary, then
+/// `"unknown-host"`. Set it when the daemon runs somewhere `$HOSTNAME` is not
+/// exported (a non-interactive service unit) so cross-host collision logs stay
+/// attributable.
+pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
 
 /// Default review-phase stall timeout (45 min of zero log output). A sweep that
 /// has already made startup progress (worktree/checkpoint exists) but whose log
@@ -543,6 +575,13 @@ pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
 /// window, is a *different* failure mode (handled by the mid-build watchdog) and
 /// never counts here.
 pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
+
+/// Marker substring embedded in every quarantine comment body posted by
+/// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
+/// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
+/// daemon-applied `loom:blocked` from one a human deliberately applied by
+/// hand — only the former is safe to auto-release at startup.
+pub const QUARANTINE_COMMENT_MARKER: &str = "Auto-quarantined by loom-daemon (#3939)";
 
 /// Resolved insta-crash-quarantine parameters (Issue #3939), set on the registry
 /// at construction so [`SweepRegistry::reap_once`] can enforce them without a
@@ -849,6 +888,60 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
     }
 }
 
+// ============================================================================
+// Account-exhaustion classification at insta-crash time (Issue #4122)
+// ============================================================================
+
+/// Number of trailing log lines scanned for an account-exhaustion signature
+/// when classifying an insta-crash (#4122). The wrapper's exhaustion banner /
+/// `RATE_LIMIT_ABORT` sentinel is emitted right before the child dies, so the
+/// tail is where it lands; a bounded tail keeps the read cheap.
+const EXHAUSTION_LOG_TAIL_LINES: usize = 200;
+
+/// The account-exhaustion signature table (#4122).
+///
+/// Each row is a `(label, regex)` pair matched against the tail of a dead
+/// sweep's log at insta-crash classification time. A match means the child died
+/// because its OAuth account hit a usage/weekly/session limit — that is the
+/// ACCOUNT's fault, not the ISSUE's, so the reaper marks the account bad rather
+/// than charging the issue's insta-crash quarantine tally.
+///
+/// Kept as a table so a future signature (e.g. #4027's `Unknown command:`
+/// crash) can be added as another row without touching the classifier logic.
+/// The regexes mirror `defaults/scripts/claude-wrapper.sh::is_account_exhaustion`
+/// so the daemon path classifies exhaustion the same way the wrapper does.
+fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
+    static SIGS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    SIGS.get_or_init(|| {
+        vec![
+            (
+                "weekly-limit",
+                Regex::new(
+                    r"(?i)hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage",
+                )
+                .expect("valid static exhaustion regex"),
+            ),
+            (
+                "rate-limit-abort",
+                // The output/startup monitors kill the CLI and emit this
+                // sentinel on the interactive usage/plan-limit modal and the
+                // 100%-weekly banner (claude-wrapper.sh). Case-sensitive: it is
+                // a literal sentinel token, not free-form prose.
+                Regex::new(r"RATE_LIMIT_ABORT").expect("valid static exhaustion regex"),
+            ),
+        ]
+    })
+}
+
+/// Scan `log_tail` for any account-exhaustion signature (#4122). Returns the
+/// matched signature label on the first hit, else `None`.
+fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
+    exhaustion_signatures()
+        .iter()
+        .find(|(_, re)| re.is_match(log_tail))
+        .map(|(label, _)| *label)
+}
+
 /// Resolve the per-call reaper `gh` timeout (Issue #3973): the
 /// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
 /// [`REAP_GH_TIMEOUT`] default.
@@ -999,6 +1092,27 @@ impl SweepRegistryConfig {
     pub fn checkpoint_dir(&self) -> PathBuf {
         self.workspace_root.join(".loom").join("sweep-checkpoint")
     }
+
+    /// Whether this workspace has the `/loom:sweep` slash command installed
+    /// (Issue #4027). The commands under `.claude/commands/loom/` are
+    /// install-not-committed (gitignored; populated by `loom-daemon init`
+    /// from `defaults/.claude/commands/loom/`), so a bare `git clone` has
+    /// `.git`/`.loom` — `looks_like_workspace()` in `workspace_registry.rs`
+    /// passes — but NOT this file. Dispatching `/loom:sweep <N>` into such a
+    /// workspace insta-crashes the child on `Unknown command: /loom:sweep`
+    /// within seconds. A cheap existence check (one `stat`), not a content
+    /// check — an empty/stale file still counts as "installed"; a genuinely
+    /// broken command definition is a different failure mode than "never
+    /// initialized".
+    #[must_use]
+    pub fn has_sweep_command(&self) -> bool {
+        self.workspace_root
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("sweep.md")
+            .exists()
+    }
 }
 
 /// On-disk owner metadata written inside the lock dir. Schema mirrors
@@ -1056,6 +1170,22 @@ pub struct SweepRegistry {
     /// Issues the watchdog has already logged a give-up for, so the loud
     /// give-up warning fires once per issue rather than every tick.
     watchdog_gaveup: HashSet<u32>,
+    /// Sweeps the startup watchdog has ever observed making progress, latched so
+    /// the "has progressed" signal is monotonic (Issue #4088). `sweep_made_progress`
+    /// re-derives progress from mutable filesystem state (worktree / checkpoint /
+    /// log) every tick, all of which are torn down at successful completion — so a
+    /// *finished* sweep reads as *never started* and the memoryless
+    /// [`watchdog_decision`] re-dispatches it. Once a `SweepId` lands here the
+    /// startup watchdog leaves it alone forever, delegating any later crash to the
+    /// mid-build-death (#3895) / review-stall (#3910) backstops, which is the
+    /// division of labor the module doc already specifies.
+    ///
+    /// Keyed by `SweepId`, NOT issue: an issue-keyed latch would persist across
+    /// re-dispatch, so a re-dispatched sweep that then genuinely hangs at startup
+    /// would read as "already progressed" and never be rescued — silently
+    /// defanging the watchdog and violating AC2. Grows per dispatch, so it is
+    /// pruned alongside entry GC in [`reap_once`](Self::reap_once).
+    watchdog_progressed: HashSet<SweepId>,
     /// Issues the mid-build-death watchdog has already recovered once (Issue
     /// #3895). Distinct from `watchdog_retried` (startup-hang, no progress):
     /// this bounds the "made progress then the child died" recovery to a
@@ -1086,6 +1216,74 @@ pub struct SweepRegistry {
     /// releases it. Keyed by issue number; since each registry is scoped to one
     /// workspace root, this is effectively a `(workspace, issue)` key.
     quarantined: HashMap<u32, DateTime<Utc>>,
+    /// Issues whose `loom:blocked` -> `loom:issue` label restore failed at
+    /// least once (Issue #4110): [`release_quarantine_label`](Self::release_quarantine_label)
+    /// is a best-effort `gh` call, and a transient failure must not silently
+    /// strand the issue at `loom:blocked` forever — the in-memory quarantine
+    /// state is already gone by the time the label edit runs, so this set is
+    /// the only remaining record that a retry is owed. [`reap_once`](Self::reap_once)
+    /// retries every entry here on each tick until the flip succeeds (or the
+    /// operator fixes the forge state by hand, at which point the retried
+    /// `gh issue edit` is a harmless idempotent no-op).
+    pending_quarantine_release: HashSet<u32>,
+    /// Whether cross-host dispatch-collision detection is enabled (Issue #4085,
+    /// Phase 0 of #4028). When `true`, [`dispatch`](Self::dispatch) issues a
+    /// pre-flip `gh issue view --json labels` read and classifies whether a peer
+    /// host already flipped `loom:issue → loom:building`. Off by default (the
+    /// probe adds one extra API round-trip); `main.rs` / [`WorkspacePool`] set
+    /// the resolved env > config > default value. Detection only — a detected
+    /// collision never changes dispatch behavior.
+    ///
+    /// [`WorkspacePool`]: crate::workspace_pool::WorkspacePool
+    detect_collisions: bool,
+    /// Cumulative count of cross-host dispatch collisions this registry has
+    /// observed (Issue #4085). Incremented once per dispatch whose pre-flip
+    /// label read showed `loom:issue` already gone (or `loom:building` already
+    /// present) — i.e. another host claimed the issue first. Surfaced to
+    /// operators via the work-finder's per-tick summary line. Always `0` when
+    /// `detect_collisions` is `false`. Monotonic for the life of the process.
+    collision_count: u64,
+}
+
+/// Classification of a pre-flip label read (Issue #4085). Detection only — the
+/// caller records the outcome but never changes dispatch behavior on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollisionClass {
+    /// `loom:issue` was still present and `loom:building` absent — this host is
+    /// the first claimant, no collision.
+    Clean,
+    /// `loom:issue` was already gone, or `loom:building` already present, before
+    /// this host flipped the labels — a peer host claimed it first. Carries the
+    /// observed pre-flip label set for the diagnostic log record.
+    Collision { labels: Vec<String> },
+    /// The label state could not be read (gh timeout / non-zero exit /
+    /// unparseable JSON). **Fail-closed**: never counted as a collision, so the
+    /// baseline is never inflated by an unverifiable flip.
+    Unknown,
+}
+
+/// Resolve this host's identity string for collision records (Issue #4085),
+/// precedence `LOOM_HOST_ID` env > `$HOSTNAME` env > the `hostname` binary >
+/// `"unknown-host"`. Only invoked when a collision is actually recorded (rare),
+/// so the one-shot `hostname` subprocess is not on the hot dispatch path.
+fn host_identity() -> String {
+    for var in [HOST_ID_ENV, "HOSTNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    if let Ok(out) = Command::new("hostname").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "unknown-host".to_string()
 }
 
 impl SweepRegistry {
@@ -1104,6 +1302,7 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
@@ -1111,6 +1310,9 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            pending_quarantine_release: HashSet::new(),
+            detect_collisions: false,
+            collision_count: 0,
         }
     }
 
@@ -1126,6 +1328,7 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
@@ -1133,6 +1336,9 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            pending_quarantine_release: HashSet::new(),
+            detect_collisions: false,
+            collision_count: 0,
         }
     }
 
@@ -1167,6 +1373,29 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_config(&self) -> QuarantineConfig {
         self.quarantine_config
+    }
+
+    /// Enable or disable cross-host dispatch-collision detection (Issue #4085).
+    /// `main.rs` and the workspace pool call this once at provision time with
+    /// the resolved env > config > default value (see
+    /// [`resolve_collision_detection`]).
+    pub fn set_collision_detection(&mut self, enabled: bool) {
+        self.detect_collisions = enabled;
+    }
+
+    /// Read-only accessor for whether collision detection is enabled (Issue
+    /// #4085).
+    #[must_use]
+    pub fn collision_detection_enabled(&self) -> bool {
+        self.detect_collisions
+    }
+
+    /// Cumulative count of cross-host dispatch collisions observed by this
+    /// registry (Issue #4085). Always `0` when detection is disabled. Read by
+    /// the work-finder to surface the running baseline on its per-tick line.
+    #[must_use]
+    pub fn collision_count(&self) -> u64 {
+        self.collision_count
     }
 
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
@@ -1208,11 +1437,17 @@ impl SweepRegistry {
     /// label restore re-arms `loom:issue` (mirroring [`expire_quarantine`]), so
     /// the operator command both releases the in-memory pause and re-enters the
     /// issue into the work-finder queue — the label flip alone never sufficed.
+    ///
+    /// A failed label restore (Issue #4110) does NOT make this return `false` —
+    /// the in-memory quarantine genuinely was cleared — but the issue is added
+    /// to [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// so the background reaper keeps retrying the flip until it succeeds,
+    /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
         let was_quarantined = self.quarantined.remove(&issue).is_some();
         if was_quarantined {
-            self.release_quarantine_label(issue);
+            self.attempt_quarantine_release(issue);
         }
         was_quarantined
     }
@@ -1225,6 +1460,14 @@ impl SweepRegistry {
         self.quarantined.insert(issue, Utc::now());
         self.insta_crash_counts
             .insert(issue, self.quarantine_config.threshold);
+    }
+
+    /// Issues currently awaiting a retried `loom:blocked` -> `loom:issue` label
+    /// restore after at least one failed attempt (Issue #4110). Exposed for
+    /// tests and `loom-daemon status`-style diagnostics.
+    #[must_use]
+    pub fn pending_quarantine_release_issues(&self) -> HashSet<u32> {
+        self.pending_quarantine_release.clone()
     }
 
     /// Read-only accessor for the event bus, if any. Exposed so external
@@ -1336,6 +1579,53 @@ impl SweepRegistry {
             }
         };
 
+        // 2.4 Workspace-commands guard (Issue #4027). A workspace registered
+        //     (or hot-added, #3926) without ever running `loom-daemon init` —
+        //     e.g. a bare `git clone` on a second daemon host — has `.git`/
+        //     `.loom` so it "looks like" a workspace, but lacks the
+        //     install-not-committed `.claude/commands/loom/` slash commands.
+        //     Dispatching `/loom:sweep <N>` into it insta-crashes the child on
+        //     `Unknown command: /loom:sweep` within seconds, and because it
+        //     exits before any checkpoint/worktree exists, the reaper reverts
+        //     `loom:building` -> `loom:issue` and the work-finder re-dispatches
+        //     on the next tick: an infinite fast-fail loop burning a rotated
+        //     token roughly every tick, forever. Checked FIRST — before even
+        //     the closed-issue guard's `gh` probe below — because it is a
+        //     single local `stat` versus a subprocess spawn: a misconfigured
+        //     workspace should cost as little as possible per tick, and zero
+        //     tokens either way. Skipped when label flips are disabled (test
+        //     fixtures exercising pure in-memory dispatch mechanics without a
+        //     fully Loom-managed workspace on disk), mirroring the #4088
+        //     closed-issue guard's skip condition below.
+        if !self.config.skip_label_flip && !self.config.has_sweep_command() {
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: workspace {} is missing \
+                 .claude/commands/loom/sweep.md — the /loom:sweep slash command is not \
+                 installed there (#4027 wedge-loop guard). Run \
+                 `loom-daemon init {}` in that workspace first.",
+                self.config.workspace_root.display(),
+                self.config.workspace_root.display()
+            ));
+        }
+
+        // 2.5 Closed-issue guard (Issue #4088). All three watchdogs
+        //     (startup #3887, mid-build-death #3895, review-stall #3910)
+        //     re-dispatch through this method, and `gh issue edit` succeeds on a
+        //     closed issue, so nothing else stops a watchdog false-positive from
+        //     re-claiming an issue whose PR already merged. Placing the guard
+        //     here — before the lock/label flip — covers all three call sites
+        //     with one check. Best-effort and fail-open: a forge lookup error
+        //     returns `None` and dispatch proceeds, so a `gh` outage can never
+        //     wedge the daemon. Skipped when label flips are disabled (test
+        //     fixtures without `gh` credentials).
+        if !self.config.skip_label_flip && self.issue_is_closed(issue_number) == Some(true) {
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: it is closed on the forge \
+                 (#4088 closed-issue guard). A watchdog re-dispatch must not re-claim a \
+                 closed/merged issue."
+            ));
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -1344,6 +1634,14 @@ impl SweepRegistry {
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
         if !self.config.skip_label_flip {
+            // 4a. Cross-host collision baseline (Issue #4085, Phase 0 of #4028):
+            //     read the pre-flip label state and record — but never act on —
+            //     the case where a peer host already claimed this issue. A no-op
+            //     when detection is disabled (default), so the flip path below is
+            //     byte-for-byte unchanged. Must run BEFORE the flip: once this
+            //     host flips, a collided issue is indistinguishable from a clean
+            //     one.
+            self.detect_and_record_collision(issue_number);
             if let Err(e) = self.flip_label_to_building(issue_number) {
                 log::warn!(
                     "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
@@ -1578,8 +1876,147 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Cross-host collision detection (Issue #4085, Phase 0 of #4028)
+    // ------------------------------------------------------------------------
+
+    /// Read the issue's **current** forge labels and classify whether a peer
+    /// host already claimed it (Issue #4085). Called by [`dispatch`](Self::dispatch)
+    /// immediately *before* the label flip, when detection is enabled — a
+    /// post-flip read cannot distinguish a collided issue from a clean one (both
+    /// end up `loom:building`), so the observation must happen pre-flip.
+    ///
+    /// Uses a bounded `gh issue view <N> --json labels`. **Fail-closed**: any
+    /// timeout, non-zero exit, or unparseable payload resolves to
+    /// [`CollisionClass::Unknown`], never `Collision`, so the baseline is never
+    /// inflated by an unverifiable read. The `gh issue edit` flip itself is left
+    /// byte-for-byte unchanged.
+    fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("labels");
+        // Same workspace/repo scoping as the flip (#3937): resolve the issue
+        // against *this* registry's repo, not the daemon's cwd repo.
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        let output = match output_with_timeout(cmd, timeout) {
+            Ok(Some(o)) if o.status.success() => o,
+            Ok(Some(_)) => return CollisionClass::Unknown, // non-zero exit
+            Ok(None) => return CollisionClass::Unknown,    // timed out + killed
+            Err(_) => return CollisionClass::Unknown,      // spawn failure
+        };
+        // `gh issue view --json labels` emits `{"labels":[{"name":"..."},...]}`.
+        let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+            Ok(v) => v,
+            Err(_) => return CollisionClass::Unknown,
+        };
+        let Some(arr) = parsed.get("labels").and_then(|l| l.as_array()) else {
+            return CollisionClass::Unknown;
+        };
+        let labels: Vec<String> = arr
+            .iter()
+            .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        let has_issue = labels.iter().any(|l| l == "loom:issue");
+        let has_building = labels.iter().any(|l| l == "loom:building");
+        if !has_issue || has_building {
+            CollisionClass::Collision { labels }
+        } else {
+            CollisionClass::Clean
+        }
+    }
+
+    /// When detection is enabled, probe the pre-flip label state and record —
+    /// but never act on — a cross-host collision (Issue #4085). A no-op (no `gh`
+    /// call at all) when detection is disabled, so the disabled dispatch path is
+    /// byte-for-byte unchanged. Increments [`collision_count`](Self::collision_count)
+    /// and logs a diagnostic record (issue, repo/workspace, host, timestamp,
+    /// observed pre-flip labels) on a confirmed collision.
+    fn detect_and_record_collision(&mut self, issue: u32) {
+        if !self.detect_collisions {
+            return;
+        }
+        match self.classify_preflip_labels(issue) {
+            CollisionClass::Collision { labels } => {
+                self.collision_count += 1;
+                log::warn!(
+                    "sweep_registry: cross-host dispatch collision (#4085) — issue #{issue} in \
+                     {repo} was already claimed by another host before host {host} flipped it at \
+                     {ts}; observed pre-flip labels=[{labels}]; running collision count={count} \
+                     (detection only — dispatch continues unchanged)",
+                    repo = self.config.workspace_root.display(),
+                    host = host_identity(),
+                    ts = Utc::now().to_rfc3339(),
+                    labels = labels.join(", "),
+                    count = self.collision_count,
+                );
+            }
+            CollisionClass::Unknown => {
+                // Fail-closed: an unverifiable read is never a collision.
+                log::debug!(
+                    "sweep_registry: collision probe for issue #{issue} inconclusive \
+                     (fail-closed, not counted) (#4085)"
+                );
+            }
+            CollisionClass::Clean => {}
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Forge label flip
     // ------------------------------------------------------------------------
+
+    /// Best-effort probe of whether an issue is closed on the forge (Issue
+    /// #4088). Returns `Some(true)` when closed, `Some(false)` when open, and
+    /// `None` on any error (missing/failed/timed-out `gh`, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
+    /// `gh` must never wedge dispatch. The call is bounded by [`reap_gh_timeout`]
+    /// exactly like the label flips so it cannot block the dispatch path.
+    fn issue_is_closed(&self, issue: u32) -> Option<bool> {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("state")
+            .arg("--jq")
+            .arg(".state");
+        // Resolve the issue against this registry's own workspace, matching the
+        // label-flip helpers (#3937). LOOM_REPO still overrides when set.
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "CLOSED" => Some(true),
+            "OPEN" => Some(false),
+            _ => None,
+        }
+    }
 
     fn flip_label_to_building(&self, issue: u32) -> Result<()> {
         let gh = self
@@ -1661,6 +2098,82 @@ impl SweepRegistry {
     // Insta-crash quarantine (Issue #3939)
     // ------------------------------------------------------------------------
 
+    /// Record an insta-crash-classified death, first giving the
+    /// account-exhaustion classifier a chance to re-attribute it to the spawn
+    /// account (#4122).
+    ///
+    /// When `insta_crash` is `true` and the dead sweep's log tail matches an
+    /// account-exhaustion signature, the death is charged to the ACCOUNT (the
+    /// spawn token is marked bad) and the issue's insta-crash quarantine tally
+    /// is left **untouched** — neither incremented (it was not the issue's
+    /// fault) nor reset (exhaustion is neutral for the issue's consecutive
+    /// streak). Otherwise the normal [`record_terminal_outcome`] accounting
+    /// applies unchanged.
+    ///
+    /// [`record_terminal_outcome`]: Self::record_terminal_outcome
+    fn record_insta_crash_outcome(&mut self, sweep_id: &SweepId, issue: u32, insta_crash: bool) {
+        if insta_crash && self.insta_crash_is_account_exhaustion(sweep_id, issue) {
+            return;
+        }
+        self.record_terminal_outcome(issue, insta_crash);
+    }
+
+    /// Classify whether an insta-crash death was caused by account exhaustion
+    /// (#4122).
+    ///
+    /// Reads the tail of the dead sweep's log and matches it against the
+    /// [`exhaustion_signatures`] table. On a match the spawn account is marked
+    /// bad (with the Rust-side exhaustion cooldown TTL — see
+    /// [`bad_tokens::is_bad`]) and `true` is returned so the caller charges the
+    /// account, not the issue. Returns `false` when the log shows no exhaustion
+    /// signature — the caller then applies the normal insta-crash accounting.
+    ///
+    /// Marking the account bad is best-effort and independent of the quarantine
+    /// config: even when quarantine is disabled, an exhaustion death should
+    /// still rotate the bad account out of the pool. When the spawn account was
+    /// never captured (`token=unknown`) the death is still not charged to the
+    /// issue, but no account can be marked bad.
+    fn insta_crash_is_account_exhaustion(&self, sweep_id: &SweepId, issue: u32) -> bool {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return false;
+        };
+        let log_path = info.log_path.clone();
+        let token_name = info.token_name.clone();
+
+        let tail = match tail_lines(&log_path, EXHAUSTION_LOG_TAIL_LINES) {
+            Ok(lines) => lines.join("\n"),
+            Err(_) => return false,
+        };
+        let Some(signature) = classify_account_exhaustion(&tail) else {
+            return false;
+        };
+
+        if token_name == UNKNOWN_TOKEN_NAME {
+            log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' but the spawn account was never \
+                 captured (token=unknown) — NOT charging the issue's quarantine tally, but cannot \
+                 mark an account bad (#4122)"
+            );
+            return true;
+        }
+
+        let reason = format!("exhausted: {signature} (daemon insta-crash, issue #{issue})");
+        match bad_tokens::mark_bad(&self.config.workspace_root, &token_name, &reason) {
+            Ok(()) => log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' — marked account '{token_name}' bad \
+                 (cooldown TTL) and charged the ACCOUNT, not the issue's quarantine tally (#4122)"
+            ),
+            Err(e) => log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' (account '{token_name}') but mark_bad \
+                 failed: {e} — still NOT charging the issue's quarantine tally (#4122)"
+            ),
+        }
+        true
+    }
+
     /// Record a terminal sweep outcome against the insta-crash tally (#3939).
     ///
     /// `insta_crash` is `true` only when the reaper classified the death as a
@@ -1716,7 +2229,9 @@ impl SweepRegistry {
     /// Called at the top of each [`reap_once`](Self::reap_once). Cheap
     /// early-return when nothing is quarantined. On release the insta-crash tally
     /// is cleared too, so the issue re-qualifies with a fresh runway, and a
-    /// best-effort forge label restore re-arms `loom:issue`.
+    /// best-effort forge label restore re-arms `loom:issue` — retried on
+    /// subsequent ticks via [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// if the first attempt fails (Issue #4110).
     fn expire_quarantine(&mut self) {
         if self.quarantined.is_empty() {
             return;
@@ -1736,8 +2251,76 @@ impl SweepRegistry {
                 "sweep_registry: issue #{issue} quarantine expired after {ttl_secs}s — eligible \
                  for re-dispatch again (#3939)"
             );
-            self.release_quarantine_label(issue);
+            self.attempt_quarantine_release(issue);
         }
+    }
+
+    /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// (Issue #4110). Called every [`reap_once`](Self::reap_once) tick, right
+    /// after [`expire_quarantine`](Self::expire_quarantine): a previously
+    /// failed `loom:blocked` -> `loom:issue` restore (transient `gh` failure or
+    /// timeout, #3973) is retried here until it succeeds, instead of leaving
+    /// the issue permanently stranded. Cheap early-return when nothing is
+    /// pending. Idempotent — re-running the flip on an issue that a human
+    /// already restored by hand is a harmless no-op `gh` call.
+    fn retry_pending_quarantine_releases(&mut self) {
+        if self.pending_quarantine_release.is_empty() {
+            return;
+        }
+        let pending: Vec<u32> = self.pending_quarantine_release.iter().copied().collect();
+        for issue in pending {
+            self.attempt_quarantine_release(issue);
+        }
+    }
+
+    /// Attempt the `loom:blocked` -> `loom:issue` label restore for `issue`
+    /// (Issue #4110). On success, clears any pending-retry record. On
+    /// failure, records `issue` in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// (if not already there) and logs at `warn` — a silent strand is the
+    /// defect this exists to prevent, so the failure must be visible above
+    /// the default log level.
+    fn attempt_quarantine_release(&mut self, issue: u32) {
+        if self.release_quarantine_label(issue) {
+            self.pending_quarantine_release.remove(&issue);
+        } else {
+            let first_attempt = self.pending_quarantine_release.insert(issue);
+            log::warn!(
+                "sweep_registry: quarantine release for #{issue} failed — `loom:blocked` may \
+                 remain stranded on the forge; retrying on the next reaper tick (#4110){}",
+                if first_attempt {
+                    ""
+                } else {
+                    " (repeated failure)"
+                }
+            );
+        }
+    }
+
+    /// Best-effort release of every currently-quarantined issue's
+    /// `loom:blocked` label before this registry is dropped (Issue #4110).
+    /// Workspace eviction ([`crate::workspace_pool::WorkspacePool::evict`])
+    /// discards this registry's in-memory state, including any live
+    /// quarantine and its reaper — so without this, an evicted workspace's
+    /// quarantined issues would sit at `loom:blocked` until the *next* full
+    /// daemon restart triggers the startup reconciliation pass
+    /// ([`crate::quarantine_reconciliation`]). Each release here is a single
+    /// best-effort attempt (no in-registry retry survives past eviction,
+    /// since the reaper that would drive it is gone); a failure is logged at
+    /// `warn` and left for the reconciliation pass to pick up at the next
+    /// restart. Returns the number of quarantines flushed (attempted).
+    pub fn flush_quarantines_for_eviction(&mut self) -> usize {
+        let issues: Vec<u32> = self.quarantined.keys().copied().collect();
+        for issue in &issues {
+            self.quarantined.remove(issue);
+            self.insta_crash_counts.remove(issue);
+            if !self.release_quarantine_label(*issue) {
+                log::warn!(
+                    "sweep_registry: eviction release for #{issue} failed — `loom:blocked` may \
+                     remain stranded until the next daemon-restart reconciliation pass (#4110)"
+                );
+            }
+        }
+        issues.len()
     }
 
     /// Best-effort forge mutation on quarantine (#3939): add `loom:blocked`,
@@ -1781,17 +2364,18 @@ impl SweepRegistry {
         }
 
         let body = format!(
-            "Auto-quarantined by loom-daemon (#3939): this issue's sweep insta-crashed {count} \
+            "{marker}: this issue's sweep insta-crashed {count} \
              times in a row — each child died within {secs}s of dispatch without writing a phase \
              checkpoint, which almost always means an environment/configuration failure (e.g. a \
              missing token pool, #3938) rather than a problem with the issue itself. Re-dispatch \
              is paused so it stops occupying a global concurrency slot and starving other work. \
              Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
-             quarantine clear {issue}` (this releases the in-memory pause AND restores \
-             `loom:issue`), or simply wait for the {ttl}s TTL to auto-release it. Note: manually \
-             flipping `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's \
-             in-memory quarantine on its own — the work finder skips it until the CLI clear or the \
-             TTL fires.",
+             quarantine clear {issue}`, or simply wait for the {ttl}s TTL — both paths release the \
+             in-memory pause AND restore `loom:issue` (#4110). Note: manually flipping \
+             `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's in-memory \
+             quarantine on its own — the work finder skips it until the CLI clear or the TTL \
+             fires.",
+            marker = QUARANTINE_COMMENT_MARKER,
             secs = self.quarantine_config.insta_crash_secs,
             ttl = self.quarantine_config.ttl.as_secs(),
         );
@@ -1816,13 +2400,24 @@ impl SweepRegistry {
         }
     }
 
-    /// Best-effort forge mutation on quarantine expiry (#3939): remove
-    /// `loom:blocked` and re-add `loom:issue` so an auto-released issue re-enters
-    /// the work-finder queue. The mirror of [`apply_quarantine_label`]. Skipped
-    /// when label flips are disabled; a `gh` failure is logged at debug only.
-    fn release_quarantine_label(&self, issue: u32) {
+    /// Best-effort forge mutation on quarantine expiry/clear (#3939): remove
+    /// `loom:blocked` and re-add `loom:issue` so a released issue re-enters the
+    /// work-finder queue. The mirror of [`apply_quarantine_label`]. Skipped
+    /// (returns `true` — a no-op success) when label flips are disabled.
+    ///
+    /// Returns `true` on a confirmed successful flip, `false` otherwise
+    /// (Issue #4110: previously this returned `()` and treated a completed-but-
+    /// failed `gh` invocation — non-zero exit — identically to success, which is
+    /// the root cause of the observed strand: the in-memory quarantine was
+    /// already dropped by the caller before this ran, so a swallowed failure
+    /// left `loom:blocked` on the forge with nothing left to retry it). Callers
+    /// use the return value to decide whether to retry
+    /// ([`attempt_quarantine_release`](Self::attempt_quarantine_release)).
+    /// Every failure is logged at `warn` (was `debug`) — a silent strand is
+    /// exactly the defect this exists to prevent.
+    fn release_quarantine_label(&self, issue: u32) -> bool {
         if self.config.skip_label_flip {
-            return;
+            return true;
         }
         let gh = self
             .config
@@ -1845,16 +2440,28 @@ impl SweepRegistry {
         // `ListSweeps` / `GetSweepStatus` read path.
         let timeout = reap_gh_timeout();
         match output_with_timeout(edit, timeout) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::debug!(
-                "sweep_registry: quarantine-release label edit for #{issue} exceeded {}s, \
-                 killed (#3973)",
-                timeout.as_secs()
-            ),
+            Ok(Some(output)) if output.status.success() => true,
+            Ok(Some(output)) => {
+                log::warn!(
+                    "sweep_registry: quarantine-release label edit for #{issue} exited {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                false
+            }
+            Ok(None) => {
+                log::warn!(
+                    "sweep_registry: quarantine-release label edit for #{issue} exceeded {}s, \
+                     killed (#3973)",
+                    timeout.as_secs()
+                );
+                false
+            }
             Err(e) => {
-                log::debug!(
+                log::warn!(
                     "sweep_registry: quarantine-release label edit for #{issue} failed: {e}"
-                )
+                );
+                false
             }
         }
     }
@@ -2029,7 +2636,21 @@ impl SweepRegistry {
             .with_context(|| format!("failed to open log {}", log_path.display()))?;
         let log_clone = log_file.try_clone()?;
 
-        let prompt = format!("/loom:sweep {issue}");
+        // Daemon self-claim marker, positional form (issue #4111): embed
+        // `--claim-owned <N>` INSIDE the `-p` prompt text so it becomes part of
+        // the `/loom:sweep` skill's own `$ARGUMENTS`, exactly like every other
+        // skill-consumed flag (`--dry-run`, `--no-daemon`, `--depends-on`,
+        // `--auto-stack`). It MUST NOT be appended as a sibling `cmd.arg()`:
+        // `spawn-claude.sh` forwards every non-wrapper token verbatim to the
+        // real `claude` CLI (`exec claude "$@"`), and `--claim-owned` is not a
+        // `claude` CLI flag — a sibling arg makes `claude` exit 1
+        // (`error: unknown option '--claim-owned'`) before any session starts,
+        // turning every daemon dispatch into an immediate crash. Only text
+        // inside the single `-p "<prompt>"` string ever reaches the skill's
+        // pre-flight. The env var (`LOOM_SWEEP_CLAIM_OWNED`, set below) is kept
+        // unchanged for backward compatibility (#3823/#3967). Unconditional on
+        // every daemon dispatch — every dispatch claims exactly one issue.
+        let prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -2059,6 +2680,8 @@ impl SweepRegistry {
         if let Some(parent) = depends_on {
             cmd.arg("--depends-on").arg(parent.to_string());
         }
+        // (Daemon self-claim marker `--claim-owned <N>` is embedded in the
+        // `-p` prompt text above, not appended as a sibling arg — see #4111.)
         // Unattended-permissions flag (issue #3824): a daemon-dispatched child
         // is a detached, non-interactive `claude -p` process — there is no
         // human to answer a permission prompt, so any tool call needing
@@ -2070,8 +2693,8 @@ impl SweepRegistry {
         // `claude -p "/<role>" --dangerously-skip-permissions`). Scoped to this
         // daemon-only dispatch path; `spawn-claude.sh` stays a generic
         // pass-through and never adds a permission flag of its own. Appended
-        // AFTER `--model`/`--effort`/`--depends-on` so the positional argv
-        // contract for those flags is unchanged.
+        // AFTER `--model`/`--effort`/`--depends-on` (and the prompt-embedded
+        // `--claim-owned`) so the positional argv contract is unchanged.
         cmd.arg("--dangerously-skip-permissions");
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Claim-ownership marker (issue #3823): `dispatch()` flips
@@ -2086,6 +2709,16 @@ impl SweepRegistry {
             // Scoped to daemon-dispatched children only: an operator-run
             // `/loom:sweep N` never sets this env var, so the manual-terminal
             // skip rule (honor any loom:building) is unchanged.
+            //
+            // Issue #4111: this env var alone was proven insufficient — a
+            // daemon-dispatched child reliably reasoned about loom:building
+            // label timing / PID tables / `loom-daemon status` and
+            // self-skipped its own claim without ever consulting it. The
+            // `--claim-owned <N>` argv flag appended above is now the PRIMARY
+            // signal (positional, in the model's context by construction);
+            // this env var is kept for backward compatibility only —
+            // spawn-claude.sh still logs it, and it is still asserted by the
+            // producer-side tests below plus `work_finder.rs` / `ipc.rs`.
             .env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string())
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
@@ -2492,6 +3125,9 @@ impl SweepRegistry {
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
         self.expire_quarantine();
+        // Retry any previously-failed quarantine label restores (Issue #4110).
+        // Cheap early-return when nothing is pending.
+        self.retry_pending_quarantine_releases();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
@@ -2560,13 +3196,31 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Crashed,
                             });
-                            // Insta-crash quarantine (#3939): a checkpoint exists,
-                            // so this sweep reached real work — the mid-build-death
-                            // watchdog (#3895) owns this failure mode, and it is
-                            // explicitly NOT an insta-crash. Reset the consecutive
-                            // tally so a genuine mid-build death never accretes
-                            // toward quarantine.
-                            self.record_terminal_outcome(issue, false);
+                            // Insta-crash quarantine (#3939 + #4009): a checkpoint
+                            // FILE existing on disk does not prove THIS run made
+                            // progress — checkpoints persist across dispatches
+                            // (#3373), so a single successful-enough historical run
+                            // would otherwise exempt the issue from quarantine
+                            // forever while every later dispatch dies pre-work in
+                            // <2s (an infinite re-dispatch loop, #4009). Only a
+                            // checkpoint (re)written by THIS run — mtime at/after
+                            // our `started_at` — counts as progress. Such a genuine
+                            // mid-build death is the mid-build-death watchdog's
+                            // remit (#3895) and resets the consecutive tally. A
+                            // stale checkpoint from an earlier dispatch does not:
+                            // fall through to the same pre-work insta-crash test the
+                            // checkpoint-less branch below uses, so a sub-window
+                            // non-clean death still counts toward quarantine.
+                            if checkpoint_written_by_run(&checkpoint, started_at) {
+                                self.record_terminal_outcome(issue, false);
+                            } else {
+                                let insta_crash = duration_sec
+                                    < self.quarantine_config.insta_crash_secs
+                                    && exit_code != Some(0);
+                                // #4122: re-attribute account-exhaustion deaths
+                                // to the spawn account instead of the issue.
+                                self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                            }
                         } else {
                             // Orphaned-claim recovery (issue #3823b): a
                             // daemon-owned sweep that exits cleanly WITHOUT a
@@ -2618,7 +3272,9 @@ impl SweepRegistry {
                             let insta_crash = duration_sec
                                 < self.quarantine_config.insta_crash_secs
                                 && exit_code != Some(0);
-                            self.record_terminal_outcome(issue, insta_crash);
+                            // #4122: re-attribute account-exhaustion deaths to
+                            // the spawn account instead of the issue.
+                            self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
                         // parent ended in `loom:blocked` and stacked children
@@ -2687,6 +3343,11 @@ impl SweepRegistry {
             // `poll_liveness` already, but drop any lingering handle so a
             // GC'd sweep never leaks a `Child` (Issue #3801).
             let _ = self.children.remove(&id);
+            // Prune the per-SweepId progress latch so it cannot grow unbounded
+            // across many dispatches (Issue #4088). Safe because a GC'd entry is
+            // terminal — the watchdog only ever consults the latch for
+            // Running/Pending entries it still owns a Child handle for.
+            self.watchdog_progressed.remove(&id);
             changes += 1;
         }
         changes
@@ -2785,7 +3446,17 @@ impl SweepRegistry {
 
         let mut restarts = 0usize;
         for (sweep_id, issue, log_path, elapsed) in candidates {
-            let made_progress = self.sweep_made_progress(issue, &log_path);
+            // Latch progress per SweepId (Issue #4088): `sweep_made_progress`
+            // only reports the *current* filesystem state, and every signal it
+            // reads (worktree, checkpoint, log) is torn down at successful
+            // completion — so a finished sweep would otherwise read as
+            // never-started and be re-dispatched. Once observed true, the latch
+            // keeps `made_progress` true for this SweepId on every later tick.
+            let made_progress = self.watchdog_progressed.contains(&sweep_id)
+                || self.sweep_made_progress(issue, &log_path);
+            if made_progress {
+                self.watchdog_progressed.insert(sweep_id.clone());
+            }
             let already_retried = self.watchdog_retried.contains(&issue);
             match watchdog_decision(elapsed, timeout, made_progress, already_retried) {
                 WatchdogDecision::Healthy => {}
@@ -3627,15 +4298,8 @@ pub struct StartupRaceConfig {
 /// [`crate::work_finder::read_work_finder_config`].
 #[must_use]
 pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
-        return StartupRaceConfig::default();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
-        return StartupRaceConfig::default();
-    };
-    let Some(auto) = config.get("autonomous") else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(auto) = crate::config_resolver::get_path(&effective, "autonomous") else {
         return StartupRaceConfig::default();
     };
     let watchdog = auto.get("watchdog");
@@ -3742,6 +4406,25 @@ pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Resolve whether cross-host dispatch-collision detection runs (Issue #4085,
+/// Phase 0 of #4028), precedence **env > config > default(false)**. Reads
+/// `LOOM_DETECT_COLLISIONS` first, then `autonomous.collisionDetection.enabled`
+/// from the effective config, then defaults **off** (the probe adds one extra
+/// `gh issue view` round-trip per dispatch, so it is opt-in until a baseline
+/// justifies it).
+#[must_use]
+pub fn resolve_collision_detection(repo_root: &Path) -> bool {
+    if let Ok(v) = std::env::var(COLLISION_DETECT_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous")
+        .and_then(|a| a.get("collisionDetection"))
+        .and_then(|c| c.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 // ============================================================================
 // Insta-crash quarantine config resolution (Issue #3939)
 // ============================================================================
@@ -3771,19 +4454,9 @@ pub struct QuarantineFileConfig {
 /// [`read_startup_race_config`].
 #[must_use]
 pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
-        return QuarantineFileConfig::default();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
-        return QuarantineFileConfig::default();
-    };
-    let block = config
-        .get("autonomous")
-        .and_then(|a| a.get("workFinder"))
-        .and_then(|w| w.get("quarantine"));
-    let Some(q) = block else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(q) = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine")
+    else {
         return QuarantineFileConfig::default();
     };
     QuarantineFileConfig {
@@ -3978,6 +4651,38 @@ fn read_checkpoint_phase(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Returns `true` when the checkpoint at `path` was last written at or after
+/// `started_at` — i.e. by the sweep run that began at `started_at` — rather than
+/// being a stale artifact left on disk by an earlier dispatch (#4009).
+///
+/// Sweep checkpoints persist across dispatches (`.loom/sweep-checkpoint/
+/// issue-<N>.json` is only removed by an explicit `sweep-checkpoint.sh delete`,
+/// which never runs on a crash — #3373), so the mere *presence* of the file
+/// does not prove the run that just died made any progress. A single
+/// successful-enough historical run would otherwise leave the file on disk
+/// forever, permanently exempting the issue from the insta-crash quarantine
+/// (#3939) even as every subsequent dispatch dies pre-work in under 2s — an
+/// infinite re-dispatch loop.
+///
+/// Comparing the file's mtime against this run's `started_at` distinguishes
+/// "this run reached real work" (a mid-build death — the #3895 watchdog's
+/// remit, which must reset the insta-crash tally) from "a checkpoint from an
+/// earlier dispatch happens to exist" (a pre-work insta-crash that must still
+/// count toward quarantine).
+///
+/// A missing file, or an unreadable/absent mtime, yields `false` (treated as
+/// "no progress by this run"), so an unreadable checkpoint never shields an
+/// issue from quarantine.
+fn checkpoint_written_by_run(path: &Path, started_at: DateTime<Utc>) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    DateTime::<Utc>::from(mtime) >= started_at
+}
+
 /// Send a signal to a PID. Returns `true` on success (signal queued or
 /// process already absent and the caller can treat that as "done"). PID
 /// 0 is rejected to avoid the POSIX broadcast-to-group semantics.
@@ -4061,6 +4766,18 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    /// Install the `/loom:sweep` command marker under `workspace` (Issue
+    /// #4027) so the workspace-commands guard in `dispatch()` treats it as
+    /// initialized. Only tests that run with `skip_label_flip = false` need
+    /// this — the guard itself is skipped when label flips are disabled
+    /// (see `dispatch()`'s 2.4 comment), which covers the overwhelming
+    /// majority of fixtures in this module.
+    fn touch_sweep_command(workspace: &Path) {
+        let dir = workspace.join(".claude").join("commands").join("loom");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sweep.md"), "# /loom:sweep (test fixture)\n").unwrap();
+    }
+
     /// Build a temp-workspace registry with a fake spawn binary that
     /// records its argv + env into a log and exits immediately. This lets
     /// us assert on the dispatch behavior without invoking real `claude`.
@@ -4086,6 +4803,13 @@ mod tests {
 # Test fixture: record dispatch args + selected env into a log.
 {{
   printf 'argv: %s\n' "$*"
+  # Also record each argv TOKEN on its own line (issue #4111): `$*` flattens a
+  # single `-p "<prompt with spaces>"` arg into space-joined text that is
+  # indistinguishable from sibling args, which is exactly why a sibling
+  # `--claim-owned` (rejected by the real `claude` CLI) slipped past the
+  # `$*`-substring tests. A per-token record lets a test assert the flag lands
+  # INSIDE the `-p` prompt value, not as its own argv token.
+  for tok in "$@"; do printf 'arg: %s\n' "$tok"; done
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
   printf 'PWD=%s\n' "$(pwd -P)"
@@ -4157,6 +4881,26 @@ exit 0
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         false
+    }
+
+    /// Wait (up to `FIXTURE_CHILD_WAIT_MS`, #4044) for the fixture's fake
+    /// `spawn-claude.sh` to write `needle` into `record_log`, then return the
+    /// file's full contents for the caller's own content assertions.
+    ///
+    /// Panics with a message that distinguishes "the child never started /
+    /// never wrote anything" from "the child started but wrote the wrong
+    /// thing" — the third acceptance criterion of #4044 — rather than the
+    /// old bare "did not finish writing within 10s".
+    fn assert_child_wrote(record_log: &Path, needle: &str) -> String {
+        let wrote = wait_for_contents(record_log, needle, FIXTURE_CHILD_WAIT_MS);
+        let recorded = std::fs::read_to_string(record_log).unwrap_or_default();
+        assert!(
+            wrote,
+            "fake spawn-claude.sh did not write expected contents within {}ms\n  needle: {needle}\n  record_log exists: {}\n  record_log contents: {recorded}",
+            FIXTURE_CHILD_WAIT_MS,
+            record_log.exists(),
+        );
+        recorded
     }
 
     /// Poll `.loom/scripts/spawn-claude.sh` fixture installation: write a
@@ -4246,19 +4990,7 @@ exit 0
         // the final line (LOOM_TERMINAL_ID) so the assertion isn't racing
         // mid-write.
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        let sweep_log = dir
-            .path()
-            .join(".loom")
-            .join("logs")
-            .join("sweep-issue-42.log");
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s\n  record_log: {}\n  record_log exists: {}\n  sweep_log: {}",
-            std::fs::read_to_string(&record_log).unwrap_or_default(),
-            record_log.exists(),
-            std::fs::read_to_string(&sweep_log).unwrap_or_default(),
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 42"),
             "expected argv in recorded log; got: {recorded}"
@@ -4345,8 +5077,9 @@ exit 0
     /// Issue #3824: `spawn_child` unconditionally appends
     /// `--dangerously-skip-permissions` to the child argv so a detached,
     /// non-interactive `claude -p` sweep never stalls on a permission prompt.
-    /// With no model/effort/depends-on the flag is the sole trailing arg,
-    /// appended AFTER any of those (verified by the exact positional form).
+    /// With no model/effort/depends-on the flag directly follows the
+    /// `--claim-owned <N>` marker (#4111, always emitted for a daemon
+    /// dispatch), appended AFTER it (verified by the exact positional form).
     #[test]
     #[serial]
     fn dispatch_appends_dangerously_skip_permissions() {
@@ -4358,14 +5091,13 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("argv: -p /loom:sweep 4242 --dangerously-skip-permissions"),
-            "expected --dangerously-skip-permissions appended after the prompt; got: {recorded}"
+            recorded.contains(
+                "argv: -p /loom:sweep 4242 --claim-owned 4242 --dangerously-skip-permissions"
+            ),
+            "expected --claim-owned then --dangerously-skip-permissions appended after the \
+             prompt; got: {recorded}"
         );
     }
 
@@ -4385,14 +5117,135 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4243"),
             "expected claim-ownership marker for issue 4243; got: {recorded}"
+        );
+    }
+
+    /// Issue #4111 (Option 1, the positional half of the fix): in addition to
+    /// the `LOOM_SWEEP_CLAIM_OWNED` env var above, `spawn_child` appends
+    /// `--claim-owned <issue>` to the child's own argv. This is the primary
+    /// signal — positional in the model's context by construction — that
+    /// `/loom:sweep`'s mandatory Step 1a pre-flight check consumes. Asserts
+    /// BOTH channels are present on the same dispatch (belt-and-suspenders,
+    /// per the issue's explicit "keep the env var exported regardless for
+    /// backward compatibility" guidance) and that the flag carries exactly
+    /// the dispatched issue number, unconditionally (unlike the
+    /// optional --model/--effort/--depends-on flags, this one is never
+    /// absent on a daemon dispatch).
+    #[test]
+    #[serial]
+    fn dispatch_appends_claim_owned_flag() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4246), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 4246 --claim-owned 4246"),
+            "expected --claim-owned 4246 in argv immediately after the prompt; got: {recorded}"
+        );
+        // Regression for the #4120 review: `--claim-owned` MUST be embedded in
+        // the `-p` prompt string, NOT appended as a sibling argv token. The
+        // real `claude` CLI rejects `--claim-owned` as an unknown option and
+        // exits 1 if it arrives as its own token; only text inside the single
+        // `-p "<prompt>"` value reaches the `/loom:sweep` skill's `$ARGUMENTS`.
+        // The fixture records each argv token on its own `arg: ` line, so we
+        // can assert the flag is part of the prompt VALUE (one token that also
+        // carries `/loom:sweep`) and NOT a standalone `arg: --claim-owned`
+        // token — the `$*`-substring assertion above cannot tell these apart
+        // (which is precisely how the original sibling-arg bug slipped through).
+        assert!(
+            recorded.contains("arg: /loom:sweep 4246 --claim-owned 4246"),
+            "expected --claim-owned inside the single -p prompt token; got: {recorded}"
+        );
+        assert!(
+            !recorded.contains("arg: --claim-owned"),
+            "--claim-owned must NOT be a standalone argv token (the real claude CLI \
+             rejects it as an unknown option); got: {recorded}"
+        );
+        // Belt-and-suspenders: the env var must still be present too (#3823
+        // backward compatibility, per #4111's explicit guidance to keep it).
+        assert!(
+            recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4246"),
+            "expected the LOOM_SWEEP_CLAIM_OWNED env var alongside the flag; got: {recorded}"
+        );
+    }
+
+    /// Issue #4111 (the consumer-side regression this issue is really about):
+    /// a checkpoint-less, clean (`exit 0`) sweep death for a daemon-dispatched
+    /// self-claim check — i.e. exactly the "deliberate skip" shape the #3939
+    /// insta-crash guard is SUPPOSED to exempt — must NOT increment the
+    /// insta-crash tally when the reaper retains the real `Child` handle
+    /// (poll_liveness observes `exit_code == Some(0)`, not the `None`
+    /// fallback the other insta-crash fixtures in this file simulate via a
+    /// dead/unretained PID). This exercises the reaper's `exit_code !=
+    /// Some(0)` guard (`sweep_registry.rs`) against a REAL spawned process
+    /// rather than a synthetic dead-PID fixture, closing the gap the issue's
+    /// Finding 1 flagged: every other insta-crash test in this file only ever
+    /// observes `exit_code = None` (no retained handle), so a real Some(0)
+    /// exit was never actually exercised before.
+    #[test]
+    fn reaper_real_clean_exit_does_not_count_as_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // A real, fast, clean-exit child (mirrors what a #4111 self-skip
+        // looks like on the wire: no checkpoint written, exits 0 quickly).
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn `true` fixture child");
+        let pid = child.id();
+        // Give the OS a moment to actually finish the process before we poll.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let sweep_id = "sweep-issue-4111-clean-exit".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(41_110),
+                pid,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(41_110),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        // Retain the handle (mirrors `dispatch()`'s `self.children.insert`) so
+        // `poll_liveness` uses the real exit code instead of the no-handle
+        // `kill(pid, 0)` fallback that always yields `exit_code = None`.
+        registry.children.insert(sweep_id.clone(), child);
+
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(41_110),
+            0,
+            "a real, handle-observed clean (exit 0) death must not count toward quarantine"
+        );
+        assert!(
+            !registry.is_quarantined(41_110),
+            "a single clean exit must never quarantine the issue"
+        );
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(
+            matches!(info.state, SweepState::Exited { code: Some(0), .. }),
+            "expected an Exited{{code: Some(0)}} terminal state; got: {:?}",
+            info.state
         );
     }
 
@@ -4413,11 +5266,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0"),
             "expected print-mode bg-wait ceiling disabled (=0); got: {recorded}"
@@ -4516,13 +5365,9 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
+            recorded.contains("argv: -p /loom:sweep 43 --claim-owned 43 --model claude-sonnet-4-6"),
             "expected --model in argv; got: {recorded}"
         );
         // #3482 (Phase 3a): the dispatch model is carried on the registry
@@ -4548,11 +5393,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--model"),
             "empty model must not emit --model; got: {recorded}"
@@ -4655,6 +5496,37 @@ exit 0
         assert_eq!(model, DEFAULT_DISPATCH_MODEL);
     }
 
+    // --- config_resolver migration (#4058) — tier precedence -------------- //
+
+    fn write_project_model_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_autonomous_model_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_project_model_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let model = read_autonomous_model(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(model, Some("opus".to_string()));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_autonomous_model_project_tier_overrides_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "sonnet"}}"#);
+        write_project_model_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let model = read_autonomous_model(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(model, Some("opus".to_string()));
+    }
+
     // --- Issue #3982: logical-tier → concrete-ID resolution --------------- //
 
     /// The shipped default map pins the stale `opus` alias to gen-5 while leaving
@@ -4701,6 +5573,49 @@ exit 0
         let dir3 = tempdir().unwrap();
         write_config(dir3.path(), "{ not json");
         assert_eq!(resolve_model_alias(dir3.path(), "opus"), "claude-opus-5");
+
+        // #4059 Finding 1: the overlay direction is config-WINS / default-LOSES.
+        // A config that overrides an UNRELATED alias must NOT disturb `opus`,
+        // which still falls back to the shipped `DEFAULT_TIER_ALIASES` default.
+        let dir4 = tempdir().unwrap();
+        write_config(dir4.path(), r#"{"sweep": {"modelAliases": {"sonnet": "claude-sonnet-9"}}}"#);
+        assert_eq!(resolve_model_alias(dir4.path(), "opus"), "claude-opus-5"); // default wins (no override)
+        assert_eq!(resolve_model_alias(dir4.path(), "sonnet"), "claude-sonnet-9");
+        // config wins
+    }
+
+    /// #4059: `sweep.modelAliases` split across the legacy and project tiers is
+    /// MERGED by `config_resolver::deep_merge` (object-merge, not replace). Keys
+    /// union across tiers, and the higher-precedence tier wins on a shared key.
+    /// The private/shared defaults tier is disabled for hermeticity.
+    #[test]
+    #[serial_test::serial]
+    fn read_model_aliases_merges_across_tiers() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        // Legacy tier supplies `opus` and `sonnet`.
+        write_config(
+            dir.path(),
+            r#"{"sweep": {"modelAliases": {"opus": "legacy-opus", "sonnet": "legacy-sonnet"}}}"#,
+        );
+        // Project tier adds `fable` and overrides `sonnet`.
+        let project_dir = dir.path().join(".loom-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"sweep": {"modelAliases": {"sonnet": "project-sonnet", "fable": "project-fable"}}}"#,
+        )
+        .unwrap();
+
+        let aliases = read_model_aliases(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        // Union of keys across both tiers.
+        assert_eq!(aliases.get("opus").map(String::as_str), Some("legacy-opus")); // only in legacy
+        assert_eq!(aliases.get("fable").map(String::as_str), Some("project-fable")); // only in project
+                                                                                     // Higher-precedence (project) tier wins on the shared `sonnet` key.
+        assert_eq!(aliases.get("sonnet").map(String::as_str), Some("project-sonnet"));
+        assert_eq!(aliases.len(), 3);
     }
 
     /// Ladder monotonicity: no rung of the shipped escalation ladder resolves to
@@ -4767,13 +5682,9 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
+            recorded.contains("argv: -p /loom:sweep 45 --claim-owned 45 --effort xhigh"),
             "expected --effort in argv; got: {recorded}"
         );
         // The dispatch effort is carried on the registry entry so
@@ -4798,13 +5709,11 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
+            recorded.contains(
+                "argv: -p /loom:sweep 46 --claim-owned 46 --model claude-sonnet-4-6 --effort xhigh"
+            ),
             "expected --model then --effort in argv; got: {recorded}"
         );
         let entry = registry.get(&outcome.sweep_id).unwrap();
@@ -4825,11 +5734,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--effort"),
             "empty effort must not emit --effort; got: {recorded}"
@@ -4857,13 +5762,9 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
-        assert!(
-            recorded.contains("argv: -p /loom:sweep 50 --depends-on 49"),
+            recorded.contains("argv: -p /loom:sweep 50 --claim-owned 50 --depends-on 49"),
             "expected --depends-on in argv; got: {recorded}"
         );
         assert_eq!(
@@ -4886,11 +5787,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--depends-on"),
             "depends_on=None must not emit --depends-on; got: {recorded}"
@@ -5038,11 +5935,7 @@ exit 0
         std::env::remove_var("LOOM_TRANSCRIPT_ARCHIVE");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("LOOM_MODEL_EXPERIMENT=canary"),
             "expected LOOM_MODEL_EXPERIMENT forwarded to child; got: {recorded}"
@@ -5084,11 +5977,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         // The fixture prints `<VAR>=unset` when the child sees the var unset.
         assert!(
             recorded.contains("LOOM_MODEL_EXPERIMENT=unset"),
@@ -5371,6 +6260,19 @@ exit 0
     /// `started_at` at `now` (so the reaper classifies its death as within the
     /// insta-crash window). Returns the synthetic sweep_id.
     fn insert_dead_running(registry: &mut SweepRegistry, issue: u32, seq: u32) -> String {
+        insert_dead_running_at(registry, issue, seq, Utc::now())
+    }
+
+    /// Like [`insert_dead_running`] but with an explicit `started_at`, so a test
+    /// can position the run's start relative to a checkpoint's mtime (#4009): a
+    /// checkpoint written *after* `started_at` is progress by this run, one
+    /// written *before* it is a stale artifact of an earlier dispatch.
+    fn insert_dead_running_at(
+        registry: &mut SweepRegistry,
+        issue: u32,
+        seq: u32,
+        started_at: DateTime<Utc>,
+    ) -> String {
         let sweep_id = format!("sweep-issue-{issue}-{seq}");
         registry.entries.insert(
             sweep_id.clone(),
@@ -5381,7 +6283,7 @@ exit 0
                 token_name: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
-                started_at: Utc::now(),
+                started_at,
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
@@ -5478,9 +6380,156 @@ exit 0
         assert_eq!(registry.quarantined_issues_sorted(), vec![42]);
     }
 
-    /// AC #1: a death WITH a checkpoint (real work happened) is NOT an
-    /// insta-crash — it is the mid-build-death watchdog's remit (#3895) — so it
-    /// never counts toward quarantine.
+    // ------------------------------------------------------------------------
+    // Account-exhaustion attribution at insta-crash time (Issue #4122)
+    // ------------------------------------------------------------------------
+
+    /// Seed a per-repo token pool under `workspace/.loom/tokens` so
+    /// `bad_tokens::{mark_bad,is_bad}` resolve to this test's tempdir rather
+    /// than the host's real shared pool (`resolve_tokens_dir` only selects the
+    /// per-repo pool when it holds at least one `*.token` file).
+    fn seed_token_pool(workspace: &Path, token: &str) {
+        let dir = workspace.join(".loom").join("tokens");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{token}.token")), "sk-ant-oat01-fake").unwrap();
+    }
+
+    /// Insert a dead `Running` entry for `issue` whose captured spawn account is
+    /// `token` and whose log contains `log_body`. Returns the sweep_id.
+    fn insert_dead_running_with_log(
+        registry: &mut SweepRegistry,
+        issue: u32,
+        seq: u32,
+        token: &str,
+        log_body: &str,
+    ) -> String {
+        let sweep_id = insert_dead_running(registry, issue, seq);
+        let log_path = {
+            let info = registry.entries.get_mut(&sweep_id).unwrap();
+            info.token_name = token.to_string();
+            info.log_path.clone()
+        };
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, log_body).unwrap();
+        sweep_id
+    }
+
+    /// The signature classifier matches the wrapper's exhaustion banners /
+    /// sentinel and ignores unrelated crash text (#4122).
+    #[test]
+    fn classify_account_exhaustion_matches_signatures() {
+        assert_eq!(
+            classify_account_exhaustion("Claude: hit your weekly limit — try again later"),
+            Some("weekly-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("you are out of extra usage this month"),
+            Some("weekly-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("monitor emitted RATE_LIMIT_ABORT and exited"),
+            Some("rate-limit-abort")
+        );
+        assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
+        assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// AC #1: an exhaustion insta-crash marks the account bad and does NOT
+    /// charge the issue's quarantine tally — three in a row never quarantine.
+    #[test]
+    fn reaper_exhaustion_insta_crash_marks_account_not_issue() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                55,
+                seq,
+                "agent-3",
+                "loom-daemon dispatch: start\nClaude: hit your weekly limit\n",
+            );
+            registry.reap_once();
+        }
+
+        // AC: not quarantined (the death was the account's fault), tally
+        // untouched.
+        assert!(
+            !registry.is_quarantined(55),
+            "exhaustion insta-crashes must not move the issue to loom:blocked (#4122)"
+        );
+        assert_eq!(registry.insta_crash_count(55), 0);
+        // AC: the spawn account is marked bad so selection rotates past it.
+        assert!(bad_tokens::is_bad(dir.path(), "agent-3"), "account marked bad on exhaustion");
+    }
+
+    /// AC #2: an insta-crash whose log does NOT match the exhaustion signature
+    /// retains today's behavior — charged to the issue, account untouched.
+    #[test]
+    fn reaper_non_exhaustion_insta_crash_charges_issue() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                56,
+                seq,
+                "agent-3",
+                "loom-daemon dispatch: start\nsome unrelated crash: boom\n",
+            );
+            registry.reap_once();
+        }
+
+        // AC: charged to the issue exactly as before #4122.
+        assert!(
+            registry.is_quarantined(56),
+            "non-exhaustion insta-crashes still quarantine the issue"
+        );
+        // AC: the account is NOT marked bad for a non-exhaustion crash.
+        assert!(!bad_tokens::is_bad(dir.path(), "agent-3"));
+    }
+
+    /// A single exhaustion insta-crash leaves an existing (real) tally
+    /// untouched — exhaustion is neutral for the issue's consecutive streak,
+    /// neither incrementing nor resetting it (#4122).
+    #[test]
+    fn exhaustion_insta_crash_is_neutral_for_existing_tally() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        // Two genuine insta-crashes accrue a tally of 2.
+        registry.record_terminal_outcome(57, true);
+        registry.record_terminal_outcome(57, true);
+        assert_eq!(registry.insta_crash_count(57), 2);
+
+        // An exhaustion insta-crash must not touch the tally.
+        insert_dead_running_with_log(
+            &mut registry,
+            57,
+            9,
+            "agent-3",
+            "Claude: hit your weekly limit\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(57),
+            2,
+            "exhaustion neither increments nor resets the issue's tally"
+        );
+        assert!(!registry.is_quarantined(57));
+        assert!(bad_tokens::is_bad(dir.path(), "agent-3"));
+    }
+
+    /// AC #1 + #3 (#4009): a death whose checkpoint was written BY THIS run
+    /// (mtime at/after `started_at`) is real mid-build progress — the
+    /// mid-build-death watchdog's remit (#3895) — so it never counts toward
+    /// quarantine. Each run starts in the past and (re)writes its checkpoint
+    /// during the run, so the checkpoint post-dates `started_at`.
     #[test]
     fn reaper_checkpoint_death_does_not_count_as_insta_crash() {
         let dir = tempdir().unwrap();
@@ -5488,14 +6537,63 @@ exit 0
 
         let cp_dir = registry.config.checkpoint_dir();
         std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("issue-43.json"), r#"{"phase":"builder","issue":43}"#).unwrap();
 
         for seq in 0..5 {
-            insert_dead_running(&mut registry, 43, seq);
+            // Run started 5s ago; it reaches real work and writes its checkpoint
+            // now, so the checkpoint mtime post-dates `started_at`.
+            insert_dead_running_at(
+                &mut registry,
+                43,
+                seq,
+                Utc::now() - chrono::Duration::seconds(5),
+            );
+            std::fs::write(cp_dir.join("issue-43.json"), r#"{"phase":"builder","issue":43}"#)
+                .unwrap();
             registry.reap_once();
         }
-        assert_eq!(registry.insta_crash_count(43), 0, "checkpoint deaths never count");
+        assert_eq!(registry.insta_crash_count(43), 0, "mid-build (this-run) deaths never count");
         assert!(!registry.is_quarantined(43), "a mid-build death is not quarantined");
+    }
+
+    /// AC #4 (#4009): a STALE checkpoint — one left on disk by an earlier
+    /// dispatch, its mtime predating this run's `started_at` — must NOT exempt an
+    /// issue from the insta-crash quarantine. Three consecutive pre-work deaths
+    /// inside the insta-crash window drive the issue into quarantine even though
+    /// `issue-<N>.json` exists on disk the whole time. This is the exact
+    /// infinite-re-dispatch-loop regression #4009 reported (issue #4009 itself
+    /// crash-looped 3x while a stale checkpoint from an earlier run persisted).
+    #[test]
+    fn reaper_stale_checkpoint_death_counts_as_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        // A checkpoint written by a PRIOR dispatch, before any run below starts.
+        std::fs::write(cp_dir.join("issue-45.json"), r#"{"phase":"builder","issue":45}"#).unwrap();
+        let stale_written_at = std::fs::metadata(cp_dir.join("issue-45.json"))
+            .and_then(|m| m.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap();
+
+        // Each run starts AFTER the stale checkpoint was written (so the file is
+        // stale relative to it) and dies pre-work inside the insta-crash window.
+        for seq in 0..3 {
+            let started_at = stale_written_at + chrono::Duration::seconds(5);
+            insert_dead_running_at(&mut registry, 45, seq, started_at);
+            registry.reap_once();
+        }
+        assert_eq!(
+            registry.insta_crash_count(45),
+            3,
+            "stale-checkpoint pre-work deaths count toward quarantine"
+        );
+        assert!(
+            registry.is_quarantined(45),
+            "issue quarantines at threshold despite a stale checkpoint on disk"
+        );
+        assert!(registry.quarantined_issues().contains(&45));
     }
 
     /// AC #4: a quarantine entry auto-releases once it ages past the TTL, and the
@@ -5622,6 +6720,349 @@ exit 0
         );
     }
 
+    // ------------------------------------------------------------------------
+    // Durable quarantine release (Issue #4110)
+    // ------------------------------------------------------------------------
+
+    /// TTL-driven release now performs the *real* `gh` label-flip argv.
+    /// Previously the quarantine test suite only ever exercised
+    /// `expire_quarantine` via `fixture_registry`, which sets
+    /// `skip_label_flip = true` — so no test asserted what argv the release
+    /// path actually sends to `gh`. Also confirms a subsequent tick with
+    /// nothing pending makes no further `gh` calls at all (idempotence: a
+    /// released issue is not repeatedly re-flipped).
+    #[test]
+    fn quarantine_expiry_flips_real_forge_label_via_argv() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real release path
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+        registry
+            .quarantined
+            .insert(60, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(60, 3);
+
+        registry.reap_once();
+
+        assert!(!registry.is_quarantined(60));
+        assert!(
+            registry.pending_quarantine_release_issues().is_empty(),
+            "a successful flip leaves nothing pending"
+        );
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 60 --remove-label loom:blocked --add-label loom:issue"),
+            "expected TTL expiry to send the real label-flip argv; got: {gh_calls:?}"
+        );
+
+        // A later tick with nothing quarantined/pending must not re-invoke gh.
+        registry.reap_once();
+        let gh_calls_after = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert_eq!(gh_calls, gh_calls_after, "no further gh calls once nothing is pending");
+    }
+
+    /// A `gh` failure during release must NOT permanently strand the issue:
+    /// the entry is retained in the pending-release set and retried until it
+    /// succeeds (Issue #4110). Previously `expire_quarantine` dropped the
+    /// in-memory entry unconditionally and `release_quarantine_label`
+    /// swallowed any failure at `debug`, so a single transient `gh` hiccup
+    /// permanently stranded `loom:blocked` with nothing left in memory to
+    /// retry it — reproducing the exact reported end state (`quarantine
+    /// clear` -> "was not quarantined", forge still `loom:blocked`).
+    ///
+    /// The fake `gh` fails its first two invocations (a counter file tracks
+    /// remaining failures) — enough to survive both the `expire_quarantine`
+    /// attempt AND the same-tick `retry_pending_quarantine_releases` pass —
+    /// so the first `reap_once` tick genuinely ends with the issue still
+    /// pending, and only the second tick's retry succeeds.
+    #[test]
+    fn quarantine_release_retries_after_gh_failure_then_succeeds() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fail_counter = dir.path().join("fails-remaining");
+        std::fs::write(&fail_counter, "2").unwrap();
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\ncount=$(cat \"{counter}\" \
+             2>/dev/null || echo 0)\nif [ \"$count\" -gt 0 ]; then\n  echo $((count - 1)) > \
+             \"{counter}\"\n  exit 1\nfi\nexit 0\n",
+            log = gh_log.display(),
+            counter = fail_counter.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+        registry
+            .quarantined
+            .insert(61, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(61, 3);
+
+        // First tick: both the `expire_quarantine` attempt and the same-tick
+        // `retry_pending_quarantine_releases` pass hit the fake gh's two
+        // scripted failures. The in-memory quarantine is still gone
+        // (`expire_quarantine` drops it before attempting the release), but
+        // the issue must NOT be silently stranded — it lands in the
+        // pending-retry set instead.
+        registry.reap_once();
+        assert!(
+            !registry.is_quarantined(61),
+            "quarantine memory clears regardless of flip outcome"
+        );
+        assert!(
+            registry.pending_quarantine_release_issues().contains(&61),
+            "a failed release must be retried, not dropped"
+        );
+
+        // Second tick: the fake gh's failure budget is exhausted, so the
+        // retry succeeds and clears the pending entry.
+        registry.reap_once();
+        assert!(
+            registry.pending_quarantine_release_issues().is_empty(),
+            "a successful retry clears the pending-release record"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert_eq!(
+            gh_calls
+                .matches("issue edit 61 --remove-label loom:blocked --add-label loom:issue")
+                .count(),
+            3,
+            "expected three attempts: two scripted failures then the successful retry; got: \
+             {gh_calls:?}"
+        );
+    }
+
+    /// Eviction (Issue #4110): a workspace's live quarantines are released
+    /// before the pool drops the registry, instead of silently vanishing with
+    /// the reaper that would otherwise have retried them.
+    #[test]
+    fn flush_quarantines_for_eviction_releases_and_clears_state() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.quarantined.insert(62, Utc::now());
+        registry.insta_crash_counts.insert(62, 3);
+
+        let flushed = registry.flush_quarantines_for_eviction();
+        assert_eq!(flushed, 1);
+        assert!(!registry.is_quarantined(62));
+        assert_eq!(registry.insta_crash_count(62), 0);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 62 --remove-label loom:blocked --add-label loom:issue"),
+            "expected eviction to flush the real label-flip argv; got: {gh_calls:?}"
+        );
+    }
+
+    // ====================================================================
+    // Cross-host collision detection (Issue #4085, Phase 0 of #4028)
+    // ====================================================================
+
+    /// Install a fake `gh` that logs its argv to `gh_log`, emits `stdout` on
+    /// stdout, and exits with `exit_code`. Returns the fake binary path. Reuses
+    /// the established bash-stub pattern (the `--json labels` payload is the one
+    /// addition the collision tests need over the flip/restore stubs).
+    fn install_fake_gh(dir: &Path, gh_log: &Path, stdout: &str, exit_code: i32) -> PathBuf {
+        let fake_gh = dir.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\nprintf '%s' '{out}'\nexit {code}\n",
+            log = gh_log.display(),
+            out = stdout.replace('\'', "'\\''"),
+            code = exit_code,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+        fake_gh
+    }
+
+    fn collision_registry(
+        dir: &Path,
+        gh_log: &Path,
+        stdout: &str,
+        exit_code: i32,
+    ) -> SweepRegistry {
+        let fake_gh = install_fake_gh(dir, gh_log, stdout, exit_code);
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        SweepRegistry::new(config)
+    }
+
+    /// A pre-flip read showing `loom:building` already present is a collision.
+    #[test]
+    fn classify_preflip_labels_flags_prior_building_claim() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:building"},{"name":"loom:curated"}]}"#,
+            0,
+        );
+        match registry.classify_preflip_labels(42) {
+            CollisionClass::Collision { labels } => {
+                assert!(labels.iter().any(|l| l == "loom:building"));
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        }
+    }
+
+    /// A pre-flip read with `loom:issue` already gone is a collision even if
+    /// `loom:building` is not (yet) visible.
+    #[test]
+    fn classify_preflip_labels_flags_missing_issue_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"tier:goal-supporting"}]}"#,
+            0,
+        );
+        assert!(matches!(registry.classify_preflip_labels(42), CollisionClass::Collision { .. }));
+    }
+
+    /// `loom:issue` still present and `loom:building` absent ⇒ this host is the
+    /// first claimant: Clean, not a collision.
+    #[test]
+    fn classify_preflip_labels_clean_when_issue_label_present() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}"#,
+            0,
+        );
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Clean);
+    }
+
+    /// Fail-closed: a non-zero `gh` exit is `Unknown`, never a collision — an
+    /// unverifiable read must not inflate the baseline.
+    #[test]
+    fn classify_preflip_labels_fail_closed_on_gh_error() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(dir.path(), &gh_log, "", 1);
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
+    }
+
+    /// Fail-closed: unparseable stdout (exit 0 but not the expected JSON) is
+    /// `Unknown`, never a collision.
+    #[test]
+    fn classify_preflip_labels_fail_closed_on_unparseable() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(dir.path(), &gh_log, "not json at all", 0);
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
+    }
+
+    /// With detection enabled, a collision increments the counter once per call;
+    /// an Unknown/Clean read does not.
+    #[test]
+    fn detect_and_record_collision_increments_counter() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        registry.set_collision_detection(true);
+        assert_eq!(registry.collision_count(), 0);
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 1);
+        registry.detect_and_record_collision(43);
+        assert_eq!(registry.collision_count(), 2);
+    }
+
+    /// With detection DISABLED, `detect_and_record_collision` is a pure no-op:
+    /// no `gh` call at all (the disabled dispatch path is byte-for-byte
+    /// unchanged) and the counter stays zero.
+    #[test]
+    fn detect_and_record_collision_disabled_is_noop() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        // detection left at its default (false)
+        assert!(!registry.collision_detection_enabled());
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 0);
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "disabled detection must not invoke gh at all; got: {gh_calls:?}"
+        );
+    }
+
+    /// A fail-closed Unknown read never increments the counter even with
+    /// detection enabled.
+    #[test]
+    fn detect_and_record_collision_unknown_not_counted() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry = collision_registry(dir.path(), &gh_log, "", 1);
+        registry.set_collision_detection(true);
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 0, "Unknown must not count");
+    }
+
+    /// Config resolution honors precedence env > config > default(off) (#4085).
+    #[test]
+    #[serial]
+    fn resolve_collision_detection_env_overrides() {
+        std::env::remove_var(COLLISION_DETECT_ENV);
+        let dir = tempdir().unwrap();
+        // No file, no env → default off.
+        assert!(!resolve_collision_detection(dir.path()));
+
+        // Config file enables it.
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"collisionDetection":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(resolve_collision_detection(dir.path()), "config enables");
+
+        // Env overrides config (off wins over config-on).
+        std::env::set_var(COLLISION_DETECT_ENV, "off");
+        assert!(!resolve_collision_detection(dir.path()), "env off overrides config on");
+        std::env::set_var(COLLISION_DETECT_ENV, "1");
+        assert!(resolve_collision_detection(dir.path()), "env on");
+        std::env::remove_var(COLLISION_DETECT_ENV);
+    }
+
     /// Config resolution honors precedence env > config > default (#3939).
     #[test]
     #[serial]
@@ -5691,6 +7132,34 @@ exit 0
         std::fs::write(loom.join("config.json"), r#"{"autonomous":{"workFinder":{}}}"#).unwrap();
         let file = read_quarantine_file_config(dir.path());
         assert_eq!(file, QuarantineFileConfig::default());
+    }
+
+    /// config_resolver migration (#4058): a value set only at the project
+    /// tier is honored identically to the legacy file.
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_quarantine_file_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let project = dir.path().join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45}}}}"#,
+        )
+        .unwrap();
+
+        let file = read_quarantine_file_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            file,
+            QuarantineFileConfig {
+                enabled: Some(true),
+                threshold: Some(4),
+                ttl_secs: Some(900),
+                insta_crash_secs: Some(45),
+            }
+        );
     }
 
     /// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits
@@ -6259,12 +7728,7 @@ exit 0
         assert!(outcome.was_new);
 
         let needle = format!("CLAUDE_CODE_OAUTH_TOKEN={token_value}");
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn did not record OAuth token within 10s; got: {}",
-            std::fs::read_to_string(&record_log).unwrap_or_default()
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains(".loom/tokens/agent-1.token"),
             "expected TOKEN_SOURCE to point at .loom/tokens/; got: {recorded}"
@@ -6967,7 +8431,8 @@ exit 0\n";
         let leader_pid = outcome.pid;
         let sweep_id = outcome.sweep_id.clone();
 
-        let gc_pid = read_pid_file(&gc_pidfile, 5000).expect("grandchild pid should be recorded");
+        let gc_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+            .expect("grandchild pid should be recorded");
         assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
         assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
         assert_ne!(leader_pid, gc_pid);
@@ -6982,9 +8447,12 @@ exit 0\n";
         // The ENTIRE tree must be gone. The grandchild assertion is the crux:
         // it proves the signal reached the whole process group (#3800), not
         // just the tracked leader PID.
-        assert!(wait_until_dead(leader_pid, 3000), "leader still alive after cancel");
         assert!(
-            wait_until_dead(gc_pid, 3000),
+            wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS),
+            "leader still alive after cancel"
+        );
+        assert!(
+            wait_until_dead(gc_pid, FIXTURE_CHILD_WAIT_MS),
             "grandchild survived cancel — group-kill did not reach it (single-PID regression)"
         );
 
@@ -7013,7 +8481,7 @@ exit 0\n";
         let sweep_id = outcome.sweep_id.clone();
 
         // Let the child start.
-        assert!(wait_until_alive(pid, 3000), "child should have started");
+        assert!(wait_until_alive(pid, FIXTURE_CHILD_WAIT_MS), "child should have started");
         assert!(matches!(registry.get(&sweep_id).unwrap().state, SweepState::Running));
 
         // Kill out of band: SIGKILL the leader PID directly (mimics an
@@ -7043,7 +8511,7 @@ exit 0\n";
         // No zombie: because try_wait() reaped the child, kill(pid, 0) now
         // fails (the PID is no longer in the process table).
         assert!(
-            wait_until_dead(pid, 2000),
+            wait_until_dead(pid, FIXTURE_CHILD_WAIT_MS),
             "killed child left a <defunct> zombie — reaper did not wait() it"
         );
     }
@@ -7069,10 +8537,25 @@ exit 0\n";
             .expect("dispatch should succeed");
         let sweep_id = outcome.sweep_id.clone();
 
-        // Reap-on-read reconciles liveness via the retained handle's
-        // `try_wait()`. Bound the loop to ~2s to prove "prompt" — a healthy
-        // implementation transitions on the first reconcile once the child has
-        // exited (`try_wait` reaps the zombie and yields the exit status).
+        // Phase 1 (#4044): wait generously for the fixture child to actually
+        // exit. Under host exec-latency pressure (syspolicyd, AV scanners),
+        // launching the child and running it to `exit 0` can itself take far
+        // longer than the promptness bound below — that latency is a host
+        // condition, not the property under test, so it gets the same
+        // generous ceiling as every other fixture-child wait.
+        assert!(
+            wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+            "fixture child did not exit within the wait budget"
+        );
+
+        // Phase 2: reap-on-read reconciles liveness via the retained handle's
+        // `try_wait()`. Bound THIS loop to ~2s to prove "prompt" — a healthy
+        // implementation transitions on the first reconcile once the child is
+        // confirmed dead (`try_wait` reaps the zombie and yields the exit
+        // status). Because Phase 1 already confirmed death, this bound now
+        // measures reap promptness from confirmed death, not from dispatch —
+        // it can no longer be falsely reddened by the child's own launch
+        // latency.
         let mut still_running = true;
         for _ in 0..80 {
             registry.reap_liveness();
@@ -7158,6 +8641,10 @@ exit 0\n";
         let workspace = dir.path();
         let scripts_dir = workspace.join(".loom").join("scripts");
         std::fs::create_dir_all(&scripts_dir).unwrap();
+        // This test runs with `skip_label_flip = false`, so it exercises the
+        // real #4027 workspace-commands guard too — install the marker so
+        // dispatch proceeds to the gh-wedge scenario under test.
+        touch_sweep_command(workspace);
 
         // A fake `gh` that hangs far longer than the reap timeout, simulating
         // the wedged gh/XPC from the incident.
@@ -7191,8 +8678,14 @@ exit 0\n";
             .expect("dispatch should succeed");
         let sweep_id = outcome.sweep_id.clone();
 
-        // Ensure the child has actually exited before we reap-on-read.
-        assert!(wait_until_dead(outcome.pid, 5000), "fake spawn child should exit promptly");
+        // Ensure the child has actually exited before we reap-on-read. This
+        // gate is generous (#4044) — it is not part of the bounded-gh
+        // property under test below, which starts timing only after this
+        // point.
+        assert!(
+            wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+            "fake spawn child did not exit within the wait budget"
+        );
 
         // The read-path reap must return well under the ~15-minute hang. It
         // kills the wedged gh at the 1s bound; generous headroom covers poll
@@ -7748,7 +9241,10 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(4242), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000), "hung fixture child should start");
+        assert!(
+            wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS),
+            "hung fixture child should start"
+        );
         let first_id = out.sweep_id.clone();
 
         // 2. Healthy while inside the timeout window.
@@ -7797,7 +9293,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(4343), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000));
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         // Simulate progress: create a worktree for the issue.
         let wt = ws.join(".loom").join("worktrees").join("issue-4343");
@@ -7811,6 +9307,390 @@ exit 0\n";
 
         // Cleanup.
         let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    // --- progress latch (Issue #4088) ---
+
+    /// AC5 regression (the headline bug): a sweep that made progress (worktree
+    /// present), then had that worktree AND its checkpoint torn down at
+    /// completion while still `Running`, with `elapsed` far past the timeout,
+    /// must NOT be cancelled or re-dispatched. On `origin/main` the stateless
+    /// probe reads "no progress" after cleanup and re-dispatches against the
+    /// now-closed issue; the per-`SweepId` latch prevents that.
+    #[test]
+    fn watchdog_does_not_redispatch_completed_sweep_after_cleanup() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4078), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Progress appears (Builder created a worktree), and a tick observes +
+        // latches it.
+        let wt = ws.join(".loom").join("worktrees").join("issue-4078");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(
+            reg.watchdog_progressed.contains(&out.sweep_id),
+            "progress is latched for the sweep"
+        );
+
+        // Completion tears down every progress signal (merge-pr.sh removes the
+        // worktree; /loom:sweep deletes the checkpoint). The stateless probe now
+        // reads no-progress — the exact #4078 condition.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            !reg.sweep_made_progress(4078, &out.log_path),
+            "stateless probe reads no-progress after cleanup (the bug's precondition)"
+        );
+
+        // Even backdated far past the timeout, the latched sweep is left alone.
+        backdate(&mut reg, &out.sweep_id, 9999);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(10)),
+            0,
+            "a completed-then-cleaned-up sweep is never re-dispatched (AC5)"
+        );
+        assert!(
+            !reg.watchdog_retried.contains(&4078),
+            "no retry recorded for the completed sweep"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// AC2 on re-dispatch (the Finding 6 trap): the latch is keyed by `SweepId`,
+    /// not issue. A latch keyed by issue would make a *re-dispatched* sweep that
+    /// genuinely hangs read as "already progressed" and never be rescued —
+    /// silently defanging the watchdog for the very issues it already rescued
+    /// once. A prior sweep's latch (distinct `SweepId`) must not cover a new
+    /// hung sweep for the same issue.
+    #[test]
+    fn watchdog_latch_is_scoped_by_sweep_id_so_redispatch_is_still_rescued() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4060), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Simulate a PRIOR, now-gone sweep for the SAME issue having progressed:
+        // its distinct SweepId is latched. An issue-keyed latch would instead
+        // hold `4060` and wrongly cover the current sweep.
+        reg.watchdog_progressed
+            .insert("sweep-issue-4060-prior".to_string());
+        assert!(
+            !reg.watchdog_progressed.contains(&out.sweep_id),
+            "the current (hung) sweep is not itself latched"
+        );
+
+        // The current sweep never progressed; backdate it past the timeout.
+        backdate(&mut reg, &out.sweep_id, 600);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(60)),
+            1,
+            "a re-dispatched sweep that hangs at startup is still rescued (AC2)"
+        );
+        assert!(reg.watchdog_retried.contains(&4060));
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4060) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    /// The latch is monotonic (stays true across ticks once observed) AND scoped
+    /// to a single `SweepId` — a sibling sweep that never progressed is
+    /// unaffected and still eligible for rescue.
+    #[test]
+    fn watchdog_latch_is_monotonic_and_per_sweep() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let a = reg
+            .dispatch(&SweepKind::Issue(5001), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(a.pid, FIXTURE_CHILD_WAIT_MS));
+        let b = reg
+            .dispatch(&SweepKind::Issue(5002), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(b.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Only A makes progress.
+        let wt_a = ws.join(".loom").join("worktrees").join("issue-5001");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(reg.watchdog_progressed.contains(&a.sweep_id), "A latched");
+        assert!(
+            !reg.watchdog_progressed.contains(&b.sweep_id),
+            "B never progressed ⇒ not latched"
+        );
+
+        // Monotonic: remove A's worktree; a later tick keeps A latched.
+        std::fs::remove_dir_all(&wt_a).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(
+            reg.watchdog_progressed.contains(&a.sweep_id),
+            "A stays latched across ticks even with its worktree gone"
+        );
+
+        // B, never progressing and backdated, is still restarted — A's latch is
+        // scoped to A and does not cover its sibling.
+        backdate(&mut reg, &b.sweep_id, 600);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(60)),
+            1,
+            "the un-latched sibling is rescued"
+        );
+        assert!(reg.watchdog_retried.contains(&5002));
+        assert!(!reg.watchdog_retried.contains(&5001));
+
+        for issue in [5001u32, 5002u32] {
+            if let Some(id) = running_issue_sweep_id(&reg, issue) {
+                let _ = reg.cancel(&id, Duration::from_secs(2));
+            }
+        }
+    }
+
+    /// Latch pruning: entries for sweeps GC'd from `entries` are dropped from
+    /// the latch, so the per-`SweepId` set cannot grow unbounded across many
+    /// dispatches.
+    #[test]
+    fn watchdog_latch_pruned_on_entry_gc() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A terminal entry aged past the retention window, with its SweepId
+        // latched — exactly the state left behind by a completed sweep.
+        let sid = "sweep-issue-6001-done".to_string();
+        let old = Utc::now() - chrono::Duration::seconds(TERMINAL_RETENTION_SECS + 60);
+        reg.entries.insert(
+            sid.clone(),
+            SweepInfo {
+                sweep_id: sid.clone(),
+                kind: SweepKind::Issue(6001),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: ws.join(".loom/logs/sweep-issue-6001.log"),
+                idempotency_key: None,
+                started_at: old,
+                state: SweepState::Exited {
+                    code: Some(0),
+                    at: old,
+                },
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        reg.watchdog_progressed.insert(sid.clone());
+
+        // GC drops the terminal entry and must prune its latch entry with it.
+        reg.reap_once();
+        assert!(!reg.entries.contains_key(&sid), "terminal entry is GC'd");
+        assert!(
+            !reg.watchdog_progressed.contains(&sid),
+            "the latch entry is pruned alongside the GC'd sweep"
+        );
+    }
+
+    // --- closed-issue dispatch guard (Issue #4088, AC6) ---
+
+    /// Install a fake `gh` that reports a fixed `issue view` state and records
+    /// every invocation, returning `(registry, gh_log)`. `spawn-claude.sh` is a
+    /// benign echo-and-exit so a dispatch that passes the guard still spawns.
+    fn closed_guard_registry(
+        ws: &Path,
+        view_stdout: &str,
+        view_exit: i32,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '%s\\n' \"{state}\"\n\
+             exit {exit}\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            state = view_stdout,
+            exit = view_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        // This helper runs with `skip_label_flip = false`, so it also
+        // exercises the #4027 workspace-commands guard — install the marker
+        // so a dispatch that clears the closed-issue guard reaches spawn.
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real guard + flip path
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC6: `dispatch` for a closed issue is refused, and it must NOT flip any
+    /// labels (no `issue edit`) — a watchdog re-dispatch can never re-claim a
+    /// closed/merged issue.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_closed_issue_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4078), None, None, None, None)
+            .expect_err("a closed issue must be refused");
+        assert!(
+            err.to_string().contains("closed"),
+            "error explains the closed-issue guard; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("issue view 4078"), "the guard probed issue state");
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        // No lock was acquired and no entry recorded.
+        assert!(running_issue_sweep_id(&reg, 4078).is_none());
+    }
+
+    /// AC6 fail-open: a forge lookup error (non-zero `gh`) must NOT wedge
+    /// dispatch — the guard returns `None` and dispatch proceeds normally.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_issue_state_lookup_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        // `issue view` exits non-zero ⇒ state unknown ⇒ fail open.
+        let (mut reg, gh_log) = closed_guard_registry(ws, "", 1);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4079), None, None, None, None)
+            .expect("a gh outage must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("issue view 4079"), "the guard probed issue state");
+        assert!(
+            calls.contains("issue edit 4079"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4079) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    // --- workspace-commands dispatch guard (Issue #4027) ---
+
+    /// A workspace that "looks like" a repo (`.git`/`.loom` present, so
+    /// `looks_like_workspace()` in `workspace_registry.rs` would pass) but
+    /// was never `loom-daemon init`-ed — the reproduction from #4027 (a
+    /// second daemon host with a bare `git clone`). `dispatch` must refuse
+    /// BEFORE spending any forge call or token: no `gh` invocation at all
+    /// (not even the closed-issue probe), no spawned child, no registry
+    /// entry, and the error must name the `loom-daemon init` remediation.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_workspace_missing_sweep_command() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        // `closed_guard_registry` installs the marker by default (so its own
+        // AC6 tests reach the closed-issue guard under test there) — remove
+        // it here to simulate the #4027 wedge scenario.
+        std::fs::remove_file(
+            ws.join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("sweep.md"),
+        )
+        .unwrap();
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4222), None, None, None, None)
+            .expect_err("a workspace missing installed commands must be refused");
+        assert!(
+            err.to_string().contains("loom-daemon init"),
+            "error names the remediation; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("sweep.md"),
+            "error names the missing marker; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.is_empty(),
+            "no forge call whatsoever (no closed-issue probe, no label flip) on a \
+             workspace-commands-refused dispatch; got: {calls:?}"
+        );
+        assert!(
+            running_issue_sweep_id(&reg, 4222).is_none(),
+            "no registry entry recorded on a refused dispatch"
+        );
+    }
+
+    /// Regression guard: a workspace WITH the marker installed dispatches
+    /// exactly as before — the #4027 guard is a pure no-op for a properly
+    /// initialized workspace.
+    #[test]
+    #[serial]
+    fn dispatch_proceeds_when_sweep_command_present() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4223), None, None, None, None)
+            .expect("a properly initialized workspace must dispatch normally");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4223"),
+            "dispatch reached the label flip; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4223) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
     }
 
     // --- config resolution: env > config > default ---
@@ -7854,6 +9734,98 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":0}}"#);
         assert_eq!(read_startup_race_config(tmp.path()).dispatch_stagger_ms, Some(0));
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_cfg(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    fn write_local_cfg(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_project_cfg(
+            tmp.path(),
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90}}}"#,
+        );
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(3000));
+        assert_eq!(cfg.watchdog_enabled, Some(false));
+        assert_eq!(cfg.watchdog_timeout_secs, Some(90));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"timeoutSecs":90}}}"#,
+        );
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":750}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `dispatchStaggerMs` -> project tier wins.
+        assert_eq!(cfg.dispatch_stagger_ms, Some(750));
+        // Non-overlapping `watchdog.timeoutSecs` still supplied by legacy tier.
+        assert_eq!(cfg.watchdog_timeout_secs, Some(90));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":3000}}"#);
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":750}}"#);
+        write_local_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":10}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(10));
+    }
+
+    /// Regression (#4058): `dispatchStaggerMs: 0` set only at the project
+    /// tier must still be read as `Some(0)` ("disable stagger"), not dropped
+    /// to `None` like a zero `watchdog.timeoutSecs` would be.
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_dispatch_stagger_zero_is_meaningful() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":0}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(0));
+    }
+
+    /// Explicit `null` at the project tier clears a legacy-tier value —
+    /// documents the `deep_merge` "null clears" semantics (#4058) at this
+    /// migrated site.
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_explicit_null_in_project_tier_clears_legacy_value() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":3000}}"#);
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":null}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, None);
     }
 
     #[test]
@@ -7909,6 +9881,13 @@ exit 0\n";
     fn resolve_watchdog_timeout_and_interval_precedence() {
         std::env::remove_var(WATCHDOG_TIMEOUT_ENV);
         std::env::remove_var(WATCHDOG_INTERVAL_ENV);
+        // AC1 (#4088): the default no-progress window is 300s — clear of the
+        // observed 110–150s healthy dispatch→worktree distribution.
+        assert_eq!(DEFAULT_WATCHDOG_TIMEOUT_SECS, 300);
+        assert_eq!(
+            resolve_watchdog_timeout(&StartupRaceConfig::default()),
+            Duration::from_secs(300)
+        );
         assert_eq!(
             resolve_watchdog_timeout(&StartupRaceConfig::default()),
             Duration::from_secs(DEFAULT_WATCHDOG_TIMEOUT_SECS)
@@ -8050,7 +10029,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(5150), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000));
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         // No worktree/checkpoint yet ⇒ NOT past startup ⇒ the review-stall
         // watchdog leaves it entirely to the #3887 startup watchdog, even with a
@@ -8073,7 +10052,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(5252), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000), "fixture child should start");
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS), "fixture child should start");
         let wt = ws.join(".loom").join("worktrees").join("issue-5252");
         std::fs::create_dir_all(&wt).unwrap();
 

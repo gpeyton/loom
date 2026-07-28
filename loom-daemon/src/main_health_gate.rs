@@ -86,6 +86,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::workspace_registry::WorkspaceRegistry;
 
 // ============================================================================
@@ -171,6 +173,17 @@ pub struct MainHealthState {
     /// SHA-memoization + indeterminate-run backoff bookkeeping (#3984) — see
     /// [`GateMemo`].
     gate_memo: Mutex<GateMemo>,
+    /// Wall-clock time of the most recent **completed** (Green/Red) gate
+    /// verdict, or `None` before the first one this process (#4012). This is
+    /// the disambiguator between "pending" (gate enabled, no verdict yet —
+    /// the ambiguous pre-#4012 `(false, false)` reading) and "clear"
+    /// (verified green), plus the recency evidence a `clear` reading
+    /// otherwise lacks. Stamped only in [`apply_gate_outcome`]'s Green/Red
+    /// arms — deliberately **not** touched by the #3984 SHA-memo skip path
+    /// ([`run_gate_tick`]'s early return), since a skip proves nothing new
+    /// about `main` and stamping it there would let a stale "last verified"
+    /// silently refresh itself forever.
+    last_verdict_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 /// Bookkeeping for #3984: the SHA of the last **determinate** (Green/Red)
@@ -221,6 +234,7 @@ impl MainHealthState {
             unevaluated: AtomicBool::new(false),
             track: Mutex::new(UnevaluatedTrack::default()),
             gate_memo: Mutex::new(GateMemo::default()),
+            last_verdict_at: Mutex::new(None),
         }
     }
 
@@ -265,6 +279,27 @@ impl MainHealthState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (class, reason) = track.detail.as_ref()?;
         Some(format!("{class}: {}", truncate_chars(reason, MAX_STATUS_REASON_CHARS)))
+    }
+
+    /// Wall-clock time of the most recent completed (Green/Red) gate verdict,
+    /// or `None` if none has landed yet this process (#4012). See the field
+    /// doc on [`Self::last_verdict_at`].
+    #[must_use]
+    pub fn last_verdict_at(&self) -> Option<DateTime<Utc>> {
+        *self
+            .last_verdict_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record `at` as the time of a just-completed (Green/Red) gate verdict.
+    /// Called from [`apply_gate_outcome`] only — never from the SHA-memo skip
+    /// path, which does not represent a completed run.
+    fn record_verdict_at(&self, at: DateTime<Utc>) {
+        *self
+            .last_verdict_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
     }
 
     /// Record this tick's evaluated/unevaluated outcome and report whether the
@@ -471,6 +506,20 @@ impl WorkspaceHealthStates {
         map.get(root).and_then(|s| s.unevaluated_summary())
     }
 
+    /// Wall-clock time of `root`'s most recent completed gate verdict
+    /// (#4012), or `None` when it has never produced one this process (or the
+    /// root has never been seen — deliberately the same "pending" reading as
+    /// a registered-but-not-yet-evaluated root, per the field doc on
+    /// [`MainHealthState::last_verdict_at`]).
+    #[must_use]
+    pub fn last_verdict_at(&self, root: &Path) -> Option<DateTime<Utc>> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).and_then(|s| s.last_verdict_at())
+    }
+
     /// Directly set `root`'s halt flag (creating its state if absent). Primarily
     /// for tests / explicit control, and for the gate loop to clear a
     /// disabled/absent-`buildGate` repo to green.
@@ -524,31 +573,8 @@ pub struct BuildGateConfig {
 /// `buildGate` block (or `enabled: false`) gets zero behavior change.
 #[must_use]
 pub fn read_build_gate_config(repo_root: &Path) -> Option<BuildGateConfig> {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "main_health_gate: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return None;
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "main_health_gate: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return None;
-        }
-    };
-
-    let gate = config.get("buildGate")?;
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let gate = crate::config_resolver::get_path(&effective, "buildGate")?;
 
     // `enabled` must be explicitly true — absent or false ⇒ disabled.
     if !gate
@@ -670,8 +696,12 @@ impl std::fmt::Display for UnevaluatedClass {
 /// The result of one gate run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
-    /// `buildGate.command` exited 0 — `main` is healthy.
-    Green,
+    /// `buildGate.command` exited 0 — `main` is healthy. `elapsed` is the
+    /// wall-clock time the gate command ran (Issue #4083) — surfaced on the
+    /// green INFO line so operators can distinguish "green with headroom" from
+    /// "green at the edge of the timeout budget" without having to wait for a
+    /// timeout to see the duration.
+    Green { elapsed: Duration },
     /// **VERIFIED_RED**: `buildGate.command` ran to completion and reported
     /// failure (a non-zero exit that is not one of the "could not run" codes —
     /// see [`UnevaluatedClass`]). `detail` is a human-readable reason + a tail
@@ -716,7 +746,7 @@ impl GateOutcome {
     /// True when the run was green.
     #[must_use]
     pub fn is_green(&self) -> bool {
-        matches!(self, Self::Green)
+        matches!(self, Self::Green { .. })
     }
 
     /// True when the run produced no verdict (did not run to completion).
@@ -746,7 +776,7 @@ impl GateOutcome {
     #[must_use]
     pub fn detail(&self) -> &str {
         match self {
-            Self::Green => "",
+            Self::Green { .. } => "",
             Self::Red { detail } => detail,
             Self::Unevaluated { reason, .. } => reason,
         }
@@ -775,6 +805,18 @@ pub trait GateRunner {
 /// halt, and only on positive contrary evidence — so this exists as an operator
 /// kill switch (`0`/`false`/`no`/`off`) for repos with no forge CI or no `gh`.
 pub const GATE_CI_CORROBORATION_ENV: &str = "LOOM_GATE_CI_CORROBORATION";
+
+/// Environment variable naming the forge workflow that must have concluded
+/// `success` for a commit before forge-CI corroboration will vouch for it
+/// (#3987). **Unset by default** — absent, corroboration keeps the #3986
+/// unanimity rule byte-for-byte. When set (env overrides
+/// `autonomous.mainHealthGate.ciWorkflow`), the named workflow must have a
+/// `completed`/`success` run for the evaluated SHA or the verdict degrades to
+/// [`CiVerdict::Unknown`]. This closes the residual gap where a repo whose real
+/// verification workflow is `paths`-filtered out of a commit — so it produces
+/// **no run at all** — could have a fast bookkeeping workflow (line counter,
+/// labeler) vouch for the commit on its own. See the module docs.
+pub const GATE_CI_WORKFLOW_ENV: &str = "LOOM_GATE_CI_WORKFLOW";
 
 /// How long to wait for the forge-CI probe before giving up (and keeping the
 /// local verdict). Deliberately short: this runs inside the gate tick, and an
@@ -824,7 +866,26 @@ pub trait ForgeCiStatus {
 /// executed in the repo root so `gh` resolves the repository from its git
 /// remote. Conclusions are matched on `headSha`, so a run for a *different*
 /// commit can never corroborate (or contradict) this one.
-pub struct GhForgeCi;
+///
+/// An optional `ci_workflow` name (#3987, resolved env > config > `None` in
+/// [`CommandGateRunner::new`]) is threaded into [`parse_gh_run_list`]: when set,
+/// that workflow must have concluded `success` for the SHA or the verdict
+/// degrades to [`CiVerdict::Unknown`]. Absent, behavior is unchanged.
+pub struct GhForgeCi {
+    /// The workflow name that must have concluded `success`, or `None` for the
+    /// unnamed (unanimity-only) behavior. See [`GATE_CI_WORKFLOW_ENV`].
+    ci_workflow: Option<String>,
+}
+
+impl GhForgeCi {
+    /// Construct a `gh`-backed forge-CI probe. Pass `None` for the unnamed
+    /// (unanimity-only) behavior, or a workflow name to additionally require
+    /// that workflow to have concluded `success` (#3987).
+    #[must_use]
+    pub fn new(ci_workflow: Option<String>) -> Self {
+        Self { ci_workflow }
+    }
+}
 
 impl ForgeCiStatus for GhForgeCi {
     fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
@@ -846,7 +907,7 @@ impl ForgeCiStatus for GhForgeCi {
                 return CiVerdict::Unknown;
             }
         };
-        parse_gh_run_list(&stdout, sha)
+        parse_gh_run_list(&stdout, sha, self.ci_workflow.as_deref())
     }
 }
 
@@ -879,7 +940,34 @@ impl ForgeCiStatus for GhForgeCi {
 ///
 /// Requiring every sibling run to have reached a definitive verdict handles both
 /// without hard-coding which workflow "counts" — see the PR discussion on #3974.
-fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
+///
+/// # Optional named verification workflow (#3987)
+///
+/// The unanimity rule above reasons only over *runs that exist*. A workflow that
+/// a `paths` / `paths-ignore` filter excluded from a commit produces **no run at
+/// all** — not a `skipped` run — so it is invisible to the reducer. In a repo
+/// where only a fast bookkeeping workflow (line counter, labeler) runs and
+/// succeeds for such a commit, every run is `completed`/`success` and the reducer
+/// returns `Success` for a commit the real build never judged.
+///
+/// When `ci_workflow` is `Some(name)` that gap is closed by layering **one extra
+/// requirement on top of** — never a relaxation of — the unanimity rule: the
+/// named workflow must itself have a `completed`/`success` run for `sha`.
+///
+/// | `ci_workflow` = `Some(name)`, runs for `sha` | Verdict |
+/// |---|---|
+/// | named workflow `completed`/`success`, unanimity otherwise satisfied | `Success` |
+/// | named workflow has **no run at all** | `Unknown` *(the gap closure)* |
+/// | named workflow `skipped` / `neutral` | `Unknown` (a required workflow that declined did not verify the commit) |
+/// | any run `failure` / `timed_out` / `startup_failure` | `Failure` (unchanged, still checked first) |
+///
+/// When `ci_workflow` is `None`, behavior is byte-for-byte the unanimity rule.
+/// A configured name that appears for **no** SHA anywhere in the probe window is
+/// almost certainly a typo (it would silently pin the gate to permanent
+/// `Unknown`), so it is surfaced with a `log::warn!` naming both the configured
+/// value and the workflow names actually observed — while still failing safe to
+/// `Unknown`.
+fn parse_gh_run_list(stdout: &str, sha: &str, ci_workflow: Option<&str>) -> CiVerdict {
     let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
         log::debug!("main_health_gate: could not parse `gh run list` output");
         return CiVerdict::Unknown;
@@ -887,12 +975,20 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
     let mut saw_success = false;
     // The first run that reached no verdict about the code, for diagnostics.
     let mut indeterminate: Option<String> = None;
-    for run in runs {
+    // #3987: whether the configured verification workflow itself reached
+    // `completed`/`success` for `sha` (only meaningful when `ci_workflow` is set).
+    let mut named_workflow_success = false;
+    // Every workflow name observed anywhere in the probe window (any SHA), for
+    // the misconfiguration warning below.
+    let mut observed_workflows: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for run in &runs {
         let field = |k: &str| run.get(k).and_then(serde_json::Value::as_str);
+        let workflow = field("workflowName").unwrap_or("<unnamed workflow>");
+        observed_workflows.insert(workflow.to_string());
         if field("headSha") != Some(sha) {
             continue;
         }
-        let workflow = field("workflowName").unwrap_or("<unnamed workflow>");
         let status = field("status").unwrap_or("<no status>");
         if status != "completed" {
             // CI has not judged this commit yet — not evidence in either
@@ -909,7 +1005,12 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
                 );
                 return CiVerdict::Failure;
             }
-            Some("success") => saw_success = true,
+            Some("success") => {
+                saw_success = true;
+                if ci_workflow == Some(workflow) {
+                    named_workflow_success = true;
+                }
+            }
             // Definitive "did not apply": a path/branch filter skipped the run,
             // or the workflow deliberately declined to judge. Neither vouches
             // for the commit nor leaves a verdict outstanding.
@@ -923,6 +1024,26 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
             }
         }
     }
+    // #3987 misconfiguration guardrail: a configured name matching no workflow
+    // anywhere in the window would otherwise silently pin the gate to permanent
+    // `Unknown` (recreating #3974 for that repo). Make the cause visible; still
+    // return the (fail-safe) computed verdict.
+    if let Some(name) = ci_workflow {
+        if !observed_workflows.iter().any(|w| w == name) {
+            log::warn!(
+                "main_health_gate: configured ci_workflow {name:?} (LOOM_GATE_CI_WORKFLOW / \
+                 autonomous.mainHealthGate.ciWorkflow) matched no workflow in the last {} runs on \
+                 {GATE_BRANCH} — observed: [{}]. Forge-CI corroboration will never vouch for a \
+                 commit; verify the name against `gh run list`.",
+                CI_PROBE_RUN_LIMIT,
+                observed_workflows
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     if let Some(reason) = indeterminate {
         log::debug!(
             "main_health_gate: forge CI verdict for {sha} is indeterminate ({reason}) — \
@@ -931,7 +1052,14 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
         return CiVerdict::Unknown;
     }
     if saw_success {
-        CiVerdict::Success
+        // #3987: with a verification workflow configured, that specific workflow
+        // must itself have concluded `success` — otherwise the commit was vouched
+        // for only by bookkeeping workflows (or the named one skipped/declined),
+        // which is not evidence the real build judged the commit.
+        match ci_workflow {
+            Some(_) if !named_workflow_success => CiVerdict::Unknown,
+            _ => CiVerdict::Success,
+        }
     } else {
         // No run for `sha` at all, or every run was skipped/neutral. Either way
         // nothing positively vouches for the commit.
@@ -943,7 +1071,11 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
 ///
 /// stdout goes to a temp file rather than a pipe for the same reason the gate
 /// command's does (no pipe-buffer deadlock while polling); stderr is discarded.
-fn run_capture_with_timeout(
+///
+/// `pub(crate)` (rather than private) so [`crate::credential_preflight`] can
+/// reuse the same bounded-subprocess helper for its `gh auth status` probe
+/// (#4005) instead of reimplementing timeout/kill handling.
+pub(crate) fn run_capture_with_timeout(
     program: &str,
     args: &[&str],
     cwd: &Path,
@@ -1043,11 +1175,15 @@ impl CommandGateRunner {
     /// to `origin/main` is **on** — the production default.
     #[must_use]
     pub fn new(config: BuildGateConfig, repo_root: PathBuf) -> Self {
+        // #3987: resolve the optional verification-workflow name (env > config >
+        // None) from the same repo root the gate runs against, so all existing
+        // call sites and the `run_gate_tick` signature stay untouched.
+        let ci_workflow = resolve_ci_workflow(&repo_root);
         Self {
             config,
             repo_root,
             sync: true,
-            ci: Box::new(GhForgeCi),
+            ci: Box::new(GhForgeCi::new(ci_workflow)),
         }
     }
 
@@ -1354,7 +1490,7 @@ pub fn run_gate_tick(
     let mut runner = CommandGateRunner::new(config.clone(), repo_root.to_path_buf());
     let outcome = runner.run_gate();
     match &outcome {
-        GateOutcome::Green | GateOutcome::Red { .. } => {
+        GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Prefer the cheaply-resolved SHA; fall back to the workspace's
             // post-sync HEAD (the runner itself resolves this internally for
             // forge-CI corroboration, but does not expose it — re-deriving it
@@ -1797,7 +1933,9 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
-                    break GateOutcome::Green;
+                    break GateOutcome::Green {
+                        elapsed: start.elapsed(),
+                    };
                 }
                 let tail = read_output_tail(&log_path);
                 break classify_failed_exit(command, &status, &tail);
@@ -1885,7 +2023,8 @@ pub enum HealthTransition {
 #[must_use]
 pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> HealthTransition {
     match outcome {
-        GateOutcome::Green => {
+        GateOutcome::Green { .. } => {
+            state.record_verdict_at(Utc::now());
             let was_halted = state.halted.swap(false, Ordering::SeqCst);
             if was_halted {
                 HealthTransition::Recovered
@@ -1894,6 +2033,7 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
             }
         }
         GateOutcome::Red { .. } => {
+            state.record_verdict_at(Utc::now());
             let was_halted = state.halted.swap(true, Ordering::SeqCst);
             if was_halted {
                 HealthTransition::RemainedHalted
@@ -1907,6 +2047,34 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
 
 /// How the current verdict reads in a log line, for an UNEVALUATED tick that
 /// left it untouched.
+/// Render a gate run's wall-clock duration for the green INFO line (#4083).
+///
+/// A whole-second `{}s` is the operator-facing unit the gate budget is
+/// expressed in, but a sub-second run would round to a misleading `0s` that
+/// reads as "the gate did not actually run". So anything under one second is
+/// rendered in milliseconds instead — a fast gate shows e.g. `320ms`, never
+/// `0s`.
+#[must_use]
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{}s", elapsed.as_secs())
+    }
+}
+
+/// Extract the elapsed run time from a green outcome, defaulting to zero for
+/// any other outcome (a `RemainedHealthy` transition only ever arrives paired
+/// with a [`GateOutcome::Green`], so the default is unreachable in practice —
+/// it exists purely so the renderers never panic on a mismatched pair).
+#[must_use]
+fn green_elapsed(outcome: &GateOutcome) -> Duration {
+    match outcome {
+        GateOutcome::Green { elapsed } => *elapsed,
+        _ => Duration::ZERO,
+    }
+}
+
 fn verdict_phrase(halted: bool) -> &'static str {
     if halted {
         "dispatch REMAINS HALTED from the previous verified-red run"
@@ -1963,7 +2131,14 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: b
             "main_health_gate: main GREEN again — RESUMING autonomous dispatch on the next work-finder tick"
         ),
         HealthTransition::RemainedHealthy => {
-            log::debug!("main_health_gate: main green — dispatch unaffected");
+            // Positive evidence, at the default level, that the gate ran and
+            // produced a green verdict this tick (#4083). Includes the elapsed
+            // run time so a green-with-headroom run is distinguishable from a
+            // green-at-the-edge-of-the-timeout-budget run.
+            log::info!(
+                "main_health_gate: main GREEN in {} — dispatch unaffected",
+                format_elapsed(green_elapsed(outcome))
+            );
         }
         // Loud, and explicit that this is NOT a statement about main (#3974).
         HealthTransition::Unevaluated => log::warn!(
@@ -1994,18 +2169,25 @@ pub fn enabled() -> bool {
 }
 
 /// The subset of `.loom/config.json → autonomous.mainHealthGate` this module
-/// consumes. Today it carries only the enablement flag; future tuning knobs
-/// (cadence, timeout) can be added here without touching the call site.
+/// consumes: the loop's on/off flag and the optional named forge verification
+/// workflow (#3987). Further tuning knobs (cadence, timeout) can still be added
+/// here without touching the call site.
 ///
 /// The gate's *behavior* (which command runs against `main`, its timeout) still
 /// comes from the separate `buildGate` block via [`read_build_gate_config`] —
-/// `autonomous.mainHealthGate` is purely the on/off (and future tuning) surface,
-/// so Phase C's already-tested `buildGate` semantics are untouched.
+/// `autonomous.mainHealthGate` is purely the on/off (plus forge-CI
+/// corroboration tuning) surface, so Phase C's already-tested `buildGate`
+/// semantics are untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutonomousGateConfig {
     /// `autonomous.mainHealthGate.enabled` — whether to run the gate loop.
     /// `None` when the key is absent (falls through to env / default).
     pub enabled: Option<bool>,
+    /// `autonomous.mainHealthGate.ciWorkflow` (#3987) — the forge workflow that
+    /// must have concluded `success` for a commit before forge-CI corroboration
+    /// will vouch for it. `None` when the key is absent, empty, or whitespace
+    /// (falls through to env / the unnamed unanimity-only behavior).
+    pub ci_workflow: Option<String>,
 }
 
 /// Read `.loom/config.json → autonomous.mainHealthGate`, soft-failing to an
@@ -2015,40 +2197,39 @@ pub struct AutonomousGateConfig {
 /// change (env-only enablement, exactly like Phase C shipped).
 #[must_use]
 pub fn read_autonomous_gate_config(repo_root: &Path) -> AutonomousGateConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "main_health_gate: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return AutonomousGateConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "main_health_gate: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return AutonomousGateConfig::default();
-        }
-    };
-
-    let Some(gate) = config
-        .get("autonomous")
-        .and_then(|a| a.get("mainHealthGate"))
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(gate) = crate::config_resolver::get_path(&effective, "autonomous.mainHealthGate")
     else {
         return AutonomousGateConfig::default();
     };
 
     AutonomousGateConfig {
         enabled: gate.get("enabled").and_then(serde_json::Value::as_bool),
+        // #3987: empty / whitespace-only ⇒ `None` (treated as unset).
+        ci_workflow: gate
+            .get("ciWorkflow")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
+}
+
+/// Resolve the optional forge verification-workflow name for `repo_root` with
+/// precedence **env > config > default(None)** (#3987), mirroring
+/// [`resolve_enabled`]. [`GATE_CI_WORKFLOW_ENV`] wins when set to a non-empty
+/// (trimmed) value; an empty/whitespace-only env value falls through to
+/// `autonomous.mainHealthGate.ciWorkflow`; absent both ⇒ `None`, which keeps the
+/// #3986 unanimity rule byte-for-byte.
+#[must_use]
+pub fn resolve_ci_workflow(repo_root: &Path) -> Option<String> {
+    if let Ok(v) = std::env::var(GATE_CI_WORKFLOW_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    read_autonomous_gate_config(repo_root).ci_workflow
 }
 
 /// Resolve whether the gate loop is enabled with precedence **env > config >
@@ -2065,6 +2246,21 @@ pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
         return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
     }
     config.enabled.unwrap_or(false)
+}
+
+/// Whether the gate is **effectively** enabled for `repo_root` (#4012): the
+/// [`resolve_enabled`] on/off switch **and** a usable `buildGate` block. A
+/// root can be nominally `autonomous.mainHealthGate.enabled: true` yet never
+/// actually gate anything because `.loom/config.json` has no `buildGate`
+/// block (or an empty command) — [`spawn_multi_main_health_gate_task`]
+/// already treats that as always-green (soft-fail, unchanged contract); this
+/// helper folds the same two checks into one so the `loom-daemon status`
+/// "disabled" reading (#4012 AC2) agrees with what the gate loop actually
+/// does, rather than reporting "enabled" for a root that will never run.
+#[must_use]
+pub fn effective_enabled(repo_root: &Path) -> bool {
+    resolve_enabled(&read_autonomous_gate_config(repo_root))
+        && read_build_gate_config(repo_root).is_some()
 }
 
 /// Resolve the gate cadence from [`MAIN_HEALTH_GATE_INTERVAL_ENV`], falling back
@@ -2167,7 +2363,13 @@ fn log_transition_for_root(
             "main_health_gate: {r} main GREEN again — RESUMING dispatch for this repo on the next work-finder tick"
         ),
         HealthTransition::RemainedHealthy => {
-            log::debug!("main_health_gate: {r} main green — dispatch unaffected");
+            // Positive evidence, at the default level, that this repo's gate ran
+            // and produced a green verdict this tick (#4083). Names the repo and
+            // includes the elapsed run time (see `log_transition` for rationale).
+            log::info!(
+                "main_health_gate: {r} main GREEN in {} — dispatch unaffected",
+                format_elapsed(green_elapsed(outcome))
+            );
         }
         HealthTransition::Unevaluated => log::warn!(
             "main_health_gate: {r} gate run UNEVALUATED [{}] — {} — this is a failure of the GATE, not evidence about main; {}",
@@ -2325,6 +2527,175 @@ mod tests {
         std::fs::write(loom_dir.join("config.json"), body).unwrap();
     }
 
+    fn write_project_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    // ===================================================================
+    // Capturing logger (#4083) — a tiny `log::Log` impl so the green-path
+    // severity can be asserted and cannot silently regress to `debug!`.
+    //
+    // The global logger can only be installed once per process and tests run
+    // in parallel, so records are routed into a *thread-local* buffer that is
+    // only collected while `capture_logs` is active on the calling thread.
+    // Any log emitted by a concurrent test lands in that other thread's
+    // (inactive) buffer and is dropped — so capture is race-free without
+    // serializing the whole suite.
+    // ===================================================================
+    mod capture {
+        use log::{Level, Log, Metadata, Record};
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static RECORDS: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
+            static ACTIVE: RefCell<bool> = const { RefCell::new(false) };
+        }
+
+        struct CaptureLogger;
+
+        impl Log for CaptureLogger {
+            fn enabled(&self, _: &Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &Record) {
+                ACTIVE.with(|a| {
+                    if *a.borrow() {
+                        RECORDS.with(|r| {
+                            r.borrow_mut()
+                                .push((record.level(), record.args().to_string()));
+                        });
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+
+        static INIT: Once = Once::new();
+
+        /// Run `f`, returning every `(Level, message)` it logged on this thread.
+        pub fn capture_logs<F: FnOnce()>(f: F) -> Vec<(Level, String)> {
+            INIT.call_once(|| {
+                // `set_max_level(Trace)` is required — without it the log macros
+                // short-circuit before reaching the logger. Because it is set to
+                // the most permissive level, a regression of the green path from
+                // `info!` to `debug!` would still be *captured* (as `Debug`), so
+                // the level assertion — not mere presence — is what guards it.
+                let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|r| r.borrow_mut().clear());
+            ACTIVE.with(|a| *a.borrow_mut() = true);
+            f();
+            ACTIVE.with(|a| *a.borrow_mut() = false);
+            RECORDS.with(|r| r.borrow_mut().clone())
+        }
+    }
+
+    // ===================================================================
+    // Green-path log severity (#4083)
+    // ===================================================================
+
+    /// AC5 — the operator-visible fix. A green run from a non-halted state must
+    /// emit exactly one `info!` line via the production (root-aware) renderer,
+    /// naming the workspace and the elapsed seconds. If the level regresses to
+    /// `debug!`, the `Level::Info` assertion fails.
+    #[test]
+    fn test_remained_healthy_logs_at_info_via_root_renderer() {
+        let root = Path::new("/repo/alpha");
+        let state = MainHealthState::new();
+        let outcome = GateOutcome::Green {
+            elapsed: Duration::from_secs(726),
+        };
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(&state, &outcome, |t, o, h| log_transition_for_root(root, t, o, h));
+        });
+
+        let green: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.contains("GREEN in"))
+            .collect();
+        assert_eq!(green.len(), 1, "exactly one green line expected, got {records:?}");
+        let (level, msg) = green[0];
+        assert_eq!(*level, log::Level::Info, "green path must log at INFO, not debug");
+        assert!(msg.contains("/repo/alpha"), "line must name the workspace: {msg}");
+        assert!(msg.contains("726s"), "line must carry the elapsed seconds: {msg}");
+        assert!(msg.contains("dispatch unaffected"), "unexpected wording: {msg}");
+    }
+
+    /// AC4 — the single-workspace renderer (no production caller, but kept for
+    /// API/test parity) must also carry the upgraded severity. It omits the
+    /// workspace name (there is no root in scope) but still logs at INFO with
+    /// the elapsed time.
+    #[test]
+    fn test_remained_healthy_logs_at_info_via_plain_renderer() {
+        let state = MainHealthState::new();
+        let outcome = GateOutcome::Green {
+            elapsed: Duration::from_secs(42),
+        };
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(&state, &outcome, log_transition);
+        });
+
+        let green: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.contains("GREEN in"))
+            .collect();
+        assert_eq!(green.len(), 1, "exactly one green line expected, got {records:?}");
+        let (level, msg) = green[0];
+        assert_eq!(*level, log::Level::Info, "green path must log at INFO, not debug");
+        assert!(msg.contains("42s"), "line must carry the elapsed seconds: {msg}");
+    }
+
+    /// A green run that *exits a halt* must stay `Recovered` (its own distinct,
+    /// greppable wording) and must NOT also emit the `RemainedHealthy` "GREEN
+    /// in Ns" line — the two remain distinguishable.
+    #[test]
+    fn test_recovered_is_distinct_from_remained_healthy() {
+        let root = Path::new("/repo/beta");
+        let state = MainHealthState::new();
+        // Prime a halt so the next green is a recovery.
+        let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::from_secs(5),
+                },
+                |t, o, h| log_transition_for_root(root, t, o, h),
+            );
+        });
+
+        assert!(
+            records
+                .iter()
+                .any(|(l, m)| *l == log::Level::Info && m.contains("GREEN again")),
+            "recovery must log the distinct 'GREEN again' line: {records:?}"
+        );
+        assert!(
+            !records.iter().any(|(_, m)| m.contains("GREEN in")),
+            "a recovery must not also emit the RemainedHealthy 'GREEN in Ns' line: {records:?}"
+        );
+    }
+
+    /// Elapsed rendering: a sub-second run must not render as a misleading
+    /// `0s` (which reads as "the gate never ran") — it renders in ms instead.
+    #[test]
+    fn test_format_elapsed_rendering() {
+        assert_eq!(format_elapsed(Duration::from_secs(726)), "726s");
+        assert_eq!(format_elapsed(Duration::from_secs(1)), "1s");
+        // Sub-second → milliseconds, never "0s".
+        assert_eq!(format_elapsed(Duration::from_millis(320)), "320ms");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_elapsed(Duration::ZERO), "0ms");
+        assert_ne!(format_elapsed(Duration::from_millis(500)), "0s");
+    }
+
     // ===================================================================
     // Config soft-fail
     // ===================================================================
@@ -2405,6 +2776,84 @@ mod tests {
     }
 
     // ===================================================================
+    // config_resolver migration (#4058) — buildGate tier precedence
+    // ===================================================================
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_build_gate_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        let cfg = read_build_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.unwrap().command, "true");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_build_gate_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "legacy-cmd", "timeoutSeconds": 99}}"#,
+        );
+        write_project_config(tmp.path(), r#"{"buildGate": {"command": "project-cmd"}}"#);
+        let cfg = read_build_gate_config(tmp.path()).unwrap();
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `command` -> project tier wins.
+        assert_eq!(cfg.command, "project-cmd");
+        // Non-overlapping `timeoutSeconds` -> legacy tier still supplies it.
+        assert_eq!(cfg.timeout, Duration::from_secs(99));
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — autonomous.mainHealthGate tier
+    // precedence
+    // ===================================================================
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_autonomous_gate_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#,
+        );
+        let cfg = read_autonomous_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            cfg,
+            AutonomousGateConfig {
+                enabled: Some(true),
+                ci_workflow: None,
+            }
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_autonomous_gate_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#,
+        );
+        let local_full = tmp.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(local_full.parent().unwrap()).unwrap();
+        std::fs::write(&local_full, r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#)
+            .unwrap();
+
+        let cfg = read_autonomous_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.enabled, Some(true));
+    }
+
+    // ===================================================================
     // Halt-state transitions (the reactive core)
     // ===================================================================
 
@@ -2412,6 +2861,114 @@ mod tests {
     fn test_default_state_not_halted() {
         assert!(!MainHealthState::new().is_halted());
         assert!(!MainHealthState::default().is_halted());
+    }
+
+    // ===================================================================
+    // Verdict timestamp (#4012) — the pending-vs-clear disambiguator
+    // ===================================================================
+
+    #[test]
+    fn test_fresh_state_has_no_verdict_yet() {
+        // The core #4012 regression: a fresh, never-evaluated state must NOT
+        // be indistinguishable from a verified-green one. `last_verdict_at`
+        // is the new signal a renderer uses to tell them apart.
+        let state = MainHealthState::new();
+        assert_eq!(state.last_verdict_at(), None);
+        assert!(!state.is_halted(), "still not halted -- dispatch allowed either way");
+    }
+
+    #[test]
+    fn test_green_verdict_stamps_last_verdict_at() {
+        let state = MainHealthState::new();
+        let before = Utc::now();
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::Green {
+                elapsed: Duration::ZERO,
+            },
+        );
+        let stamped = state
+            .last_verdict_at()
+            .expect("a completed Green run must stamp a verdict time");
+        assert!(stamped >= before, "stamped time must not be in the past relative to the call");
+    }
+
+    #[test]
+    fn test_red_verdict_also_stamps_last_verdict_at() {
+        // Both determinate outcomes count as "a verdict happened" -- a red
+        // main is still a real answer, just an unwelcome one.
+        let state = MainHealthState::new();
+        let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
+        assert!(state.last_verdict_at().is_some());
+    }
+
+    #[test]
+    fn test_unevaluated_outcome_does_not_stamp_last_verdict_at() {
+        // An UNEVALUATED tick produced no verdict at all -- it must not be
+        // mistaken for one by stamping the timestamp.
+        let state = MainHealthState::new();
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::unevaluated(UnevaluatedClass::Timeout, "timed out"),
+        );
+        assert_eq!(state.last_verdict_at(), None, "an unevaluated tick must not stamp a verdict");
+    }
+
+    #[test]
+    fn test_run_gate_tick_skip_path_does_not_stamp_last_verdict_at() {
+        // The #3984 SHA-memo skip path (unchanged `origin/main`) proves
+        // nothing new -- the Curator's explicit design decision is that only
+        // the real Green/Red run stamps the verdict time, never the skip.
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let first = run_gate_tick(&state, &cfg, clone.path());
+        assert!(matches!(first, Some(GateOutcome::Green { .. })));
+        // `run_gate_tick` alone does not apply the outcome (the caller does,
+        // via `apply_gate_outcome`) -- so no verdict is stamped by the tick
+        // itself yet.
+        assert_eq!(state.last_verdict_at(), None);
+        let _ = apply_gate_outcome(&state, &first.unwrap());
+        let after_first = state.last_verdict_at();
+        assert!(after_first.is_some(), "the real run's outcome, once applied, stamps a verdict");
+
+        // Second tick: unchanged SHA -> skip. No outcome to apply, so the
+        // verdict time must be untouched.
+        let second = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(second, None, "unchanged origin/main must skip the second tick");
+        assert_eq!(
+            state.last_verdict_at(),
+            after_first,
+            "a skipped tick must never refresh the verdict timestamp"
+        );
+    }
+
+    #[test]
+    fn test_workspace_health_states_last_verdict_at_unknown_root_is_none() {
+        let states = WorkspaceHealthStates::new();
+        assert_eq!(states.last_verdict_at(Path::new("/repo/never-seen")), None);
+    }
+
+    #[test]
+    fn test_workspace_health_states_last_verdict_at_delegates_to_root() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/repo/a");
+        let state = states.get_or_create(root);
+        assert_eq!(states.last_verdict_at(root), None);
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::Green {
+                elapsed: Duration::ZERO,
+            },
+        );
+        assert!(states.last_verdict_at(root).is_some());
     }
 
     // ===================================================================
@@ -2469,7 +3026,12 @@ mod tests {
     fn test_green_then_red_enters_halt() {
         let state = MainHealthState::new();
         assert_eq!(
-            apply_gate_outcome(&state, &GateOutcome::Green),
+            apply_gate_outcome(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::ZERO
+                }
+            ),
             HealthTransition::RemainedHealthy
         );
         assert!(!state.is_halted());
@@ -2501,7 +3063,15 @@ mod tests {
         let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
         assert!(state.is_halted());
 
-        assert_eq!(apply_gate_outcome(&state, &GateOutcome::Green), HealthTransition::Recovered);
+        assert_eq!(
+            apply_gate_outcome(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::ZERO
+                }
+            ),
+            HealthTransition::Recovered
+        );
         assert!(!state.is_halted(), "a green run must clear the halt");
     }
 
@@ -2514,7 +3084,9 @@ mod tests {
         }
         impl GateRunner for FakeGateRunner {
             fn run_gate(&mut self) -> GateOutcome {
-                self.outcomes.pop_front().unwrap_or(GateOutcome::Green)
+                self.outcomes.pop_front().unwrap_or(GateOutcome::Green {
+                    elapsed: Duration::ZERO,
+                })
             }
         }
 
@@ -2522,7 +3094,9 @@ mod tests {
             outcomes: VecDeque::from([
                 GateOutcome::red("first failure"),
                 GateOutcome::red("second failure"),
-                GateOutcome::Green,
+                GateOutcome::Green {
+                    elapsed: Duration::ZERO,
+                },
             ]),
         };
         let state = MainHealthState::new();
@@ -2555,7 +3129,7 @@ mod tests {
             ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
-        assert_eq!(runner.run_gate(), GateOutcome::Green);
+        assert!(runner.run_gate().is_green());
     }
 
     #[test]
@@ -2814,7 +3388,7 @@ mod tests {
     fn test_green_local_run_never_consults_forge_ci() {
         std::env::remove_var(GATE_CI_CORROBORATION_ENV);
         let (outcome, asked) = run_gate_with_ci("exit 0", CiVerdict::Failure);
-        assert_eq!(outcome, GateOutcome::Green, "a green local run is authoritative");
+        assert!(outcome.is_green(), "a green local run is authoritative");
         assert!(asked.is_empty(), "CI must not be probed on a green run");
     }
 
@@ -2857,30 +3431,30 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"LOC"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Success);
 
         // Any completed failure for the SHA ⇒ red.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"Sec"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Failure);
 
         // Only in-progress runs for the SHA ⇒ unknown (never a silent green).
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // A green run for a DIFFERENT commit must never vouch for this one.
         let json = format!(
             r#"[{{"headSha":"{other}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Empty / unparseable output ⇒ unknown.
-        assert_eq!(parse_gh_run_list("[]", &sha), CiVerdict::Unknown);
-        assert_eq!(parse_gh_run_list("not json", &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list("[]", &sha, None), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list("not json", &sha, None), CiVerdict::Unknown);
     }
 
     /// Only *positive* contrary evidence may relax a halt (#3974 AC4). These are
@@ -2896,7 +3470,7 @@ mod tests {
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Cancelled CI alongside a completed-success bookkeeping workflow: still
         // unknown. The success does not paper over the missing CI verdict.
@@ -2904,7 +3478,7 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // 2. The ~100s window after every push where the fast bookkeeping
         //    workflow has finished but CI is still running.
@@ -2912,14 +3486,14 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Queued counts the same as in-progress: not yet a verdict.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"queued","conclusion":null,"workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // `action_required` (awaiting a human) and `stale` are likewise not
         // statements about the code.
@@ -2929,7 +3503,7 @@ mod tests {
                     {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
             );
             assert_eq!(
-                parse_gh_run_list(&json, &sha),
+                parse_gh_run_list(&json, &sha, None),
                 CiVerdict::Unknown,
                 "conclusion {conclusion:?} must not vouch for the commit"
             );
@@ -2940,14 +3514,14 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"some_new_thing","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Absence of failure is not success: every run skipped ⇒ nothing
         // positively vouches for the commit.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // A real failure still wins over any indeterminate sibling — a halt may
         // always be *established*, it just may not be relaxed on non-evidence.
@@ -2956,7 +3530,7 @@ mod tests {
                 {{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"Lines of Code"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Failure);
 
         // And the genuine all-clear still reads green: every workflow for the
         // commit reached a verdict, at least one of them `success`.
@@ -2965,7 +3539,91 @@ mod tests {
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"Release"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Success);
+    }
+
+    /// #3987: with a named verification workflow configured, that workflow must
+    /// itself have concluded `success` for the SHA — a bookkeeping workflow
+    /// succeeding on its own may not vouch for a commit whose real build never
+    /// ran (`paths`-filtered away, so it produced no run at all).
+    #[test]
+    fn test_parse_gh_run_list_named_workflow() {
+        let sha = "d".repeat(40);
+
+        // Regression for this issue: only a bookkeeping `success`, no `CI` run at
+        // all for the SHA. Unnamed ⇒ Success (today's behavior); named "CI" ⇒
+        // Unknown, because the workflow that verifies the code never judged it.
+        let bookkeeping_only = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&bookkeeping_only, &sha, None), CiVerdict::Success);
+        assert_eq!(
+            parse_gh_run_list(&bookkeeping_only, &sha, Some("CI")),
+            CiVerdict::Unknown,
+            "no CI run for the SHA must not be vouched for by a bookkeeping success"
+        );
+
+        // The named workflow completed/success (unanimity otherwise satisfied) ⇒
+        // Success: the corroboration path stays reachable (preserves #3986/#3974).
+        let ci_success = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_success, &sha, Some("CI")), CiVerdict::Success);
+
+        // Named workflow `skipped` alongside a bookkeeping success ⇒ Unknown (a
+        // required workflow that declined to run did not verify the commit). Note
+        // this differs from the unnamed case, where the same fixture is Success.
+        let ci_skipped = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_skipped, &sha, None), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&ci_skipped, &sha, Some("CI")), CiVerdict::Unknown);
+
+        // A `failure` on any run still yields Failure, configured or not — a halt
+        // may always be established, only never relaxed on non-evidence.
+        let ci_failure = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_failure, &sha, None), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&ci_failure, &sha, Some("CI")), CiVerdict::Failure);
+
+        // A configured name matching no workflow anywhere in the window ⇒ Unknown
+        // (fail safe) and exercises the misconfiguration `warn!` path.
+        assert_eq!(
+            parse_gh_run_list(&bookkeeping_only, &sha, Some("Typo Workflow")),
+            CiVerdict::Unknown
+        );
+
+        // Matching is exact on `workflowName` (case-sensitive): a near-miss name
+        // is treated as "no run for the named workflow".
+        assert_eq!(parse_gh_run_list(&ci_success, &sha, Some("ci")), CiVerdict::Unknown);
+    }
+
+    /// #3987 Finding-1 guard: real captured `gh run list` output for this repo —
+    /// where `Shell Script Linting` is `paths`-filtered and appears for only one
+    /// of several SHAs — must yield `Success` for a green SHA **both** unnamed and
+    /// with `ciWorkflow: "CI"`, i.e. the low-frequency workflow must not perturb
+    /// any verdict.
+    #[test]
+    fn test_parse_gh_run_list_real_data_fixture() {
+        let green = "1111111111111111111111111111111111111111";
+        let older = "2222222222222222222222222222222222222222";
+        // The green SHA has CI + two other no-filter workflows all green; the
+        // paths-filtered `Shell Script Linting` only ever ran on an older SHA.
+        let json = format!(
+            r#"[
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}},
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"Security Scan"}},
+                {{"headSha":"{older}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{older}","status":"completed","conclusion":"success","workflowName":"Shell Script Linting"}}
+            ]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, green, None), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, green, Some("CI")), CiVerdict::Success);
     }
 
     // ===================================================================
@@ -3379,7 +4037,7 @@ mod tests {
             ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf());
-        assert_eq!(runner.run_gate(), GateOutcome::Green);
+        assert!(runner.run_gate().is_green());
     }
 
     // ===================================================================
@@ -3549,7 +4207,10 @@ mod tests {
         let state = MainHealthState::new();
 
         let first = run_gate_tick(&state, &cfg, clone.path());
-        assert_eq!(first, Some(GateOutcome::Green), "first tick must run and be green");
+        assert!(
+            matches!(first, Some(GateOutcome::Green { .. })),
+            "first tick must run and be green"
+        );
         let invocations_after_first = std::fs::read_to_string(&marker_file)
             .unwrap_or_default()
             .lines()
@@ -3583,7 +4244,10 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert!(matches!(
+            run_gate_tick(&state, &cfg, clone.path()),
+            Some(GateOutcome::Green { .. })
+        ));
         assert_eq!(
             std::fs::read_to_string(&marker_file)
                 .unwrap_or_default()
@@ -3594,7 +4258,10 @@ mod tests {
 
         // main moves — the next tick must run again.
         advance_origin_main(origin.path());
-        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert!(matches!(
+            run_gate_tick(&state, &cfg, clone.path()),
+            Some(GateOutcome::Green { .. })
+        ));
         assert_eq!(
             std::fs::read_to_string(&marker_file)
                 .unwrap_or_default()
@@ -3892,16 +4559,76 @@ mod tests {
         assert_eq!(
             read_autonomous_gate_config(tmp.path()),
             AutonomousGateConfig {
-                enabled: Some(true)
+                enabled: Some(true),
+                ci_workflow: None,
             }
         );
         write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
         assert_eq!(
             read_autonomous_gate_config(tmp.path()),
             AutonomousGateConfig {
-                enabled: Some(false)
+                enabled: Some(false),
+                ci_workflow: None,
             }
         );
+    }
+
+    // ===================================================================
+    // #3987 — optional named forge verification workflow
+    // ===================================================================
+
+    #[test]
+    fn test_autonomous_config_ci_workflow_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true, "ciWorkflow": "CI"}}}"#,
+        );
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()),
+            AutonomousGateConfig {
+                enabled: Some(true),
+                ci_workflow: Some("CI".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_autonomous_config_ci_workflow_empty_and_whitespace_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty string ⇒ treated as unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": ""}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, None);
+        // Whitespace-only ⇒ trimmed away ⇒ unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "   "}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, None);
+        // Leading/trailing whitespace on a real value is trimmed.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "  CI  "}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, Some("CI".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_ci_workflow_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var(GATE_CI_WORKFLOW_ENV);
+
+        // No env, no config ⇒ None (unanimity-only behavior preserved).
+        assert_eq!(resolve_ci_workflow(tmp.path()), None);
+
+        // Config alone is used when env is unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "Build"}}}"#);
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("Build".to_string()));
+
+        // Env overrides config.
+        std::env::set_var(GATE_CI_WORKFLOW_ENV, "CI");
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("CI".to_string()));
+
+        // Empty/whitespace env falls through to config.
+        std::env::set_var(GATE_CI_WORKFLOW_ENV, "   ");
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("Build".to_string()));
+
+        std::env::remove_var(GATE_CI_WORKFLOW_ENV);
     }
 
     #[test]
@@ -3914,21 +4641,103 @@ mod tests {
 
         // Config alone enables/disables when env is unset.
         assert!(resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(true)
+            enabled: Some(true),
+            ..Default::default()
         }));
         assert!(!resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(false)
+            enabled: Some(false),
+            ..Default::default()
         }));
 
         // Env overrides config in both directions (env is the master switch).
         std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
         assert!(resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(false)
+            enabled: Some(false),
+            ..Default::default()
         }));
         std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "0");
         assert!(!resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(true)
+            enabled: Some(true),
+            ..Default::default()
         }));
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+    }
+
+    // ===================================================================
+    // Effective enablement (#4012) — the "disabled" render signal
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_with_no_config_at_all() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!effective_enabled(tmp.path()), "no config at all ⇒ disabled");
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_when_enabled_but_no_usable_build_gate() {
+        // #4012's "edge case" test-plan item: a root that is nominally
+        // enabled but has no usable `buildGate` block (or an empty command)
+        // is treated by the gate loop as always-green and must ALSO report
+        // as effectively disabled here -- not "pending" -- since nothing
+        // will ever evaluate it until `buildGate` is actually configured.
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
+        assert!(
+            !effective_enabled(tmp.path()),
+            "enabled=true with no buildGate block must still report disabled"
+        );
+
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "   "}}"#,
+        );
+        assert!(
+            !effective_enabled(tmp.path()),
+            "enabled=true with an empty buildGate.command must still report disabled"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_true_with_both_signals_configured() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        );
+        assert!(effective_enabled(tmp.path()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_when_build_gate_present_but_autonomous_disabled() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        assert!(
+            !effective_enabled(tmp.path()),
+            "a usable buildGate block alone does not enable the gate -- autonomous.mainHealthGate must opt in too"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_env_master_switch_overrides_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": false}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        );
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
+        assert!(
+            effective_enabled(tmp.path()),
+            "the env master switch overrides a config that disables the loop"
+        );
         std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
     }
 }

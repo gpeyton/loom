@@ -103,7 +103,7 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 | Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
 | Tier 2 | `loom-daemon` (MCP) + GH Actions cron | Multi-issue dispatch + scheduled support roles | Continuous / cron |
 | Tier 1 | `/loom:sweep <issue>` | Issue lifecycle from creation to merge | Per-issue |
-| Tier 0 | `/builder`, `/judge`, etc. | Task execution — single focused work units | Per-task |
+| Tier 0 | `/loom:builder`, `/loom:judge`, etc. | Task execution — single focused work units | Per-task |
 
 ### Tier responsibilities
 
@@ -146,7 +146,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 **Setup**:
 1. Open Claude Code in this repository
-2. Use slash commands to assume roles: `/builder`, `/judge`, `/curator`, etc.
+2. Use slash commands to assume roles: `/loom:builder`, `/loom:judge`, `/loom:curator`, etc.
 3. Each terminal acts as a specialized agent following role guidelines
 
 **When to use MOM**:
@@ -236,15 +236,15 @@ GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-f
 
 **Fallback for daemon-less deployments:** GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process. This is the degraded mode documented above: a single static `CLAUDE_API_KEY` secret with no rotation and no health-awareness.
 
-| Workflow | Role | Schedule (commented) | Claude model |
-|----------|------|----------------------|--------------|
-| `loom-champion.yml` | `/champion` | `*/10 * * * *` | `claude-sonnet-4-6` |
-| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`  | `claude-sonnet-4-6` |
-| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`  | `claude-opus-4-8`   |
-| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *` | `claude-sonnet-4-6` |
-| `loom-guide.yml`    | `/guide`    | `*/15 * * * *` | `claude-sonnet-4-6` |
+| Workflow | Role | Schedule (commented) |
+|----------|------|----------------------|
+| `loom-champion.yml` | `/loom:champion` | `*/10 * * * *` |
+| `loom-curator.yml`  | `/loom:curator`  | `*/5 * * * *`  |
+| `loom-judge.yml`    | `/loom:judge`    | `*/5 * * * *`  |
+| `loom-auditor.yml`  | `/loom:auditor`  | `*/10 * * * *` |
+| `loom-guide.yml`    | `/loom:guide`    | `*/15 * * * *` |
 
-**Runtime choice (claude | codex, #13).** Each role can run on either runtime. The default is `claude` (byte-equivalent to the historical behavior): installs `@anthropic-ai/claude-code` and runs `claude -p "/<role>" --model <pinned> --dangerously-skip-permissions` with `CLAUDE_API_KEY` mapped to `ANTHROPIC_API_KEY`. Selecting `codex` (via the `workflow_dispatch` runtime input) installs `@openai/codex` and runs `codex exec "<role prompt>" --sandbox workspace-write -m <codex-model>`, authenticating with `OPENAI_API_KEY`. Codex cannot resolve Claude slash commands, so the role prompt is inlined from `.loom/roles/<role>.md`. The default Codex model is centralized in the reusable workflow's `codex-model` input default — bump it there in one place.
+**Runtime choice (claude | codex).** Each role can run on either runtime. The default is `claude` (byte-equivalent to the historical behavior): installs `@anthropic-ai/claude-code` and runs `claude -p "/<role>" --model <pinned> --dangerously-skip-permissions` with `CLAUDE_API_KEY` mapped to `ANTHROPIC_API_KEY`. Selecting `codex` (via the `workflow_dispatch` runtime input) installs `@openai/codex` and runs `codex exec "<role prompt>" --sandbox workspace-write -m <codex-model>`, authenticating with `OPENAI_API_KEY`. Codex cannot resolve Claude slash commands, so the role prompt is inlined from `.loom/roles/<role>.md`. The default Codex model is centralized in the reusable workflow's `codex-model` input default — bump it there in one place.
 
 **Disabled by default.** Every shipped workflow has its `schedule:` block commented out so forks don't burn Actions minutes accidentally. To opt in on a fork:
 
@@ -1158,10 +1158,11 @@ If setup fails, it's usually due to:
 
 ## Custom Guard Hooks
 
-Loom ships with two built-in Bash `PreToolUse` guard hooks, both registered under the `Bash` matcher and firing independently:
+Loom ships with several built-in `PreToolUse` guard hooks, registered independently under the `Bash` or `Edit|Write` matcher as noted below:
 
-- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
-- **`guard-loom-workflow.sh`** — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). These two guards are specific to the Loom worktree/merge workflow and stay Loom-owned.
+- **`guard-destructive.sh`** (`Bash` matcher) — the generic repository-hygiene guard (catastrophic denies like `rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction; the segment-parsed lifecycle/cloud-CLI checks; and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery documented below). Nothing about this guard is Loom-specific, so as of **#4041 its canonical home is [Repo Skills](https://github.com/rjwalters/repo)** (installed at `.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29 curl-pipe fix). In Loom, `guard-destructive.sh` is now a thin **dispatcher**: when the canonical Repo Skills guard is present it defers to it at runtime (and the installer does not install a second generic guard); otherwise it falls back to a clearly-marked **vendored copy** (`guard-destructive-generic.sh`) that Loom ships so standalone-Loom repos — those without Repo Skills — keep full coverage. Exactly one generic guard ever runs; the behavior and all the toggles below are unchanged either way. The pattern list itself is maintained upstream in Repo Skills, not forked in Loom.
+- **`guard-loom-workflow.sh`** (`Bash` matcher) — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). This guard and `guard-worktree-paths.sh` below are specific to the Loom worktree/merge workflow and stay Loom-owned.
+- **`guard-worktree-paths.sh`** (`Edit|Write` matcher, issue #2441 / #4007) — confines Edit/Write tool calls to a builder's issue worktree, denying writes that resolve into the main checkout. Two mechanisms: the `LOOM_WORKTREE_PATH` env fast path (tmux/manual sessions pinned to one worktree) and, when that env var is absent, a **path-derived fallback** — it walks up from the target path looking for the `.loom-managed` sentinel `worktree.sh` writes at every worktree root, and denies a write that lands in the main checkout while at least one managed worktree exists. The fallback exists because a daemon-dispatched sweep hosts multiple Task-subagent builders in one shared process env, so a single process-wide `LOOM_WORKTREE_PATH` cannot cover that path (#3719). Toggle: `guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`, documented alongside the other guard toggles below.
 
 You can also add project-specific guards to protect read-only directories from accidental edits (see below).
 
@@ -1277,6 +1278,25 @@ LOOM_GUARD_REVERSIBLE_GH=1 gh pr close 42       # ASK
 # Force off for one command even when the repo opts in:
 LOOM_GUARD_REVERSIBLE_GH=0 gh issue close 100   # allowed
 ```
+
+### Worktree Isolation Guard Opt-Out (`guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`)
+
+`guard-worktree-paths.sh` (issue #4007) denies Edit/Write tool calls whose target resolves into the **main** repository checkout while a Loom-managed worktree exists (path-derived — see the guard inventory bullet above for the mechanism). This is the mechanical enforcement behind "never work on main branch": a builder that used a repo-relative path after a cwd reset, or that otherwise escaped its issue worktree, is denied instead of silently corrupting the main checkout.
+
+The guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.worktreeIsolation` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "worktreeIsolation": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Disabling this guard does not weaken any other guard. The toggle governs the guard as a whole — disabling it skips **both** mechanisms, including the `LOOM_WORKTREE_PATH` fast path's own containment check.
 
 ### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
 
@@ -1528,7 +1548,7 @@ jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
 
 ```bash
 # Enable for a single command (e.g. to capture one session's fires)
-LOOM_GUARD_DECISION_LOG=1 claude -p "/builder" --dangerously-skip-permissions
+LOOM_GUARD_DECISION_LOG=1 claude -p "/loom:builder" --dangerously-skip-permissions
 
 # Persist for a whole repo
 #   .loom/config.json  ->  { "guards": { "decisionLog": true } }
@@ -1833,6 +1853,11 @@ gh label sync --file .github/labels.yml
 tail -f ~/.loom/daemon.log
 ```
 
+The log path can be overridden with `LOOM_DAEMON_LOG` (e.g. to isolate a test
+daemon's log from the operator's production history); an unset override falls
+back to `$HOME/.loom/daemon.log` unchanged. See "Daemon log path override" in
+`.loom/docs/daemon-reference.md`.
+
 **Claude Code not found**:
 ```bash
 # Ensure Claude Code CLI is in PATH
@@ -1957,8 +1982,8 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the f
 **This is by design post-v0.10.0.** Neither the daemon nor the GH Actions cron generates work for Architect / Hermit — that cadence is tracked under follow-up #3381. For now, trigger them manually when the queue is empty:
 
 ```bash
-claude -p "/architect" --dangerously-skip-permissions
-claude -p "/hermit"    --dangerously-skip-permissions
+claude -p "/loom:architect" --dangerously-skip-permissions
+claude -p "/loom:hermit"    --dangerously-skip-permissions
 ```
 
 ## Health Monitoring

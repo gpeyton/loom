@@ -7,13 +7,14 @@ use crate::git_utils;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
-use crate::types::{DaemonStatusReport, Event, Request, Response};
+use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
@@ -24,6 +25,527 @@ use tokio::net::{UnixListener, UnixStream};
 /// the `Ping`/`Pong` roundtrip are individually capped at this duration so a
 /// hung or unresponsive peer can never stall daemon startup.
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+// ============================================================================
+// Shutdown-intent exit codes (Issue #4054 — supervised restart primitive)
+// ============================================================================
+// Under the macOS launchd `KeepAlive: { SuccessfulExit: true }` contract (see
+// `render_launchd_plist` in `loom-daemon-start.sh`), launchd relaunches the job
+// ONLY when it exits with status 0 ("successful"), and leaves it down on any
+// non-zero exit. The daemon therefore encodes *why* it is shutting down in its
+// exit code so exactly one path — the restart primitive — trips a relaunch:
+//
+//   | Cause                         | Exit code       | launchd action    |
+//   |-------------------------------|-----------------|-------------------|
+//   | RestartDaemon (this primitive)| 0  EXIT_RESTART | relaunch (wanted) |
+//   | SIGTERM (operator stop)       | 143 EXIT_SIGTERM| NO relaunch       |
+//   | SIGINT  (interactive Ctrl-C)  | 130 EXIT_SIGINT | NO relaunch       |
+//   | IPC Shutdown request          | 143 EXIT_SHUTDOWN| NO relaunch      |
+//   | crash / panic                 | non-zero        | NO relaunch       |
+//
+// This is Curator Finding 1's remedy: because a SIGTERM'd daemon now exits
+// non-zero, launchd never relaunches it during an operator stop, so "an operator
+// stop stays stopped" holds WITHOUT depending on `bootout` timing (the bootout
+// in `loom-daemon-stop.sh` is demoted to belt-and-braces). It also preserves the
+// pre-existing no-crash-loop semantics: a crashed daemon exits non-zero and is
+// not respawned, exactly as under the old `KeepAlive: false`.
+
+/// Exit code for the supervised restart primitive: the ONLY exit that trips a
+/// launchd `SuccessfulExit` relaunch.
+pub const EXIT_RESTART: i32 = 0;
+/// Exit code for a SIGTERM-driven operator stop (128 + SIGTERM 15). Non-zero so
+/// launchd does not relaunch.
+pub const EXIT_SIGTERM: i32 = 143;
+/// Exit code for an interactive SIGINT / Ctrl-C (128 + SIGINT 2). Non-zero so
+/// launchd does not relaunch.
+pub const EXIT_SIGINT: i32 = 130;
+/// Exit code for an explicit IPC `Shutdown` request. Non-zero — an explicit
+/// shutdown means "stay down", so launchd must not relaunch.
+pub const EXIT_SHUTDOWN: i32 = 143;
+
+/// Detect the daemon's process supervisor from the environment (#4054).
+///
+/// Returns `Some("launchd")` when `LOOM_DAEMON_SUPERVISOR=launchd`
+/// (case-insensitive) is present — a value `loom-daemon-start.sh` bakes into the
+/// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Any other
+/// or absent value ⇒ `None` (the daemon is unsupervised: nohup / Linux /
+/// `--foreground`), and the restart primitive must refuse to end the process
+/// because nothing would bring it back.
+pub fn detect_supervisor() -> Option<String> {
+    match std::env::var("LOOM_DAEMON_SUPERVISOR") {
+        Ok(v) if v.eq_ignore_ascii_case("launchd") => Some("launchd".to_string()),
+        _ => None,
+    }
+}
+
+/// Decide how to answer a `RestartDaemon` request (Issue #4054): the `Response`
+/// to send back, plus whether the daemon should then end its own process (exit
+/// [`EXIT_RESTART`]) for a supervised relaunch.
+///
+/// The daemon ends itself ONLY when [`detect_supervisor`] proves it is
+/// supervised. On an unsupervised host it refuses, stays running, and returns a
+/// `DaemonRestart { scheduled: false, .. }` — degrading to "log loudly, leave
+/// the daemon running, do not restart" per #4017, because exiting with no
+/// supervisor to relaunch it would be strictly worse than the status quo.
+pub fn build_restart_decision() -> (Response, bool) {
+    match detect_supervisor() {
+        Some(sup) => (
+            Response::DaemonRestart {
+                scheduled: true,
+                supervisor: Some(sup.clone()),
+                message: format!(
+                    "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
+                     In-flight sweeps survive by design; the relaunched daemon re-reads \
+                     the same launchd plist, so it comes back with exactly its start flags."
+                ),
+            },
+            true,
+        ),
+        None => (
+            Response::DaemonRestart {
+                scheduled: false,
+                supervisor: None,
+                message: "refusing to restart: no supervisor detected \
+                    (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
+                    launchd (nohup / Linux / --foreground), so nothing would relaunch it \
+                    if it exited. Leaving it running. Restart it manually with \
+                    loom-daemon-stop.sh && loom-daemon-start.sh."
+                    .to_string(),
+            },
+            false,
+        ),
+    }
+}
+
+// ============================================================================
+// Scheduled drain-and-restart (Issue #4090)
+// ============================================================================
+
+/// Default bound on how long a drain waits for the sweep registry to empty
+/// before it either refuses (fail-safe) or force-cancels the stragglers. A
+/// sweep is ~10–20 min, so the default is generous.
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
+
+/// How often the drain supervisor re-counts the cross-root in-flight sweeps.
+/// Small enough that a drain that finishes exits promptly; the zero-in-flight
+/// case is handled on the very first poll (no full-interval wait).
+pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Shared drain-and-restart coordination state (Issue #4090).
+///
+/// Owns the daemon-global drain flag OR'd into the producers' halt checks (work
+/// finder, epic supervisor, role runner) and the descriptor the `DaemonStatus`
+/// snapshot renders. Exactly one drain-supervisor task may be live at a time; a
+/// monotonic `generation` lets a running supervisor detect it has been
+/// superseded (a fresh drain) or aborted, and stop **without** exiting the
+/// process.
+#[derive(Debug)]
+pub struct DrainState {
+    /// The flag consulted by the dispatch producers. `true` ⇒ new dispatch is
+    /// paused pending a supervised restart. Cloned out to each producer via
+    /// [`Self::flag`].
+    flag: Arc<AtomicBool>,
+    /// Bumped on every accepted drain start AND on abort/timeout-resume, so a
+    /// running drain-supervisor task can tell it is still the current one.
+    generation: AtomicU64,
+    /// Mutable descriptor of the active/last drain, for status rendering.
+    inner: Mutex<DrainDescriptor>,
+}
+
+/// The rendered view of the current (or most recent) drain (Issue #4090).
+#[derive(Debug, Default, Clone)]
+pub struct DrainDescriptor {
+    /// Whether a drain is currently in progress.
+    pub active: bool,
+    /// Deadline after which the drain gives up waiting.
+    pub deadline: Option<chrono::DateTime<Utc>>,
+    /// Whether the deadline path force-cancels stragglers (vs. refusing).
+    pub force_after_timeout: bool,
+    /// A short human-readable note about the last transition (timeout refusal,
+    /// abort) surfaced in `loom-daemon status`.
+    pub note: Option<String>,
+}
+
+/// Outcome of [`DrainState::begin`].
+#[derive(Debug)]
+pub enum DrainBegin {
+    /// A new drain was started; the caller must spawn the supervisor task with
+    /// this generation.
+    Started {
+        generation: u64,
+        deadline: chrono::DateTime<Utc>,
+    },
+    /// A drain was already in progress; the request is an idempotent ack and no
+    /// second supervisor should be spawned (the deadline/generation are
+    /// unchanged).
+    AlreadyDraining,
+}
+
+impl Default for DrainState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Allow expect_used: a poisoned drain mutex means another thread panicked while
+// holding it — unrecoverable, same crash-on-poison policy as the rest of ipc.rs.
+#[allow(clippy::expect_used)]
+impl DrainState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            generation: AtomicU64::new(0),
+            inner: Mutex::new(DrainDescriptor::default()),
+        }
+    }
+
+    /// A clone of the drain flag to hand to a dispatch producer.
+    #[must_use]
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        self.flag.clone()
+    }
+
+    /// Whether new dispatch is currently paused for a drain.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// The current generation — the token a supervisor compares against to
+    /// detect it has been superseded/aborted.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of the descriptor for status rendering.
+    #[must_use]
+    pub fn snapshot(&self) -> DrainDescriptor {
+        self.inner.lock().expect("Drain mutex poisoned").clone()
+    }
+
+    /// Start a drain, or ack an already-running one (idempotent — a second drain
+    /// request while DRAINING neither stacks a supervisor nor moves the
+    /// deadline). Sets the drain flag on a fresh start.
+    pub fn begin(&self, timeout: Duration, force_after_timeout: bool) -> DrainBegin {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if inner.active {
+            return DrainBegin::AlreadyDraining;
+        }
+        let deadline = Utc::now()
+            + chrono::Duration::from_std(timeout).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        inner.active = true;
+        inner.deadline = Some(deadline);
+        inner.force_after_timeout = force_after_timeout;
+        inner.note = None;
+        // Set the flag while holding the descriptor lock so status can never
+        // observe `flag=true` with `active=false`.
+        self.flag.store(true, Ordering::Relaxed);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        DrainBegin::Started {
+            generation,
+            deadline,
+        }
+    }
+
+    /// Abort an in-progress drain: clear the flag, bump the generation (so the
+    /// running supervisor stops without exiting), and record a note. Returns
+    /// `true` when a drain was actually in progress.
+    pub fn abort(&self) -> bool {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if !inner.active {
+            return false;
+        }
+        self.flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.note = Some("drain aborted by operator — dispatch resumed".to_string());
+        true
+    }
+
+    /// The supervisor's fail-safe timeout path: clear the flag, bump the
+    /// generation, and record the refusal note so status explains why the
+    /// daemon stayed up.
+    fn resolve_timeout(&self, note: String) {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        self.flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.note = Some(note);
+    }
+}
+
+/// The three terminal/continue decisions a drain-supervisor poll can reach
+/// (Issue #4090). Extracted as a pure function so the "2 → 1 → 0" and
+/// timeout-vs-force logic is unit-testable without spawning a task or calling
+/// `std::process::exit`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DrainTick {
+    /// Sweeps still in flight and the deadline has not passed — keep waiting.
+    Continue,
+    /// Zero in-flight — restart now (exit `EXIT_RESTART`).
+    Complete,
+    /// Deadline passed with sweeps still in flight and no force — refuse the
+    /// restart, resume dispatch, stay up.
+    TimedOutRefuse,
+    /// Deadline passed with sweeps still in flight and `--force-after-timeout` —
+    /// cancel the stragglers, then restart.
+    TimedOutForce,
+}
+
+/// Decide a single drain-supervisor poll (Issue #4090). Zero in-flight always
+/// wins (even at/after the deadline: everything drained, so restart), otherwise
+/// a passed deadline is refused (fail-safe) or forced.
+#[must_use]
+pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -> DrainTick {
+    if in_flight == 0 {
+        DrainTick::Complete
+    } else if past_deadline {
+        if force {
+            DrainTick::TimedOutForce
+        } else {
+            DrainTick::TimedOutRefuse
+        }
+    } else {
+        DrainTick::Continue
+    }
+}
+
+/// Count non-terminal (`Pending` / `Running`) sweeps across **every** managed
+/// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
+/// accounting so a drain never reads only the primary registry and restarts
+/// while a secondary managed repo still has live sweeps.
+// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
+#[allow(clippy::expect_used)]
+#[must_use]
+pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
+    let mut count = 0;
+    for root in &roots {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry.lock().expect("Sweep registry mutex poisoned");
+        count += sr
+            .list(None)
+            .into_iter()
+            .filter(|info| !info.state.is_terminal())
+            .count();
+    }
+    count
+}
+
+/// Cancel every in-flight sweep across all managed roots via the existing
+/// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
+/// Returns the number cancelled. Blocking cancel is acceptable here: this runs
+/// only on the rare force-timeout path, moments before the process exits.
+// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
+#[allow(clippy::expect_used)]
+fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
+    let mut cancelled = 0;
+    for root in &roots {
+        let registry = workspace_pool.get_or_provision(root);
+        let ids: Vec<String> = {
+            let sr = registry.lock().expect("Sweep registry mutex poisoned");
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| info.sweep_id)
+                .collect()
+        };
+        for id in ids {
+            let mut sr = registry.lock().expect("Sweep registry mutex poisoned");
+            if sr.cancel(&id, Duration::from_secs(5)).is_ok() {
+                cancelled += 1;
+            }
+        }
+    }
+    cancelled
+}
+
+/// Handle a `DrainAndRestartDaemon` request (Issue #4090): check supervision up
+/// front (AC5 — refuse *before* pausing dispatch), then start the drain and
+/// spawn its supervisor task. Returns the `DaemonDrain` response to send back.
+///
+/// Must be called from within a tokio runtime context (the connection handler
+/// is) so it can spawn the supervisor.
+fn handle_drain_request(
+    drain: &Arc<DrainState>,
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+    event_bus: &Arc<EventBus>,
+    timeout_secs: Option<u64>,
+    force_after_timeout: bool,
+) -> Response {
+    // AC5 / Finding 4: prove supervision BEFORE entering DRAINING. Draining for
+    // 20 minutes and only then discovering there is no supervisor to relaunch
+    // into is the worst possible ordering — and pausing dispatch then refusing
+    // would be a silent outage.
+    let supervisor = match detect_supervisor() {
+        Some(s) => s,
+        None => {
+            return Response::DaemonDrain {
+                accepted: false,
+                supervisor: None,
+                in_flight: count_in_flight_sweeps(workspace_pool, fallback_root),
+                message: "refusing to drain: no supervisor detected \
+                    (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
+                    launchd, so nothing would relaunch it after a drain. Dispatch was \
+                    NOT paused. Restart manually with loom-daemon-stop.sh && \
+                    loom-daemon-start.sh."
+                    .to_string(),
+            };
+        }
+    };
+
+    let in_flight = count_in_flight_sweeps(workspace_pool, fallback_root);
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS));
+
+    match drain.begin(timeout, force_after_timeout) {
+        DrainBegin::Started {
+            generation,
+            deadline,
+        } => {
+            let _ = event_bus.publish_generic(
+                "daemon.drain.started",
+                serde_json::json!({
+                    "in_flight": in_flight,
+                    "timeout_secs": timeout.as_secs(),
+                    "force_after_timeout": force_after_timeout,
+                    "deadline": deadline,
+                }),
+            );
+            let drain_task = drain.clone();
+            let pool_task = workspace_pool.clone();
+            let root_task = fallback_root.to_path_buf();
+            let bus_task = event_bus.clone();
+            tokio::spawn(async move {
+                run_drain_supervisor(
+                    drain_task,
+                    pool_task,
+                    root_task,
+                    bus_task,
+                    generation,
+                    DRAIN_POLL_INTERVAL,
+                )
+                .await;
+            });
+            let msg = if in_flight == 0 {
+                format!("drain scheduled ({supervisor}-supervised): 0 in-flight — restarting now.")
+            } else {
+                format!(
+                    "drain scheduled ({supervisor}-supervised): {in_flight} in-flight sweep(s); \
+                     new dispatch paused. Will restart when drained, or {} at the deadline.",
+                    if force_after_timeout {
+                        "cancel stragglers and restart"
+                    } else {
+                        "refuse and resume dispatch"
+                    }
+                )
+            };
+            Response::DaemonDrain {
+                accepted: true,
+                supervisor: Some(supervisor),
+                in_flight,
+                message: msg,
+            }
+        }
+        DrainBegin::AlreadyDraining => Response::DaemonDrain {
+            accepted: true,
+            supervisor: Some(supervisor),
+            in_flight,
+            message: format!(
+                "already draining (idempotent): {in_flight} in-flight sweep(s); the existing \
+                 deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+            ),
+        },
+    }
+}
+
+/// The drain-supervisor loop (Issue #4090). Polls the cross-root in-flight count
+/// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
+/// timeout it clears the drain flag and stays up. Stops without exiting if it
+/// has been superseded (a new drain) or aborted (generation moved on).
+async fn run_drain_supervisor(
+    drain: Arc<DrainState>,
+    workspace_pool: Arc<WorkspacePool>,
+    fallback_root: PathBuf,
+    event_bus: Arc<EventBus>,
+    my_generation: u64,
+    poll_interval: Duration,
+) {
+    loop {
+        // Superseded / aborted: a newer drain or an abort bumped the generation,
+        // so this supervisor is stale — stop WITHOUT ending the process. This is
+        // the "abort then the queue empties anyway" guard (AC6): a stale
+        // supervisor must never fire a restart.
+        if drain.generation() != my_generation {
+            log::info!(
+                "drain supervisor (gen {my_generation}) superseded/aborted (current gen {}) — \
+                 stopping without restart",
+                drain.generation()
+            );
+            return;
+        }
+
+        let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
+        let (past_deadline, force) = {
+            let snap = drain.snapshot();
+            let past = snap.deadline.is_some_and(|d| Utc::now() >= d);
+            (past, snap.force_after_timeout)
+        };
+
+        match evaluate_drain_tick(in_flight, past_deadline, force) {
+            DrainTick::Continue => {
+                tokio::time::sleep(poll_interval).await;
+            }
+            DrainTick::Complete => {
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.completed",
+                    serde_json::json!({ "in_flight": 0 }),
+                );
+                log::warn!(
+                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a launchd \
+                     KeepAlive:SuccessfulExit relaunch. No sweep was killed; no orphan left behind."
+                );
+                std::process::exit(EXIT_RESTART);
+            }
+            DrainTick::TimedOutRefuse => {
+                let note = format!(
+                    "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
+                     (no --force-after-timeout); dispatch resumed, daemon stays up"
+                );
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.timeout",
+                    serde_json::json!({ "in_flight": in_flight, "forced": false }),
+                );
+                log::warn!("{note}");
+                drain.resolve_timeout(note);
+                return;
+            }
+            DrainTick::TimedOutForce => {
+                let cancelled = cancel_all_in_flight(&workspace_pool, &fallback_root);
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.timeout",
+                    serde_json::json!({
+                        "in_flight": in_flight,
+                        "forced": true,
+                        "cancelled": cancelled,
+                    }),
+                );
+                log::warn!(
+                    "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
+                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
+                );
+                std::process::exit(EXIT_RESTART);
+            }
+        }
+    }
+}
 
 /// Returns `true` if a live `loom-daemon` is currently listening on
 /// `socket_path` and actively servicing requests.
@@ -120,6 +642,15 @@ pub struct IpcServer {
     /// empty (#3930). In the common single-workspace case this is the only root
     /// the `DaemonStatus` per-repo breakdown enumerates.
     fallback_root: PathBuf,
+    /// Startup forge-credential preflight snapshot (#4005), resolved once at
+    /// daemon boot (`main.rs`, before the claim-reconciliation startup pass)
+    /// and threaded in read-only so `DaemonStatus` can report it without a
+    /// re-probe on every status query.
+    credential_preflight: Arc<CredentialPreflightReport>,
+    /// Shared drain-and-restart coordination state (#4090). The same `Arc` whose
+    /// flag is OR'd into the dispatch producers' halt checks; the IPC handler
+    /// sets/aborts it and the `DaemonStatus` snapshot renders it.
+    drain_state: Arc<DrainState>,
 }
 
 impl IpcServer {
@@ -133,6 +664,8 @@ impl IpcServer {
         health_states: Arc<WorkspaceHealthStates>,
         workspace_pool: Arc<WorkspacePool>,
         fallback_root: PathBuf,
+        credential_preflight: CredentialPreflightReport,
+        drain_state: Arc<DrainState>,
     ) -> Self {
         Self {
             socket_path,
@@ -143,6 +676,8 @@ impl IpcServer {
             health_states,
             workspace_pool,
             fallback_root,
+            credential_preflight: Arc::new(credential_preflight),
+            drain_state,
         }
     }
 
@@ -179,9 +714,22 @@ impl IpcServer {
                     let health = self.health_states.clone();
                     let pool = self.workspace_pool.clone();
                     let fallback = self.fallback_root.clone();
+                    let credential_preflight = self.credential_preflight.clone();
+                    let drain = self.drain_state.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_client(stream, tm, db, sr, bus, health, pool, fallback).await
+                        if let Err(e) = handle_client(
+                            stream,
+                            tm,
+                            db,
+                            sr,
+                            bus,
+                            health,
+                            pool,
+                            fallback,
+                            credential_preflight,
+                            drain,
+                        )
+                        .await
                         {
                             log::error!("Client error: {e}");
                         }
@@ -205,6 +753,8 @@ async fn handle_client(
     health_states: Arc<WorkspaceHealthStates>,
     workspace_pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
+    credential_preflight: Arc<CredentialPreflightReport>,
+    drain_state: Arc<DrainState>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -270,11 +820,99 @@ async fn handle_client(
         // filesystem reads for the dynamic-cap inputs); per-token usage is left
         // to the CLI (a slow network probe) so this handler never blocks.
         if let Request::DaemonStatus = request {
-            let report = build_daemon_status(&workspace_pool, &health_states, &fallback_root);
+            // Pre-warm the memoized CPU idle-fraction sample off the runtime
+            // (#4031): the macOS `iostat` read sleeps ~1s, so it must never run
+            // inline on a tokio worker. `build_daemon_status` then reads the
+            // freshly-cached value without blocking. A memoized-fresh sample
+            // (within the TTL) makes this a no-op. `spawn_blocking` join errors
+            // are non-fatal — the status falls back to the last cached value.
+            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
+            let report = build_daemon_status_with_drain(
+                &workspace_pool,
+                &health_states,
+                &fallback_root,
+                &credential_preflight,
+                &drain_state,
+            );
             let response = Response::DaemonStatus(report);
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // DrainAndRestartDaemon / AbortDrain (Issue #4090). Handled here — like
+        // RestartDaemon — because the drain must ack immediately and then exit
+        // *minutes* later from a background supervisor task, which the inline
+        // per-connection handler cannot do. The supervisor is spawned inside
+        // `handle_drain_request`; this handler just acks and moves on.
+        if let Request::DrainAndRestartDaemon {
+            timeout_secs,
+            force_after_timeout,
+        } = request
+        {
+            let response = handle_drain_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+                timeout_secs,
+                force_after_timeout,
+            );
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
+        if let Request::AbortDrain = request {
+            let was_draining = drain_state.abort();
+            let _ = event_bus.publish_generic(
+                "daemon.drain.aborted",
+                serde_json::json!({ "was_draining": was_draining }),
+            );
+            let message = if was_draining {
+                "drain aborted — dispatch resumed; no restart will fire (even if in-flight \
+                 later reaches zero)."
+                    .to_string()
+            } else {
+                "no drain in progress — nothing to abort (no-op).".to_string()
+            };
+            let response = Response::DaemonDrain {
+                accepted: was_draining,
+                supervisor: detect_supervisor(),
+                in_flight: count_in_flight_sweeps(&workspace_pool, &fallback_root),
+                message,
+            };
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // RestartDaemon (Issue #4054) is handled here rather than in the
+        // synchronous `handle_request` dispatcher so the supervised path can
+        // reply to the client and FLUSH before ending the process — the
+        // operator / Phase-3 caller gets a clean ack, then the daemon exits 0
+        // for a launchd `KeepAlive:SuccessfulExit` relaunch. On an unsupervised
+        // host it returns `DaemonRestart { scheduled: false }` and keeps running
+        // (do_exit == false). Mirrors the CancelSweep/DaemonStatus interception.
+        if let Request::RestartDaemon = request {
+            let (response, do_exit) = build_restart_decision();
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            if do_exit {
+                log::warn!(
+                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a launchd \
+                     KeepAlive:SuccessfulExit relaunch. In-flight sweeps survive by design; \
+                     the relaunched daemon re-reads the same plist (exactly its start flags). \
+                     The stale socket is reclaimed by the relaunched daemon's singleton guard."
+                );
+                std::process::exit(EXIT_RESTART);
+            }
             continue;
         }
 
@@ -458,6 +1096,7 @@ pub fn build_daemon_status(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &WorkspaceHealthStates,
     fallback_root: &Path,
+    credential_preflight: &CredentialPreflightReport,
 ) -> DaemonStatusReport {
     // Enumerate every registered managed workspace (Issue #3930). An empty
     // registry yields `[fallback_root]`, so the common single-workspace case is
@@ -497,6 +1136,10 @@ pub fn build_daemon_status(
             // Name the actual failure class (#3974 AC2) rather than letting the
             // renderer assume "dirty tree" for every unevaluated tick.
             health_gate_not_evaluated_reason: health_states.unevaluated_summary(root),
+            // Resolved daemon-side (this process's own env + this root's own
+            // `.loom/config.json`), never the CLI client's environment (#4012).
+            health_gate_enabled: Some(crate::main_health_gate::effective_enabled(root)),
+            health_gate_verdict_at: health_states.last_verdict_at(root),
         });
         in_flight.extend(live);
     }
@@ -517,19 +1160,28 @@ pub fn build_daemon_status(
     let workspace_root = fallback_root;
     let token_pool_size = crate::tokens::token_pool_size(workspace_root);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
-    // CPU/load headroom (#3978) — a host-level resource (not per-repo), read
-    // fresh on every status request just like disk headroom.
-    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
-    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
-    let cpu_headroom = crate::cpu_headroom::cpu_headroom(
-        logical_cpus,
-        loadavg_1m,
-        crate::cpu_headroom::utilization_target(),
-        crate::cpu_headroom::est_cores_per_sweep(),
-    );
+    // Hoisted above the CPU snapshot (#4032) so the resolved
+    // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
+    // was already happening six lines below; moving it up is not a new config
+    // read, just a reorder so status and dispatch resolve through the same
+    // env > config > default path (`resolve_cpu_utilization_target` /
+    // `resolve_cpu_est_cores_per_sweep`, single-root, matching
+    // `resolve_per_token_concurrency`).
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
+    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
+    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
+    // CPU headroom (#3978, measured-idle signal #4031) — a host-level resource
+    // (not per-repo). The snapshot reads the memoized idle fraction (never
+    // blocks; the caller pre-warms it via `spawn_blocking(refresh_cpu_util_cache)`
+    // before invoking `build_daemon_status`) plus a fast fresh loadavg read.
+    let cpu_snapshot =
+        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
+    let logical_cpus = cpu_snapshot.logical_cpus;
+    let loadavg_1m = cpu_snapshot.loadavg_1m;
+    let cpu_idle_fraction = cpu_snapshot.idle_fraction;
+    let cpu_headroom = cpu_snapshot.cpu_headroom;
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation
@@ -551,6 +1203,11 @@ pub fn build_daemon_status(
     let token_bound = token_axis_effective <= disk_headroom
         && token_axis_effective <= cpu_headroom
         && token_axis_effective <= configured_max;
+    // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
+    // minimum of several ceilings, but a ceiling only *binds* once in-flight
+    // occupancy reaches it. Below the cap the limiter is work availability, not
+    // any resource term — so gate the token-bound diagnosis on real occupancy.
+    let capacity_bound = in_flight.len() >= dynamic_cap;
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
         total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
@@ -569,6 +1226,8 @@ pub fn build_daemon_status(
         cpu_headroom,
         logical_cpus,
         loadavg_1m,
+        cpu_idle_fraction,
+        capacity_bound,
         configured_max,
         per_token_concurrency,
         dynamic_cap,
@@ -577,9 +1236,42 @@ pub fn build_daemon_status(
         main_health_gate_halted: health_states.is_halted(fallback_root),
         main_health_gate_not_evaluated: health_states.is_unevaluated(fallback_root),
         main_health_gate_not_evaluated_reason: health_states.unevaluated_summary(fallback_root),
+        main_health_gate_enabled: Some(crate::main_health_gate::effective_enabled(fallback_root)),
+        main_health_gate_verdict_at: health_states.last_verdict_at(fallback_root),
         capacity,
         per_repo,
+        // Resolved once at daemon startup (#4005), threaded in read-only —
+        // never re-probed per status query.
+        credential_preflight: Some(credential_preflight.clone()),
+        // Drain fields default to "not draining" here; the drain-aware wrapper
+        // [`build_daemon_status_with_drain`] overlays live drain state (#4090).
+        // Keeping the base builder drain-agnostic preserves its many existing
+        // unit-test call sites unchanged.
+        draining: false,
+        drain_deadline: None,
+        drain_note: None,
     }
+}
+
+/// Like [`build_daemon_status`] but overlays the live drain-and-restart state
+/// (Issue #4090) so `loom-daemon status` can surface `DRAINING (n remaining,
+/// deadline …)`. The IPC `DaemonStatus` handler calls this; the base builder
+/// stays drain-agnostic for its existing tests.
+#[must_use]
+pub fn build_daemon_status_with_drain(
+    workspace_pool: &Arc<WorkspacePool>,
+    health_states: &WorkspaceHealthStates,
+    fallback_root: &Path,
+    credential_preflight: &CredentialPreflightReport,
+    drain: &DrainState,
+) -> DaemonStatusReport {
+    let mut report =
+        build_daemon_status(workspace_pool, health_states, fallback_root, credential_preflight);
+    let snap = drain.snapshot();
+    report.draining = drain.is_draining();
+    report.drain_deadline = snap.deadline;
+    report.drain_note = snap.note;
+    report
 }
 
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
@@ -1408,8 +2100,31 @@ fn handle_request(
         Request::RemoveWatch { id } => handle_remove_watch(&id),
 
         Request::Shutdown => {
-            log::info!("Shutdown requested");
-            std::process::exit(0);
+            // Exit NON-ZERO (Issue #4054): an explicit shutdown means "stay
+            // down", so under launchd `KeepAlive:SuccessfulExit` this must not
+            // trip a relaunch. Only `RestartDaemon` (handled in `handle_client`)
+            // exits 0. See the EXIT_* constants at the top of this module.
+            log::info!("Shutdown requested (exiting {EXIT_SHUTDOWN}; not a supervised relaunch)");
+            std::process::exit(EXIT_SHUTDOWN);
+        }
+        Request::RestartDaemon => {
+            // Structurally unreachable: `handle_client` intercepts
+            // `RestartDaemon` before dispatching to `handle_request` (it must
+            // reply-then-exit). Answer defensively in case of a future direct
+            // caller — do NOT exit here, only `handle_client` may end the
+            // process for a supervised relaunch.
+            build_restart_decision().0
+        }
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+            // Structurally unreachable: `handle_client` intercepts both drain
+            // requests (#4090) before dispatching here, because a drain must ack
+            // immediately and exit from a background supervisor task minutes
+            // later — state the connection-scoped `handle_request` cannot own.
+            Response::Error {
+                message: "internal: drain requests must be handled by handle_client, not \
+                          handle_request"
+                    .to_string(),
+            }
         }
     }
 }
@@ -1655,6 +2370,19 @@ mod tests {
         RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
             .handle()
             .clone()
+    }
+
+    /// A fixture credential-preflight snapshot for `build_daemon_status` tests
+    /// (#4005) — these tests exercise the dynamic-cap/health-gate machinery,
+    /// not credential resolution, so a fixed `Ok` snapshot keeps them focused.
+    fn test_credential_preflight() -> CredentialPreflightReport {
+        CredentialPreflightReport {
+            ok: true,
+            mechanism: "test-fixture".to_string(),
+            fingerprint: None,
+            message: "test fixture — not a real preflight".to_string(),
+            checked_at: Utc::now(),
+        }
     }
 
     /// A [`WorkspacePool`] for `handle_request` tests (Issue #3929). The
@@ -2093,7 +2821,9 @@ exit 0
     /// `dispatch_sweep` tool round-trip into over the Unix socket — so a
     /// regression here would have caught the incident regardless of which of
     /// those two client surfaces initiated the request. Asserts the spawned
-    /// child's env carries `LOOM_SWEEP_CLAIM_OWNED=<issue>` end-to-end.
+    /// child's env carries `LOOM_SWEEP_CLAIM_OWNED=<issue>` end-to-end, AND
+    /// (#4111) that its argv carries the equivalent `--claim-owned <issue>`
+    /// flag — the positional signal `/loom:sweep`'s pre-flight actually reads.
     #[test]
     #[serial_test::serial]
     fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
@@ -2137,6 +2867,13 @@ exit 0
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
             "expected the daemon-owned-child self-claim marker to reach the \
              spawned child via the IPC DispatchSweep handler; got: {recorded:?}"
+        );
+        // #4111: the positional argv flag must also reach the child via this
+        // same IPC path.
+        assert!(
+            recorded.contains("--claim-owned 3964"),
+            "expected --claim-owned 3964 in the spawned child's argv via the IPC \
+             DispatchSweep handler (#4111); got: {recorded:?}"
         );
     }
 
@@ -2652,12 +3389,16 @@ exit 0
             cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
+            cpu_idle_fraction: Some(0.90),
+            capacity_bound: false,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
             main_health_gate_halted: true,
             main_health_gate_not_evaluated: false,
             main_health_gate_not_evaluated_reason: None,
+            main_health_gate_enabled: Some(true),
+            main_health_gate_verdict_at: Some(chrono::Utc::now()),
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -2674,7 +3415,13 @@ exit 0
                 quarantined_issues: vec![101, 202],
                 health_gate_not_evaluated: false,
                 health_gate_not_evaluated_reason: None,
+                health_gate_enabled: Some(true),
+                health_gate_verdict_at: Some(chrono::Utc::now()),
             }],
+            credential_preflight: Some(test_credential_preflight()),
+            draining: false,
+            drain_deadline: None,
+            drain_note: None,
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -2686,6 +3433,8 @@ exit 0
                 assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
                 assert_eq!(r.loadavg_1m, Some(1.25));
+                assert_eq!(r.cpu_idle_fraction, Some(0.90));
+                assert!(!r.capacity_bound);
                 assert_eq!(r.configured_max, 5);
                 assert_eq!(r.dynamic_cap, 3);
                 assert!(r.main_health_gate_halted);
@@ -2700,9 +3449,135 @@ exit 0
                 assert_eq!(r.per_repo[0].in_flight_count, 0);
                 assert!(r.per_repo[0].health_gate_halted);
                 assert!(!r.per_repo[0].health_gate_not_evaluated);
+                assert_eq!(r.main_health_gate_enabled, Some(true));
+                assert!(r.main_health_gate_verdict_at.is_some());
+                assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
+                assert!(r.per_repo[0].health_gate_verdict_at.is_some());
+                assert_eq!(
+                    r.credential_preflight
+                        .as_ref()
+                        .map(|c| c.mechanism.as_str()),
+                    Some("test-fixture")
+                );
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
+    }
+
+    // ===== Supervised restart primitive (Issue #4054) =====
+
+    /// `Request::RestartDaemon` / `Response::DaemonRestart` must survive a serde
+    /// round-trip over the wire (same pattern as the Ping/Pong + DaemonStatus
+    /// round-trips above).
+    #[test]
+    fn test_restart_daemon_request_response_round_trip() {
+        // Request: unit variant, `{"type":"RestartDaemon"}`.
+        let req = Request::RestartDaemon;
+        let json = serde_json::to_string(&req).expect("serialize request");
+        assert_eq!(json, r#"{"type":"RestartDaemon"}"#);
+        let back: Request = serde_json::from_str(&json).expect("deserialize request");
+        assert!(matches!(back, Request::RestartDaemon));
+
+        // Response (supervised / scheduled).
+        let resp = Response::DaemonRestart {
+            scheduled: true,
+            supervisor: Some("launchd".to_string()),
+            message: "restart scheduled".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize response");
+        let back: Response = serde_json::from_str(&json).expect("deserialize response");
+        match back {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                message,
+            } => {
+                assert!(scheduled);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+                assert_eq!(message, "restart scheduled");
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // Response (unsupervised / refused).
+        let resp = Response::DaemonRestart {
+            scheduled: false,
+            supervisor: None,
+            message: "refused".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize response");
+        let back: Response = serde_json::from_str(&json).expect("deserialize response");
+        match back {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(!scheduled);
+                assert!(supervisor.is_none());
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+    }
+
+    /// `build_restart_decision` ends the process (do_exit == true) ONLY when the
+    /// daemon proves it is launchd-supervised via `LOOM_DAEMON_SUPERVISOR`; an
+    /// unsupervised host refuses and stays running. Also pins the shutdown-intent
+    /// exit-code contract (#4054): only the restart primitive exits 0, so under
+    /// launchd `KeepAlive:SuccessfulExit` it is the only path that relaunches.
+    ///
+    /// NOTE: this is the sole test touching `LOOM_DAEMON_SUPERVISOR`, so the
+    /// env-var mutation cannot race another test reading it.
+    #[test]
+    fn test_build_restart_decision_supervisor_gated() {
+        // Exit-code contract: exactly one exit-0 path.
+        assert_eq!(EXIT_RESTART, 0, "restart is the only successful (relaunch) exit");
+        assert_ne!(EXIT_SIGTERM, 0, "SIGTERM stop must be non-zero (no relaunch)");
+        assert_ne!(EXIT_SIGINT, 0, "SIGINT/Ctrl-C must be non-zero (no relaunch)");
+        assert_ne!(EXIT_SHUTDOWN, 0, "explicit Shutdown must be non-zero (no relaunch)");
+
+        // Supervised: scheduled + do_exit.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
+        assert_eq!(detect_supervisor().as_deref(), Some("launchd"));
+        let (resp, do_exit) = build_restart_decision();
+        assert!(do_exit, "supervised daemon must end its process for a relaunch");
+        match resp {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(scheduled);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // Case-insensitive acceptance.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "LaunchD");
+        assert_eq!(detect_supervisor().as_deref(), Some("launchd"));
+
+        // Unsupervised (var unset): refuse, keep running.
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
+        assert!(detect_supervisor().is_none());
+        let (resp, do_exit) = build_restart_decision();
+        assert!(!do_exit, "unsupervised daemon must NOT exit — nothing would relaunch it");
+        match resp {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(!scheduled);
+                assert!(supervisor.is_none());
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // An unrelated value is also unsupervised.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "systemd");
+        assert!(detect_supervisor().is_none());
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
     }
 
     /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field, no
@@ -2726,6 +3601,87 @@ exit 0
         assert_eq!(report.cpu_headroom, 0);
         assert_eq!(report.logical_cpus, 0);
         assert_eq!(report.loadavg_1m, None);
+        // Absent pre-#4012 fields must default to `None` — NOT `false` — so a
+        // legacy payload from an older, perfectly healthy daemon is read as
+        // "unknown" rather than misreported as "gate disabled" (#4012).
+        assert_eq!(
+            report.main_health_gate_enabled, None,
+            "absent main_health_gate_enabled (#4012) must default to None, not Some(false)"
+        );
+        assert_eq!(
+            report.main_health_gate_verdict_at, None,
+            "absent main_health_gate_verdict_at (#4012) defaults to None (reads as pending)"
+        );
+        // Absent pre-#4031 fields default rather than failing to parse: no
+        // measured idle fraction, and "not capacity-bound".
+        assert_eq!(report.cpu_idle_fraction, None);
+        assert!(!report.capacity_bound);
+    }
+
+    /// `build_daemon_status` sets `capacity_bound` only when in-flight occupancy
+    /// has actually reached the dynamic cap (#4031) — the "currently binding" vs
+    /// "smallest ceiling" distinction. With a real token pool (cap > 0) and no
+    /// in-flight sweeps, the cap is a ceiling but is NOT binding.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
+        let tokens_dir = root.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_dir).unwrap();
+        std::fs::write(tokens_dir.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        std::fs::write(tokens_dir.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // No sweeps in flight, cap > 0 ⇒ the cap is a ceiling but NOT binding.
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert!(report.dynamic_cap > 0, "two tokens should yield a positive cap");
+        assert!(report.in_flight.is_empty());
+        assert!(
+            !report.capacity_bound,
+            "0 in-flight against cap {} must not be capacity-bound",
+            report.dynamic_cap
+        );
+
+        // Fill the cap: dispatch sweeps until in-flight reaches the cap.
+        let cap = report.dynamic_cap;
+        {
+            let mut reg = sr.lock().unwrap();
+            for i in 0..cap {
+                reg.dispatch(
+                    &crate::types::SweepKind::Issue(4031 + i as u32),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("dispatch");
+            }
+        }
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.in_flight.len(), cap);
+        assert!(
+            report.capacity_bound,
+            "{cap} in-flight against cap {cap} must be capacity-bound",
+        );
+
+        if let Some(v) = prev_shared {
+            std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
+        } else {
+            std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
+        }
     }
 
     /// `build_daemon_status` reflects the per-repo main-health halt flag and
@@ -2758,7 +3714,7 @@ exit 0
         let health = WorkspaceHealthStates::new();
 
         // Fresh state: not halted, no sweeps.
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(!report.main_health_gate_halted);
         assert!(report.in_flight.is_empty());
         // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
@@ -2769,6 +3725,37 @@ exit 0
         assert_eq!(report.per_repo[0].root, root);
         assert_eq!(report.per_repo[0].in_flight_count, 0);
         assert!(!report.per_repo[0].health_gate_halted);
+        // No `.loom/config.json` buildGate/autonomous block exists yet, so the
+        // gate is effectively disabled for this root (#4012).
+        assert_eq!(report.main_health_gate_enabled, Some(false));
+        assert_eq!(report.per_repo[0].health_gate_enabled, Some(false));
+        assert_eq!(report.main_health_gate_verdict_at, None);
+        assert_eq!(report.per_repo[0].health_gate_verdict_at, None);
+
+        // #4012: a root the gate loop HAS never evaluated (no verdict yet)
+        // reports the same `Some(false)`/`None` pair while genuinely disabled
+        // -- but once the config turns the gate on, a fresh `MainHealthState`
+        // reports "enabled, pending" (verdict_at still `None`), NOT "clear".
+        // This is the exact ambiguity the issue is about: `pending` and
+        // `disabled` both still allow dispatch, but they must not be
+        // confused with `clear` (verified green).
+        std::env::remove_var(crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV);
+        std::fs::write(
+            root.join(".loom").join("config.json"),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(
+            report.main_health_gate_enabled,
+            Some(true),
+            "config now enables the gate for this root"
+        );
+        assert_eq!(
+            report.main_health_gate_verdict_at, None,
+            "no gate run has completed yet -- must report pending, not clear"
+        );
+        assert!(!report.main_health_gate_halted, "pending must still read as dispatch-allowed");
 
         // Dispatch a sweep -> it should show up as in-flight (Running).
         {
@@ -2776,7 +3763,7 @@ exit 0
             reg.dispatch(&crate::types::SweepKind::Issue(3891), None, None, None, None)
                 .expect("dispatch");
         }
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert_eq!(report.in_flight.len(), 1);
         assert!(matches!(report.in_flight[0].kind, crate::types::SweepKind::Issue(3891)));
         assert_eq!(report.per_repo[0].in_flight_count, 1);
@@ -2784,7 +3771,7 @@ exit 0
         // Flip the halt flag for this root -> the report tracks it (top-level and
         // per-repo).
         health.set_halted(&root, true);
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(report.main_health_gate_halted);
         assert!(report.per_repo[0].health_gate_halted);
         assert!(!report.main_health_gate_not_evaluated, "no skip has happened yet");
@@ -2801,7 +3788,7 @@ exit 0
             )),
             std::time::Duration::from_secs(3600),
         );
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(report.main_health_gate_halted, "prior halt persists through a skip");
         assert!(report.main_health_gate_not_evaluated, "skip surfaces as not-evaluated");
         assert!(report.per_repo[0].health_gate_halted);
@@ -2870,7 +3857,7 @@ exit 0
                 .expect("dispatch");
         }
 
-        let report = build_daemon_status(&pool, &health, &root_a);
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
         assert_eq!(report.per_repo.len(), 2, "both managed repos are listed");
         // Union of in-flight across repos = repo A's single sweep.
         assert_eq!(report.in_flight.len(), 1);
@@ -2889,6 +3876,16 @@ exit 0
         assert!(!a.health_gate_halted, "repo A is green");
         assert_eq!(b.in_flight_count, 0, "repo B has no sweeps");
         assert!(b.health_gate_halted, "repo B is red, independently of A");
+        // Neither repo has a `.loom/config.json` buildGate block, so both
+        // resolve as effectively disabled (#4012) — independent of the raw
+        // halt flag test-injected directly on repo B above (`set_halted`
+        // bypasses the gate loop's own disabled soft-fail path, so this
+        // combination only arises in a test; the renderer must still prefer
+        // "halted" over "disabled" when both are true, see `main.rs`).
+        assert_eq!(a.health_gate_enabled, Some(false));
+        assert_eq!(b.health_gate_enabled, Some(false));
+        assert_eq!(a.health_gate_verdict_at, None);
+        assert_eq!(b.health_gate_verdict_at, None);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
@@ -3158,5 +4155,337 @@ exit 0
         }
 
         std::env::remove_var(crate::watch_registry::WATCHES_PATH_ENV);
+    }
+
+    // ===== Scheduled drain-and-restart (Issue #4090) =====
+
+    /// The pure drain-decision function (AC2 / AC3): zero in-flight always
+    /// completes (restart), even at/after the deadline; a passed deadline with
+    /// sweeps still in flight refuses (fail-safe) or forces per the flag; before
+    /// the deadline it keeps waiting.
+    #[test]
+    fn test_evaluate_drain_tick_decisions() {
+        // Still in flight, deadline not reached ⇒ keep waiting.
+        assert_eq!(evaluate_drain_tick(2, false, false), DrainTick::Continue);
+        assert_eq!(evaluate_drain_tick(1, false, true), DrainTick::Continue);
+        // Zero in-flight ⇒ complete regardless of deadline/force.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(evaluate_drain_tick(0, true, false), DrainTick::Complete);
+        assert_eq!(evaluate_drain_tick(0, true, true), DrainTick::Complete);
+        // Deadline passed with work left: refuse (fail-safe) vs. force.
+        assert_eq!(evaluate_drain_tick(3, true, false), DrainTick::TimedOutRefuse);
+        assert_eq!(evaluate_drain_tick(3, true, true), DrainTick::TimedOutForce);
+    }
+
+    /// The "2 → 1 → 0" completion sequence (AC2): a supervisor stepping through
+    /// a decreasing in-flight count keeps waiting until it hits exactly zero,
+    /// then completes exactly once. Driven through the pure decision function so
+    /// no process actually exits.
+    #[test]
+    fn test_drain_tick_completes_only_at_zero() {
+        let mut completed = 0;
+        for n in [2usize, 1, 0] {
+            match evaluate_drain_tick(n, false, false) {
+                DrainTick::Continue => assert!(n > 0, "must still be waiting while n>0"),
+                DrainTick::Complete => {
+                    assert_eq!(n, 0, "must only complete at zero");
+                    completed += 1;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(completed, 1, "completes exactly once, at n==0");
+    }
+
+    /// The `DrainState` machine: begin sets the flag and a deadline, a second
+    /// begin is idempotent (does not stack / move the deadline), abort clears
+    /// the flag and bumps the generation, and the timeout path clears + notes.
+    #[test]
+    fn test_drain_state_lifecycle() {
+        let drain = DrainState::new();
+        assert!(!drain.is_draining());
+        assert_eq!(drain.generation(), 0);
+
+        // begin ⇒ Started, flag set, deadline recorded, generation bumped.
+        let (gen1, deadline) = match drain.begin(Duration::from_secs(120), false) {
+            DrainBegin::Started {
+                generation,
+                deadline,
+            } => (generation, deadline),
+            other => panic!("expected Started, got {other:?}"),
+        };
+        assert!(drain.is_draining());
+        assert_eq!(gen1, 1);
+        assert_eq!(drain.snapshot().deadline, Some(deadline));
+        assert!(!drain.snapshot().force_after_timeout);
+
+        // A second begin while already draining is idempotent: same generation,
+        // same deadline, flag still set (AC edge: second drain does not stack).
+        match drain.begin(Duration::from_secs(9999), true) {
+            DrainBegin::AlreadyDraining => {}
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
+        assert_eq!(
+            drain.snapshot().deadline,
+            Some(deadline),
+            "idempotent begin does not move the deadline"
+        );
+
+        // abort ⇒ flag cleared, generation bumped (so a live supervisor stops),
+        // note recorded.
+        assert!(drain.abort());
+        assert!(!drain.is_draining());
+        assert_eq!(drain.generation(), gen1 + 1);
+        assert!(drain.snapshot().note.unwrap().contains("aborted"));
+        // abort again ⇒ no-op.
+        assert!(!drain.abort());
+
+        // timeout resolution clears + notes + bumps generation.
+        let gen_before = drain.generation();
+        let _ = drain.begin(Duration::from_secs(1), false);
+        drain.resolve_timeout("timed out".to_string());
+        assert!(!drain.is_draining());
+        assert_eq!(drain.snapshot().note.as_deref(), Some("timed out"));
+        assert!(drain.generation() > gen_before);
+    }
+
+    /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
+    /// is refused with `accepted: false` **and the drain flag is never set** —
+    /// pausing dispatch then refusing would be a silent outage.
+    ///
+    /// NOTE: shares the `LOOM_DAEMON_SUPERVISOR` env with
+    /// `test_build_restart_decision_supervisor_gated`; `#[serial]` keeps them
+    /// from racing the process-global env var.
+    #[test]
+    #[serial_test::serial]
+    fn test_drain_request_unsupervised_refuses_without_pausing() {
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let bus = Arc::new(EventBus::new());
+        let drain = Arc::new(DrainState::new());
+
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                supervisor,
+                ..
+            } => {
+                assert!(!accepted, "unsupervised host must refuse the drain");
+                assert!(supervisor.is_none());
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(!drain.is_draining(), "refused drain must NOT pause dispatch");
+        assert_eq!(drain.generation(), 0, "refused drain must not bump generation");
+
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Cross-root in-flight counting (Finding 5): sweeps live in the SECONDARY
+    /// managed repo only must still be counted, so a drain that reads them does
+    /// not restart while that repo has live work. Also asserts terminal sweeps
+    /// are excluded.
+    #[test]
+    #[serial_test::serial]
+    fn test_count_in_flight_sweeps_cross_root() {
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_b, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        let canon_a = normalize_path(&root_a);
+        let canon_b = normalize_path(&root_b);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a);
+        pool.seed(canon_b.clone(), sr_b.clone());
+
+        // No sweeps anywhere ⇒ zero.
+        assert_eq!(count_in_flight_sweeps(&pool, &canon_a), 0);
+
+        // Dispatch a live sweep into the SECONDARY repo only.
+        {
+            let mut reg_b = sr_b.lock().unwrap();
+            reg_b
+                .dispatch(&crate::types::SweepKind::Issue(4090), None, None, None, None)
+                .expect("dispatch");
+        }
+        // Counted even though the primary (root_a) registry is empty — a drain
+        // reading only the primary would wrongly see zero and restart.
+        assert_eq!(
+            count_in_flight_sweeps(&pool, &canon_a),
+            1,
+            "a live sweep in the secondary repo must be counted"
+        );
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// A pre-#4090 `DaemonStatus` JSON payload (no `drain` fields) still
+    /// deserializes — `#[serde(default)]` fills `draining: false` and leaves the
+    /// deadline/note `None` (mirrors the `capacity_bound` compat rationale).
+    #[test]
+    fn test_daemon_status_backward_compat_missing_drain_fields() {
+        let legacy = r#"{"in_flight":[],"token_pool_size":2,"disk_headroom":9,"configured_max":3,"dynamic_cap":2,"main_health_gate_halted":false}"#;
+        let report: DaemonStatusReport =
+            serde_json::from_str(legacy).expect("legacy payload deserializes");
+        assert!(!report.draining, "absent draining (#4090) defaults to false");
+        assert_eq!(report.drain_deadline, None);
+        assert_eq!(report.drain_note, None);
+    }
+
+    /// The new drain fields round-trip through serde, and
+    /// `build_daemon_status_with_drain` overlays the live drain state onto the
+    /// base report (AC4).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_with_drain_overlays_state() {
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let health = WorkspaceHealthStates::new();
+        let drain = DrainState::new();
+
+        // No drain ⇒ overlay is a no-op.
+        let report = build_daemon_status_with_drain(
+            &pool,
+            &health,
+            &root,
+            &test_credential_preflight(),
+            &drain,
+        );
+        assert!(!report.draining);
+        assert_eq!(report.drain_deadline, None);
+
+        // Begin a drain ⇒ overlay reports draining + deadline.
+        let deadline = match drain.begin(Duration::from_secs(300), false) {
+            DrainBegin::Started { deadline, .. } => deadline,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        let report = build_daemon_status_with_drain(
+            &pool,
+            &health,
+            &root,
+            &test_credential_preflight(),
+            &drain,
+        );
+        assert!(report.draining);
+        assert_eq!(report.drain_deadline, Some(deadline));
+
+        // Round-trips over the wire.
+        let json = serde_json::to_string(&report).unwrap();
+        let back: DaemonStatusReport = serde_json::from_str(&json).unwrap();
+        assert!(back.draining);
+        assert_eq!(back.drain_deadline, Some(deadline));
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Wire-compat (Finding 3): the new `DrainAndRestartDaemon` variant
+    /// round-trips, and the untouched `RestartDaemon` unit variant STILL
+    /// serializes to exactly `{"type":"RestartDaemon"}`. The
+    /// `test_restart_daemon_request_response_round_trip` assertion above must
+    /// also keep passing unmodified.
+    #[test]
+    fn test_drain_request_wire_compat() {
+        // RestartDaemon is unchanged — byte-for-byte the pre-#4090 shape.
+        assert_eq!(
+            serde_json::to_string(&Request::RestartDaemon).unwrap(),
+            r#"{"type":"RestartDaemon"}"#
+        );
+
+        // The new variant round-trips with its payload.
+        let req = Request::DrainAndRestartDaemon {
+            timeout_secs: Some(600),
+            force_after_timeout: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::DrainAndRestartDaemon {
+                timeout_secs,
+                force_after_timeout,
+            } => {
+                assert_eq!(timeout_secs, Some(600));
+                assert!(force_after_timeout);
+            }
+            other => panic!("expected DrainAndRestartDaemon, got {other:?}"),
+        }
+
+        // AbortDrain round-trips (unit-with-payload-none shape).
+        let json = serde_json::to_string(&Request::AbortDrain).unwrap();
+        assert_eq!(json, r#"{"type":"AbortDrain"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::AbortDrain));
+
+        // The DaemonDrain response round-trips.
+        let resp = Response::DaemonDrain {
+            accepted: true,
+            supervisor: Some("launchd".to_string()),
+            in_flight: 3,
+            message: "draining".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::DaemonDrain {
+                accepted,
+                supervisor,
+                in_flight,
+                ..
+            } => {
+                assert!(accepted);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+                assert_eq!(in_flight, 3);
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+    }
+
+    /// Abort clears the flag and bumps the generation, so a supervisor holding
+    /// the old generation stops without exiting — even if in-flight later
+    /// reaches zero (AC6, the "abort then the queue empties anyway" race). We
+    /// assert the generation contract the async supervisor relies on rather than
+    /// spawning it (its Complete branch calls `process::exit`).
+    #[test]
+    fn test_abort_supersedes_running_supervisor_generation() {
+        let drain = DrainState::new();
+        let gen = match drain.begin(Duration::from_secs(300), false) {
+            DrainBegin::Started { generation, .. } => generation,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        // A supervisor captured `gen`; abort moves the generation on.
+        assert!(drain.abort());
+        assert_ne!(
+            drain.generation(),
+            gen,
+            "abort must bump the generation so the running supervisor detects supersession"
+        );
+        assert!(!drain.is_draining(), "abort resumes dispatch");
     }
 }
