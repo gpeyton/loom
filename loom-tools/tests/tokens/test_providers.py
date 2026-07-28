@@ -257,6 +257,37 @@ class TestBootstrapProvider:
         assert entry.get("drift") is True
         assert entry["provider"] == "openai"
 
+    def test_provider_survives_multi_source_override(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        # merge_accounts() rebuilds the Account in its override branch; the
+        # winning (repo) entry's provider must survive rather than silently
+        # resetting to the anthropic default.
+        home = mock_repo / "home-accounts.env"
+        home.write_text(
+            "ACCOUNT_EMAIL_1=a@b.com\n"
+            "ACCOUNT_KEY_1=sk-home\n"
+            "ACCOUNT_TOKEN_FILE_1=one.token\n",
+            encoding="utf-8",
+        )
+        (mock_repo / ".env").write_text(
+            "ACCOUNT_EMAIL_1=a@b.com\n"
+            "ACCOUNT_KEY_1=sk-repo\n"
+            "ACCOUNT_TOKEN_FILE_1=one.token\n"
+            "ACCOUNT_PROVIDER_1=OpenAI\n",
+            encoding="utf-8",
+        )
+        bootstrap_tokens(mock_repo, home_env_path=home)
+        idx = json.loads(
+            (mock_repo / ".loom" / "tokens" / "index.json").read_text()
+        )
+        entry = idx["accounts"][0]
+        assert entry["source"] == "repo-override"
+        assert entry["provider"] == "openai"
+        assert load_provider_map(mock_repo / ".loom" / "tokens") == {
+            "one": "openai"
+        }
+
 
 # ---------------------------------------------------------------------------
 # select: provider filtering
