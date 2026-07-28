@@ -6,6 +6,11 @@ triples and materializes them as per-account ``.token`` files inside
 fingerprints (truncated to 8 chars) so drift between the source and on-disk
 state can be detected without storing secret material.
 
+Each account may additionally declare an optional ``ACCOUNT_PROVIDER_N``
+(#12); it is normalized (lowercased/stripped) and recorded as the
+``provider`` field of that account's ``index.json`` entry, defaulting to
+``anthropic`` when absent so pre-#12 sources and manifests are unchanged.
+
 **Additive multi-source merge (#3695, #3698).** Accounts are read from up to
 three sources and merged so a set of Claude accounts can be declared **once**
 and shared across every workspace instead of duplicating ``ACCOUNT_*_N``
@@ -62,11 +67,13 @@ from loom_tools.common.logging import (
 )
 from loom_tools.common.paths import LoomPaths
 from loom_tools.tokens import monitor
+from loom_tools.tokens.providers import DEFAULT_PROVIDER, normalize_provider
 
 # ``ACCOUNT_<FIELD>_<N>=<value>`` — N is 1+ digits, FIELD is one of the
-# triple keys we recognize. Anchored to start of line.
+# triple keys we recognize (plus the optional ``PROVIDER``). Anchored to
+# start of line.
 _ENV_LINE_RE = re.compile(
-    r"^ACCOUNT_(EMAIL|KEY|TOKEN_FILE)_(\d+)\s*=\s*(.*)$"
+    r"^ACCOUNT_(EMAIL|KEY|TOKEN_FILE|PROVIDER)_(\d+)\s*=\s*(.*)$"
 )
 
 # Filename safety: lowercase letters, digits, dot, dash, underscore. Must
@@ -165,11 +172,19 @@ def parse_env_accounts(env_path: Path) -> dict[int, dict[str, str]]:
 
     Returns:
         Mapping from account index ``N`` to a dict with keys ``email``,
-        ``key``, and ``file`` (any subset may be present).
+        ``key``, ``file``, and the optional ``provider`` (#12 — any subset
+        may be present). ``provider`` is optional metadata, not part of the
+        completeness check: a lone ``ACCOUNT_PROVIDER_N`` never forms an
+        account.
     """
     accounts: dict[int, dict[str, str]] = {}
     text = env_path.read_text(encoding="utf-8", errors="replace")
-    field_to_key = {"EMAIL": "email", "KEY": "key", "TOKEN_FILE": "file"}
+    field_to_key = {
+        "EMAIL": "email",
+        "KEY": "key",
+        "TOKEN_FILE": "file",
+        "PROVIDER": "provider",
+    }
 
     for line in text.splitlines():
         stripped = line.lstrip()
@@ -207,6 +222,12 @@ class Account:
     * ``"monitor"`` (#3698) — only in the claude-monitor master;
     * ``"monitor-override"`` (#3698) — email present in claude-monitor and at
       least one lower-precedence source; the claude-monitor entry won.
+
+    ``provider`` (#12) is the normalized per-account provider slug. It
+    defaults to :data:`~loom_tools.tokens.providers.DEFAULT_PROVIDER`
+    (``anthropic``) so every pre-existing construction site — notably
+    ``monitor_db.credentials_to_accounts()`` — stays valid and backward
+    compatible.
     """
 
     email: str
@@ -214,6 +235,7 @@ class Account:
     file: str
     source: str
     index: int  # source index N, for reporting/ordering
+    provider: str = DEFAULT_PROVIDER
 
 
 def default_home_accounts_env() -> Path | None:
@@ -309,6 +331,9 @@ def _assemble_valid_accounts(
                 file=filename,
                 source=source,
                 index=n,
+                # Normalize on write (#12) so the manifest is canonical:
+                # absent/empty -> "anthropic", "OpenAI" -> "openai".
+                provider=normalize_provider(triple.get("provider")),
             )
         )
     return out
@@ -329,7 +354,7 @@ def merge_accounts(
           ``source``).
         * An email present in both: the *over* entry wins and is retagged
           ``source=override_label`` — it keeps *base*'s position in the ordering
-          but takes *over*'s key/file/index.
+          but takes *over*'s key/file/index/provider.
 
     ``override_label`` defaults to ``"repo-override"`` so the #3695 home+repo
     merge is byte-for-byte unchanged; the #3698 three-source merge passes
@@ -361,6 +386,9 @@ def merge_accounts(
                 file=acct.file,
                 source=override_label,
                 index=acct.index,
+                # The *over* entry wins wholesale (#12) — without this the
+                # provider silently resets to the default on every override.
+                provider=acct.provider,
             )
         else:
             order.append(k)
@@ -528,6 +556,7 @@ def materialize_accounts(
                     "email": email,
                     "file": filename,
                     "source": acct.source,
+                    "provider": acct.provider,
                     "key_fingerprint": existing_fp,
                     "drift": True,
                     "env_fingerprint": new_fp,
@@ -562,6 +591,7 @@ def materialize_accounts(
                 "email": email,
                 "file": filename,
                 "source": acct.source,
+                "provider": acct.provider,
                 "key_fingerprint": new_fp,
             }
         )
@@ -582,8 +612,8 @@ def write_index(
 ) -> None:
     """Atomically write the ``index.json`` manifest beside the pool.
 
-    The manifest carries only email / filename / source / 8-char fingerprint —
-    :func:`fingerprint` guarantees no secret material lands here.
+    The manifest carries only email / filename / source / provider / 8-char
+    fingerprint — :func:`fingerprint` guarantees no secret material lands here.
     """
     manifest = {
         "version": INDEX_VERSION,
