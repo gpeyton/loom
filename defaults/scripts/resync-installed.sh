@@ -107,6 +107,12 @@ fi
 
 INSTALLED_HOOKS="$REPO_ROOT/.loom/hooks"
 INSTALLED_SCRIPTS="$REPO_ROOT/.loom/scripts"
+# Loom's slash commands. Claude Code only reads commands from .claude/commands/,
+# so the role prompts have to live outside .loom/ — but they are still Loom's
+# files, installed per-machine and untracked, exactly like .loom/. Only the
+# loom/ subdirectory is ours; anything else under .claude/commands/ belongs to
+# the repo and is never touched.
+INSTALLED_COMMANDS="$REPO_ROOT/.claude/commands/loom"
 
 # ---------- resolve the defaults/ source tree ----------
 #
@@ -266,6 +272,22 @@ if [[ -d "$DEFAULTS_DIR/scripts" && -d "$INSTALLED_SCRIPTS" ]]; then
         rel="${src#"$DEFAULTS_DIR/scripts/"}"
         sync_one "$src" "$INSTALLED_SCRIPTS/$rel" "scripts/$rel"
     done < <(find "$DEFAULTS_DIR/scripts" -type f -print0 | sort -z)
+fi
+
+# ---------- .claude/commands/loom (role prompts) ----------
+#
+# Before this pass existed, role prompts were written once by install.sh and then
+# drifted forever: resync covered only .loom/, so a fix to judge.md or builder.md
+# reached no repo, and the only way to update them was install.sh — which is
+# exactly the command that must never be re-run over an existing install. Pin a
+# path here the same way as any other: `commands/judge.md` in .loom/resync-ignore.
+
+if [[ -d "$DEFAULTS_DIR/.claude/commands/loom" && -d "$INSTALLED_COMMANDS" ]]; then
+    info "Resyncing .claude/commands/loom/ from ${DEFAULTS_DIR#"$REPO_ROOT/"}/.claude/commands/loom/ ..."
+    while IFS= read -r -d '' src; do
+        rel="${src#"$DEFAULTS_DIR/.claude/commands/loom/"}"
+        sync_one "$src" "$INSTALLED_COMMANDS/$rel" "commands/$rel"
+    done < <(find "$DEFAULTS_DIR/.claude/commands/loom" -type f -print0 | sort -z)
 fi
 
 # ---------- summary ----------
