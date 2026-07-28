@@ -7,7 +7,7 @@
 # this makes the resolution a command whose output is either used or visibly
 # absent.
 #
-#   resolve-tier-model.sh <issue> [runtime]     # runtime defaults to claude
+#   resolve-tier-model.sh <issue> [runtime] [repo]   # runtime defaults to claude
 #
 # Resolution:
 #   1. Read `<!-- loom:complexity=... -->` from the issue body. Missing or
@@ -23,16 +23,29 @@ set -uo pipefail
 
 ISSUE="${1:-}"
 RUNTIME="${2:-claude}"
-[[ -n "$ISSUE" ]] || { echo "usage: resolve-tier-model.sh <issue> [runtime]" >&2; exit 2; }
+[[ -n "$ISSUE" ]] || { echo "usage: resolve-tier-model.sh <issue> [runtime] [repo]" >&2; exit 2; }
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repo" >&2; exit 2; }
 CONFIG="$ROOT/.loom/config.json"
 
-body="$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)"
+# Resolve the repo explicitly — see require-complexity-marker.sh. Reading the
+# tier off the wrong repository's issue is worse than reading no tier at all,
+# because it produces a confident model choice for someone else's work item.
+REPO="${3:-${LOOM_REPO:-}}"
+if [[ -z "$REPO" ]]; then
+  # shellcheck source=/dev/null
+  source "$ROOT/.loom/scripts/lib/forge-helpers.sh" 2>/dev/null || true
+  if declare -F forge_get_repo_nwo >/dev/null; then
+    REPO="$(forge_get_repo_nwo gh 2>/dev/null || true)"
+  fi
+fi
+[[ -n "$REPO" ]] || { echo "could not determine repo; pass it explicitly or set LOOM_REPO" >&2; exit 2; }
+
+body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
 tier="$(printf '%s' "$body" | grep -o 'loom:complexity=[a-z]*' | head -1 | cut -d= -f2)"
 case "$tier" in
   mechanical|routine|complex) ;;
-  *) echo "issue $ISSUE: no valid complexity marker -> routine" >&2; tier="routine" ;;
+  *) echo "$REPO#$ISSUE: no valid complexity marker -> routine" >&2; tier="routine" ;;
 esac
 
 model="$(CONFIG="$CONFIG" RUNTIME="$RUNTIME" TIER="$tier" python3 - <<'PY'
@@ -54,5 +67,5 @@ if [[ -x "$resolver" ]]; then
   resolved="$("$resolver" "$model" 2>/dev/null)" && [[ -n "$resolved" ]] && model="$resolved"
 fi
 
-echo "resolve-tier-model: issue=$ISSUE runtime=$RUNTIME tier=$tier model=$model" >&2
+echo "resolve-tier-model: repo=$REPO issue=$ISSUE runtime=$RUNTIME tier=$tier model=$model" >&2
 printf '%s\n' "$model"

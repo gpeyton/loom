@@ -62,5 +62,11 @@
       },
       "theme": "midnight"
     }
-  ]
+  ],
+  "sweep": {
+    "tierModels": {
+      "claude": { "mechanical": "haiku", "routine": "sonnet", "complex": "opus" },
+      "codex": { "mechanical": "gpt-5-mini", "routine": "gpt-5", "complex": "gpt-5-codex" }
+    }
+  }
 }
