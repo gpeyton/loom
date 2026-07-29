@@ -390,6 +390,25 @@ Agents coordinate work through forge labels (GitHub or Gitea). This enables auto
 - **`loom:blocked`**: Implementation blocked, needs help or clarification
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
+### Every issue you file MUST carry a workflow label
+
+**Any role creating an issue MUST pass a workflow label**, normally
+`--label loom:issue` (or `loom:curated` when the Curator has already enhanced
+it, `loom:auditor` for an Auditor finding, and so on per the flow above):
+
+```bash
+gh issue create --title "..." --body "..." --label loom:issue
+```
+
+An issue with no `loom:*` label is **invisible to the pipeline** — no lane
+queries for it, no Curator or Builder will ever claim it, and the work is
+silently lost. This is not cosmetic: it is the difference between filing a bug
+and discarding it.
+
+Many `gh issue create` examples throughout these role documents omit the flag.
+**Treat this rule as authoritative over any example that lacks it**, and add the
+label even when copying an example verbatim.
+
 ### Issues Are Suggestions (Role Autonomy)
 
 Filed issues are the *input queue*, not mandates. In autonomous mode the **Curator, Builder, and Judge** have standing authority to **close** or **rescope** an issue — with a stated rationale — when building it is not the best outcome (obsolete, duplicate/already covered, low value vs. cost, wrong approach, better split/merged). This is what keeps the auto-picked-up backlog healthy rather than "build whatever is filed". Full mechanism + guardrails live in each role prompt's "Issues Are Suggestions — Close or Rescope With Rationale" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`). The rules in brief:
