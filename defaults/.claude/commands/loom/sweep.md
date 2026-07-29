@@ -1609,6 +1609,20 @@ If `CHECKPOINT_PHASE` is `judge-rejected`, `judge-done`, or `doctor-done`, see t
 
 For issues without `builder-done`-or-later checkpoints, proceed with the normal Builder dispatch:
 
+**Atomic per-issue worktree claim (#11954 — MANDATORY, before dispatch).** Issue #11872 was dispatched to two independent Builder subagents that both called `worktree.sh N` and landed in the same `.loom/worktrees/issue-N` — both correctly detected the collision at *write* time and then sat blocked at an interactive prompt for hours, still counting as busy workers. `worktree.sh`'s own idempotent-reuse path has no liveness concept, so it cannot catch this; the gate has to run **before** a Builder is ever dispatched, not discovered by the Builder afterward. The Codex backend already gates this correctly (`spawn-codex-wave.sh`'s `_claim_acquire`, called before every child spawn, refusing on exit 4) — this subagent path must use the same primitive:
+
+For **each** surviving candidate issue `N` about to receive a Builder in this wave, immediately before including it in the dispatch block:
+```bash
+./.loom/scripts/sweep-claim.sh acquire N --pid "$PPID" --runtime claude --run-id "$RUN_ID"
+CLAIM_STATUS=$?
+```
+Use `$PPID`, **not** `$$` — this is the exact bug Step 0a's Sweep Run Identity section exists to prevent: `$$` is a fresh Bash-subshell PID on every tool call, so a claim leased under it would look dead to `kill -0` moments later, the instant that one tool call's subshell exits, even though this orchestrator session is still very much running. `$PPID` and `$RUN_ID` are already established once, at sweep start (Step 0a) — reuse the same literals here rather than minting new ones, exactly as every checkpoint write already does.
+- **Exit 0**: the claim is yours, held under this sweep's own `$RUN_ID`. Include `N` in this wave's Builder dispatch.
+- **Exit 4**: another live run (a peer `/loom:sweep` session, a daemon-dispatched sweep, or a still-alive prior Builder) already holds an active claim on `N`. **Drop `N` from this wave's Builder dispatch** — do NOT call `worktree.sh N` and do NOT spawn a Builder subagent for it. Log `skip (issue #N already claimed — see \`sweep-claim.sh status N\`)`. This is exactly the #11954 collision, refused here atomically before any worktree write is attempted, instead of surfacing as two agents deadlocked at a prompt hours later.
+- Any other exit code: fail-open (proceed with dispatch) — a broken claim primitive must never wedge the wave, mirroring every other best-effort probe in this document.
+
+This check is local and cheap (an `mkdir`-based lock under `.loom/sweep-claims/`, no `gh` call) — run it for every surviving candidate right before the dispatch block, not only ones that look risky.
+
 Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/loom:sweep` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
 Each builder is responsible for:
@@ -1637,17 +1651,18 @@ The `--baseline` argument points at the snapshot taken once at step 0 (before wa
 
 If it exits `3`, the main worktree carries **new** uncommitted changes a builder left behind. Surface this loudly in the wave summary — **quote the specific offending paths** the check printed under `Offending changes:` so the operator can see exactly which files escaped a worktree — and **hard-block the wave from advancing any PR to Judge** until the contamination is investigated and the stray changes reverted (move them into the owning issue worktree, then restore main). This is a backstop only — the builder guidance (capture the absolute worktree path once, use absolute paths everywhere) is the primary defense. Note the mechanical reason it is *only* a backstop: a builder subagent is dispatched via the Task tool ("one level deep", step 4 above) and inherits the orchestrator's single shared process env, which has **no** `LOOM_WORKTREE_PATH` — and the Task tool exposes no per-subagent env-injection parameter — so `guard-worktree-paths.sh` structurally cannot fire per builder on this path (#3719; same-shape harness limitation as #3705). Detection here plus the builder-side absolute-path contract are the achievable defenses.
 
-**On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
+**On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number) and release the claim acquired above:
 ```bash
 # Append --model <resolved> when you passed a model param to the builder subagent (#3482).
 ./.loom/scripts/sweep-checkpoint.sh write N builder-done --task-id "$RUN_ID" --pr-number <PR>
+./.loom/scripts/sweep-claim.sh release N --run-id "$RUN_ID" --status resumable
 ```
 
-If the builder failed (no PR opened), do NOT write a checkpoint — leave the checkpoint at the previous phase (typically `curator-done`) so the next sweep retries the builder from scratch.
+If the builder failed (no PR opened), do NOT write a checkpoint — leave the checkpoint at the previous phase (typically `curator-done`) so the next sweep retries the builder from scratch. Still release the claim (`sweep-claim.sh release N --run-id "$RUN_ID" --status resumable`) so a retry is not needlessly refused by the claim just acquired.
 
-**Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
+**Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it, release `#A`'s claim (above), and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
 
-**Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
+**Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job. **The claim needs no explicit cleanup here**: `sweep-claim.sh`'s liveness check is `status == "active" AND pid alive`, and a killed sweep's `$PPID` (the orchestrator process the claim was leased under) dies with it, so the claim is already orphaned/reclaimable the moment the process is gone — the next sweep's `acquire` for the same issue succeeds without anyone having called `release`.
 
 ### Stacked dependency (auto-reconciliation on parent merge) — #3729 (v1), #3747 (v2 items 1 & 2)
 

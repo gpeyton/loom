@@ -1626,6 +1626,25 @@ impl SweepRegistry {
             ));
         }
 
+        // 2.6 Open-PR guard (Issue #11954). Two builders were dispatched onto
+        //     #11872 into the same worktree, both deadlocked for hours -- and
+        //     #11872 already had PR #11928 open against it before either
+        //     dispatch. Nothing in this path had ever asked whether an issue
+        //     already had a pull request. Placed right after the closed-issue
+        //     guard so it covers the same three watchdog re-dispatch call
+        //     sites plus every future one. Best-effort and fail-open, exactly
+        //     like #4088 above: a forge lookup error or unparseable response
+        //     returns `None` and dispatch proceeds, so a `gh` outage can never
+        //     wedge the daemon. Skipped when label flips are disabled (test
+        //     fixtures without `gh` credentials).
+        if !self.config.skip_label_flip && self.issue_has_open_pr(issue_number) == Some(true) {
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: it already has an open pull \
+                 request on the forge (#11954 open-PR guard). This issue is done or in \
+                 review -- route it to Judge/Champion, not Builder."
+            ));
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2016,6 +2035,47 @@ impl SweepRegistry {
             "OPEN" => Some(false),
             _ => None,
         }
+    }
+
+    /// Best-effort probe of whether an issue already has an OPEN pull request
+    /// that will close it (Issue #11954). Returns `Some(true)` when at least
+    /// one linked PR is open, `Some(false)` when none are, and `None` on any
+    /// error (missing/failed/timed-out `gh`, unparseable output) -- the same
+    /// fail-open contract as [`Self::issue_is_closed`].
+    ///
+    /// Only counts PRs GitHub reports via `closedByPullRequestsReferences`
+    /// (i.e. PRs that reference the issue with a closing keyword like
+    /// `Closes #N`) -- a deliberately precise signal, not a loose search for
+    /// any PR that merely mentions the issue number.
+    fn issue_has_open_pr(&self, issue: u32) -> Option<bool> {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("closedByPullRequestsReferences")
+            .arg("--jq")
+            .arg(r#"[.closedByPullRequestsReferences[] | select(.state == "OPEN")] | length"#);
+        // Resolve the issue against this registry's own workspace, matching the
+        // label-flip helpers (#3937). LOOM_REPO still overrides when set.
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(|n| n > 0)
     }
 
     fn flip_label_to_building(&self, issue: u32) -> Result<()> {
@@ -9611,6 +9671,149 @@ exit 0\n";
         );
 
         if let Some(id) = running_issue_sweep_id(&reg, 4079) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    // --- open-PR dispatch guard (Issue #11954) ---
+
+    /// Install a fake `gh` that answers BOTH the closed-issue guard's
+    /// `--json state` probe (always "OPEN", so that guard never fires here)
+    /// and the open-PR guard's `--json closedByPullRequestsReferences` probe
+    /// (the configurable `pr_count_stdout`/`pr_view_exit`), and records every
+    /// invocation. `spawn-claude.sh` is a benign echo-and-exit so a dispatch
+    /// that clears both guards still spawns.
+    fn open_pr_guard_registry(
+        ws: &Path,
+        pr_count_stdout: &str,
+        pr_view_exit: i32,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$*\" == *closedByPullRequestsReferences* ]]; then\n\
+             printf '%s\\n' \"{pr_count}\"\n\
+             exit {pr_exit}\n\
+             elif [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'OPEN\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            pr_count = pr_count_stdout,
+            pr_exit = pr_view_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real guard + flip path
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// #11954: `dispatch` for an issue with an open linked PR is refused, and
+    /// it must NOT flip any labels -- reproduces the guard that would have
+    /// prevented the #11872 double-dispatch.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_issue_with_open_pr_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        // One open linked PR (mirrors #11872 / PR #11928).
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "1", 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(11872), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(
+            err.to_string().contains("open pull request"),
+            "error explains the open-PR guard; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("closedByPullRequestsReferences"),
+            "the guard probed linked PR state"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 11872).is_none());
+    }
+
+    /// #11954: an issue with zero open linked PRs dispatches normally.
+    #[test]
+    #[serial]
+    fn dispatch_proceeds_when_no_open_pr() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "0", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(11873), None, None, None, None)
+            .expect("zero open linked PRs must not block dispatch");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("closedByPullRequestsReferences"), "the guard probed linked PRs");
+        assert!(
+            calls.contains("issue edit 11873"),
+            "dispatch proceeded to the label flip; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 11873) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    /// #11954 fail-open: a forge lookup error (non-zero `gh`) on the linked-PR
+    /// probe must NOT wedge dispatch.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_open_pr_lookup_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "", 1);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(11874), None, None, None, None)
+            .expect("a gh outage on the open-PR probe must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("closedByPullRequestsReferences"), "the guard probed linked PRs");
+        assert!(
+            calls.contains("issue edit 11874"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 11874) {
             let _ = reg.cancel(&id, Duration::from_secs(2));
         }
     }

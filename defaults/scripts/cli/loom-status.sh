@@ -15,6 +15,10 @@
 #     session (present on the socket but not in config).
 #   - Flags agents configured in .loom/config.json that are NOT running (in red),
 #     so a crashed / never-started agent is easy to spot.
+#   - Flags a RUNNING session that is actually sitting at an unanswered
+#     interactive prompt (yellow BLOCKED, distinct from a busy agent) --
+#     process liveness alone cannot tell "working" from "stalled at a
+#     confirmation dialog for hours" apart (issue #11954).
 #   - Shows a work-queue summary (open loom:issue / loom:review-requested /
 #     loom:pr counts) when `gh` is available on a GitHub forge.
 #
@@ -91,6 +95,9 @@ ${YELLOW}OUTPUT:${NC}
     printed with their exact 'tmux -L loom kill-session' recovery command.
     Agents present in the config but not currently running are listed
     separately in ${RED}red${NC} so a crashed or never-started agent is easy to spot.
+    A running agent sitting at an unanswered interactive prompt is marked
+    ${YELLOW}◐ BLOCKED${NC} rather than the usual ${GREEN}●${NC} -- process liveness alone cannot
+    distinguish a stalled confirmation dialog from real progress.
     A Work Queue summary (open ${CYAN}loom:issue${NC} / ${CYAN}loom:review-requested${NC} /
     ${CYAN}loom:pr${NC} counts) is shown when 'gh' is available on a GitHub forge.
 
@@ -136,6 +143,38 @@ session_uptime_seconds() {
     local secs=$(( now - created ))
     (( secs < 0 )) && secs=0
     echo "$secs"
+}
+
+# Blocked-pane detection (Issue #11954). Two builder panes sat for hours at an
+# unanswered interactive confirmation prompt ("Two builders are on #11872 in
+# one worktree, how should I proceed?") while this script's only status model
+# was "running" (tmux session present) vs "stopped" — a process wedged on
+# stdin is still `running` under a pure liveness check, so the pool reported
+# full utilisation while actually running at 80%. This is a single-shot
+# heuristic (no cross-invocation state): a pane whose most recent non-blank
+# visible line looks like a question awaiting a typed/selected answer, with
+# nothing printed after it, is flagged BLOCKED instead of RUNNING. It cannot
+# prove a pane is stalled (a real question mid-normal-work looks identical
+# for one snapshot), but it turns "invisible for hours" into "visible on the
+# next `loom status`", which is the actual gap #11954 reported.
+is_pane_blocked() {
+    local session="$1"
+    local tail
+    tail=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session" -p -S -40 2>/dev/null) || return 1
+    local last_line
+    last_line=$(printf '%s\n' "$tail" | sed '/^[[:space:]]*$/d' | tail -n1)
+    [[ -z "$last_line" ]] && return 1
+    # Common interactive-prompt shapes: a trailing '?', y/n confirmations,
+    # numbered/lettered menu prompts, "press ... to continue", or a
+    # TUI selection cursor (❯/>) as the last visible line.
+    if [[ "$last_line" =~ \?[[:space:]]*$ ]] || \
+       [[ "$last_line" =~ \([Yy]/[Nn]\) ]] || \
+       [[ "$last_line" =~ \[[Yy]/[Nn]\] ]] || \
+       [[ "$last_line" =~ [Pp]ress[[:space:]].*to[[:space:]](continue|proceed) ]] || \
+       [[ "$last_line" =~ ^[[:space:]]*(❯|>)[[:space:]] ]]; then
+        return 0
+    fi
+    return 1
 }
 
 # Format a whole-second duration compactly (e.g. 4h32m, 3d4h, 45s)
@@ -210,11 +249,13 @@ emit_json() {
         while IFS= read -r session; do
             [[ -z "$session" ]] && continue
             local id="${session#loom-}"
-            local pid uptime
+            local pid uptime blocked
             pid=$(session_pid "$session")
             uptime=$(session_uptime_seconds "$session")
+            blocked=$(is_pane_blocked "$session" && echo true || echo false)
             rows+=$(jq -nc --arg session "$session" --arg id "$id" --arg pid "$pid" --arg uptime "$uptime" \
-                '{session:$session, id:$id, pid:($pid|select(.!="")|tonumber?), uptime_seconds:($uptime|select(.!="")|tonumber?)}')
+                --argjson blocked "$blocked" \
+                '{session:$session, id:$id, pid:($pid|select(.!="")|tonumber?), uptime_seconds:($uptime|select(.!="")|tonumber?), blocked:$blocked}')
             rows+=$'\n'
         done <<< "$running"
         running_json=$(printf '%s' "$rows" | jq -sc '.')
@@ -243,7 +284,8 @@ emit_json() {
                     session: $r.session,
                     pid: $r.pid,
                     uptime_seconds: $r.uptime_seconds,
-                    status: "running"
+                    status: "running",
+                    blocked: $r.blocked
                   }
               )),
             stopped: ($terminals | map(select(.id as $id | ($running_ids | index($id)) | not))
@@ -255,7 +297,8 @@ emit_json() {
                   })),
             unmanaged: ($running | map(select(.id as $rid
                 | ($terminals | map(.id) | index($rid)) | not))
-                | map({session: .session, id: .id, pid: .pid, uptime_seconds: .uptime_seconds, status: "unmanaged"})),
+                | map({session: .session, id: .id, pid: .pid, uptime_seconds: .uptime_seconds,
+                       status: "unmanaged", blocked: .blocked})),
             work_queue: $work_queue
           }'
 }
@@ -299,9 +342,10 @@ emit_human() {
     if [[ ${#running_ids[@]} -eq 0 ]]; then
         echo -e "${YELLOW}No agents running.${NC}"
     else
+        local blocked_count=0
         echo -e "${GREEN}Running agents (${#running_ids[@]}):${NC}"
         echo ""
-        local session id name role pid uptime uptime_str
+        local session id name role pid uptime uptime_str blocked dot label
         while IFS= read -r session; do
             [[ -z "$session" ]] && continue
             id="${session#loom-}"
@@ -320,19 +364,41 @@ emit_human() {
                 role=$(echo "$terminals" | jq -r --arg id "$id" \
                     '.[] | select(.id == $id) | (.roleConfig.roleFile // "")' 2>/dev/null | head -1)
             fi
-            if [[ -n "$name" ]]; then
-                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ($name)   ${GRAY}up ${uptime_str}${NC}"
+            # Blocked-pane detection (#11954): a session that is technically
+            # `running` (tmux liveness only) but sitting at an unanswered
+            # interactive prompt is not making progress — flag it distinctly
+            # instead of rendering identically to a busy agent.
+            if is_pane_blocked "$session"; then
+                blocked=true
+                blocked_count=$(( blocked_count + 1 ))
+                dot="${YELLOW}◐${NC}"
+                label=" ${YELLOW}[BLOCKED — awaiting input]${NC}"
             else
-                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ${YELLOW}(not in config — unmanaged)${NC}   ${GRAY}up ${uptime_str}${NC}"
+                blocked=false
+                dot="${GREEN}●${NC}"
+                label=""
+            fi
+            if [[ -n "$name" ]]; then
+                echo -e "  ${dot} ${BOLD}$id${NC} ($name)${label}   ${GRAY}up ${uptime_str}${NC}"
+            else
+                echo -e "  ${dot} ${BOLD}$id${NC} ${YELLOW}(not in config — unmanaged)${NC}${label}   ${GRAY}up ${uptime_str}${NC}"
             fi
             echo -e "      session: ${CYAN}$session${NC}   pid: ${CYAN}${pid:-unknown}${NC}"
             [[ -n "$role" ]] && echo -e "      role:    ${CYAN}$role${NC}"
+            if [[ "$blocked" == "true" ]]; then
+                echo -e "      ${YELLOW}pane is sitting at an unanswered prompt — attach and answer it:${NC}"
+                echo -e "      ${CYAN}tmux -L $TMUX_SOCKET attach -t $session${NC}"
+            fi
             # For unmanaged sessions (present on the socket but absent from
             # config), print the exact recovery command to tear it down.
             if [[ -z "$name" ]]; then
                 echo -e "      ${YELLOW}recover:${NC} ${CYAN}tmux -L $TMUX_SOCKET kill-session -t $session${NC}"
             fi
         done <<< "$running"
+        if [[ "$blocked_count" -gt 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}${BOLD}${blocked_count} of ${#running_ids[@]} running agent(s) blocked at an unanswered prompt.${NC}"
+        fi
     fi
 
     # Configured-but-not-running section
