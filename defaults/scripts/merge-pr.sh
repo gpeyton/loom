@@ -336,13 +336,17 @@ fi
 # condition in this file. --allow-stacked-children bypasses it (operator asserts
 # the children are reconciled). --dry-run still runs the guard and REPORTS the
 # would-be block, but honors the dry-run contract (never exits 1).
+#
+# GitHub-only; NOT restricted to the feature/issue-<N> branch-name convention
+# (identical guard conditions to _auto_reconcile_stacked_children). Originally
+# gated on that pattern too, but a real stacked pair on a differently-named
+# parent branch (`feat/1404-...`) hit the exact race this guard exists to
+# prevent — the branch-name check was a scope-limiting assumption, not a
+# requirement of the underlying `gh pr list --base <parent>` query, which
+# already works for any branch name. Keying purely on "does a live child PR
+# target this branch" covers every naming convention.
 _check_no_open_stacked_children() {
-  # Only GitHub, and only a parent PR on a feature/issue-<N> branch, can have
-  # stacked children — identical guard conditions to
-  # _auto_reconcile_stacked_children. No-op (byte-for-byte unchanged behavior)
-  # otherwise.
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
 
   # Live forge discovery — NEVER the daemon registry. Same call/shape item 1
   # already makes; plain `gh` (uncached) so we see child PRs as of right now.
@@ -605,11 +609,13 @@ Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_i
 
 # Discover open child PRs stacked on the just-merged parent branch and reconcile
 # (or defer) each. Best-effort; returns 0 unconditionally.
+#
+# GitHub-only; NOT restricted to the feature/issue-<N> branch-name convention —
+# see _check_no_open_stacked_children's comment for why (a real parent branch
+# named `feat/1404-...` proved the naming assumption wrong). The live `gh pr
+# list --base <parent>` query below already works for any branch name.
 _auto_reconcile_stacked_children() {
   [[ "$FORGE_TYPE" == "github" ]] || return 0
-
-  # Only a parent PR on a feature/issue-<N> branch can have stacked children.
-  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
 
   # Live forge discovery — NEVER the daemon registry. Plain `gh` (uncached) so we
   # see child PRs as of the merge, not a cached list snapshot.

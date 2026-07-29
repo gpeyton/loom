@@ -11,9 +11,11 @@
 # branch synchronously during the merge and leave the children unable to rebase
 # onto it. --allow-stacked-children bypasses the guard; --dry-run still runs it
 # and reports the would-be block but never exits 1 (honors the dry-run contract).
-# The guard is a no-op for non-feature/issue-N parent branches and non-GitHub
-# forges, and keys purely on "does an open child PR target this branch" (NOT on
-# the child issue's loom:building label — that split is item 1's concern).
+# The guard is a no-op only for non-GitHub forges — NOT for non-feature/issue-N
+# parent branch names, since the underlying discovery query works for any
+# branch name — and keys purely on "does an open child PR target this branch"
+# (NOT on the child issue's loom:building label — that split is item 1's
+# concern).
 #
 # Strategy (mirrors test-merge-pr-auto-reconcile.sh): the function under test
 # (_check_no_open_stacked_children) depends only on globals (PR_BRANCH, REPO_NWO,
@@ -204,14 +206,17 @@ assert_not_contains "$LAST_OUT" "Merge blocked" "--allow-stacked-children -> no 
 assert_contains "$LAST_OUT" "--allow-stacked-children set" "--allow-stacked-children -> override warning emitted"
 ALLOW_STACKED_CHILDREN=false
 
-# T4: non-feature/issue-N parent branch -> guard skipped entirely (rc 0), even
-# though the stub would return an open child for that base.
+# T4: non-feature/issue-N parent branch ('release-1') -> guard still fires and
+# blocks (rc 1) when the stub returns an open child for that base — keyed
+# purely on the live `gh pr list --base` query, not the branch-name pattern (a
+# real stacked pair on a `feat/1404-...` parent proved that gate a false
+# assumption).
 DRY_RUN=false; ALLOW_STACKED_CHILDREN=false
 PR_BRANCH="release-1"
 write_prlist "release-1" '[{"number":503,"headRefName":"feature/issue-201"}]'
 run_guard
-assert_eq "0" "$LAST_RC" "Non-feature/issue-N parent 'release-1' -> guard skipped (exit 0)"
-assert_not_contains "$LAST_OUT" "Merge blocked" "Non-feature/issue-N parent -> no block"
+assert_eq "1" "$LAST_RC" "Non-feature/issue-N parent 'release-1' -> guard still blocks (exit 1)"
+assert_contains "$LAST_OUT" "Merge blocked" "Non-feature/issue-N parent -> block still emitted"
 
 # T5: --dry-run with an open child present -> reports the would-be block WITHOUT
 # exiting 1 (dry-run contract preserved), and the reported message still surfaces

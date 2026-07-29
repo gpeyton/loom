@@ -9,7 +9,8 @@
 #   - Unsafe (child issue still loom:building): skips the rebase and posts a
 #     deferred-reconciliation comment on the child PR instead.
 # The whole step is best-effort and must never fail the parent merge, and it is
-# a no-op for non-feature/issue-N parent branches and non-GitHub forges.
+# a no-op only for non-GitHub forges — NOT for non-feature/issue-N parent branch
+# names, since the underlying discovery query works for any branch name.
 #
 # Strategy (mirrors test-merge-pr-partial-increment.sh): the functions under
 # test (_auto_reconcile_stacked_children and _reconcile_one_stacked_child) depend
@@ -230,13 +231,17 @@ assert_eq "" "$(read_recon)" "Unsafe child #502 (issue #202 building) -> reconci
 assert_contains "$(read_gh_log)" "pr comment 502 --repo owner/repo" \
   "Unsafe child -> deferred-reconciliation comment posted on PR #502"
 
-# T4: non-feature/issue-N parent branch -> step skipped entirely (no discovery).
+# T4: non-feature/issue-N parent branch ('release-1') -> NOT skipped; discovery
+# and reconcile still run, keyed purely on the live `gh pr list --base` query
+# (a real stacked pair on a `feat/1404-...` parent proved the branch-name gate
+# a false assumption, not a requirement of the underlying query).
 reset_logs
 PR_BRANCH="release-1"
 write_prlist "release-1" '[{"number":503,"headRefName":"feature/issue-201"}]'
 _auto_reconcile_stacked_children
-assert_eq "" "$(read_recon)" "Non-feature/issue-N parent 'release-1' -> reconcile skipped"
-assert_eq "" "$(read_gh_log)" "Non-feature/issue-N parent -> no comment, no discovery"
+assert_contains "$(read_recon)" "reconcile-stack.sh 503 release-1" \
+  "Non-feature/issue-N parent 'release-1' -> reconcile-stack.sh 503 release-1 still invoked"
+assert_eq "" "$(read_gh_log)" "Non-feature/issue-N parent, safe child -> no deferred comment"
 
 # T5: FORGE_TYPE != github -> no-op (GitHub-only for v2 item 1).
 reset_logs
