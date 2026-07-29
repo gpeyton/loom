@@ -155,6 +155,38 @@ log_error() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [ERROR] $*" >&2
 }
 
+# Resolve a bounded-execution binary once at startup (issue #11955). `timeout`
+# is GNU coreutils; macOS ships neither `timeout` nor `gtimeout` by default, so
+# every one of this file's `timeout N cmd` call sites was silently returning
+# 127 (command not found) instead of ever actually bounding anything. Resolve
+# once here so a missing binary is one WARN, not N per-callsite failures.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+else
+    log_warn "Neither 'timeout' nor 'gtimeout' found - pre-flight checks and the" \
+        "auth check will run UNBOUNDED (degraded mode, no hang protection)." \
+        "Install GNU coreutils (e.g. 'brew install coreutils' on macOS) to restore it."
+fi
+
+# Run a command bounded by TIMEOUT_BIN when one was resolved, unbounded
+# otherwise (degraded mode, already warned about once above). Exit 127 from
+# the wrapped command itself is passed through unchanged -- callers that
+# branch on a specific timeout exit code (124) must be able to tell "the
+# command doesn't exist" from "the command ran and then timed out", and must
+# not let a retry loop waiting for 124 quietly absorb a 127 instead.
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if [[ -n "${TIMEOUT_BIN}" ]]; then
+        "${TIMEOUT_BIN}" "${seconds}" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Check whether pipe-pane already captured the CLI output by comparing
 # content fingerprints.  Normalizes both the new log portion and probe
 # lines from captured output by stripping non-alphanumeric chars, then
@@ -375,7 +407,7 @@ check_mcp_server() {
     # Extract the MCP server entry point from .mcp.json
     # Use timeout to prevent hanging on resource-contended systems (see issue #2472).
     local mcp_entry
-    mcp_entry=$(timeout 10 python3 -c "
+    mcp_entry=$(run_with_timeout 10 python3 -c "
 import json, sys
 with open('${mcp_config}') as f:
     cfg = json.load(f)
@@ -422,7 +454,7 @@ for name, srv in servers.items():
     # The MCP server writes "Loom MCP server running on stdio" to stderr on success.
     # Use a short timeout - we just need to see the startup message.
     local mcp_stderr
-    mcp_stderr=$(timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
+    mcp_stderr=$(run_with_timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
 
     if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
         log_info "MCP server health check passed"
@@ -538,7 +570,7 @@ _try_mcp_rebuild() {
     fi
 
     local mcp_stderr
-    mcp_stderr=$(timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
+    mcp_stderr=$(run_with_timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
 
     if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
         log_info "MCP server health check passed after rebuild"
@@ -755,8 +787,11 @@ check_auth_status() {
         # Unset CLAUDECODE to avoid nested-session guard when running inside
         # a Claude Code session (e.g., during testing or shepherd-spawned builds).
         # Use timeout to prevent hanging after a long first attempt leaves
-        # auth in a bad state (see issue #2472).
-        auth_output=$(timeout 15 bash -c 'CLAUDECODE="" claude auth status --json 2>&1') || auth_exit_code=$?
+        # auth in a bad state (see issue #2472). In degraded mode (no
+        # timeout/gtimeout resolved, see TIMEOUT_BIN above) this call is
+        # unbounded and can genuinely hang -- that tradeoff was already
+        # warned about once at startup.
+        auth_output=$(run_with_timeout 15 bash -c 'CLAUDECODE="" claude auth status --json 2>&1') || auth_exit_code=$?
 
         # timeout exits with 124 when the command times out
         if [[ "${auth_exit_code}" -eq 124 ]]; then
@@ -770,6 +805,19 @@ check_auth_status() {
                 continue
             fi
             log_warn "Authentication check timed out after ${max_retries} attempts"
+            [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
+            return 1
+        fi
+
+        # 127 means the wrapped command itself was not found (most likely the
+        # `claude` binary is missing or PATH is broken inside `bash -c`) --
+        # a broken install, not a slow command. It must never be mistaken for
+        # 124: a retry-with-backoff loop waiting for "still starting up" would
+        # just re-run the same missing binary and fail identically every time.
+        # Fail hard immediately instead of burning the retry budget on it.
+        if [[ "${auth_exit_code}" -eq 127 ]]; then
+            log_error "Authentication check command not found (exit 127) - broken install, not retrying"
+            log_error "Output: ${auth_output}"
             [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
         fi
